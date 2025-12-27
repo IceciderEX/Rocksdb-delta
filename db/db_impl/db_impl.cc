@@ -56,6 +56,7 @@
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
 #include "db/write_callback.h"
+#include "delta/hotspot_manager.h"
 #include "env/unique_id_gen.h"
 #include "file/file_util.h"
 #include "file/filename.h"
@@ -276,6 +277,12 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   if (write_buffer_manager_) {
     wbm_stall_.reset(new WBMStallInterface());
   }
+  // for delta
+  std::string hotspot_dir = dbname_ + "/hotspot_data";
+  ColumnFamilyOptions default_cf_opts; 
+  Options hotspot_opts(initial_db_options_, default_cf_opts);
+  
+  hotspot_manager_ = std::make_shared<HotspotManager>(hotspot_opts, hotspot_dir);
 }
 
 Status DBImpl::Resume() {
@@ -3917,7 +3924,8 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                              (read_options.snapshot != nullptr)
                                  ? read_options.snapshot->GetSequenceNumber()
                                  : kMaxSequenceNumber,
-                             nullptr /* read_callback */);
+                             nullptr /* read_callback */,
+                             hotspot_manager_);
   }
   return result;
 }
@@ -3988,7 +3996,8 @@ ArenaWrappedDBIter* DBImpl::NewIteratorImpl(
   // that they are likely to be in the same cache line and/or page.
   return NewArenaWrappedDbIterator(
       env_, read_options, cfh, sv, snapshot, read_callback, this,
-      expose_blob_index, allow_refresh, /*allow_mark_memtable_for_flush=*/true);
+      expose_blob_index, allow_refresh, /*allow_mark_memtable_for_flush=*/true,
+      hotspot_manager_);
 }
 
 std::unique_ptr<Iterator> DBImpl::NewCoalescingIterator(

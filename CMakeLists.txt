@@ -1449,6 +1449,8 @@ if(WITH_TESTS)
         db/write_batch_test.cc
         db/write_callback_test.cc
         db/write_controller_test.cc
+        delta/hot_data_buffer.cc
+        delta/hot_index_table.cc
         env/env_test.cc
         env/io_posix_test.cc
         env/mock_env_test.cc
@@ -1693,3 +1695,7 @@ option(WITH_BENCHMARK "build benchmark tests" OFF)
 if(WITH_BENCHMARK)
   add_subdirectory(${PROJECT_SOURCE_DIR}/microbench/)
 endif()
+
+# for delta
+add_executable(rocksdb_scan test/rocksdb_scan.cc db/db_test_util.cc)
+target_link_libraries(rocksdb_scan rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})

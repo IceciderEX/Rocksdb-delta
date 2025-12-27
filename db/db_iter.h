@@ -74,13 +74,15 @@ class DBIter final : public Iterator {
                          ReadOnlyMemTable* active_mem,
                          ColumnFamilyHandleImpl* cfh = nullptr,
                          bool expose_blob_index = false,
-                         Arena* arena = nullptr) {
+                         Arena* arena = nullptr,
+                         // for delta
+                         std::shared_ptr<HotspotManager> hotspot_manager = nullptr) {
     void* mem = arena ? arena->AllocateAligned(sizeof(DBIter))
                       : operator new(sizeof(DBIter));
     DBIter* db_iter = new (mem)
         DBIter(env, read_options, ioptions, mutable_cf_options,
                user_key_comparator, internal_iter, version, sequence, arena,
-               read_callback, cfh, expose_blob_index, active_mem);
+               read_callback, cfh, expose_blob_index, active_mem, hotspot_manager);
     return db_iter;
   }
 
@@ -250,7 +252,8 @@ class DBIter final : public Iterator {
          InternalIterator* iter, const Version* version, SequenceNumber s,
          bool arena_mode, ReadCallback* read_callback,
          ColumnFamilyHandleImpl* cfh, bool expose_blob_index,
-         ReadOnlyMemTable* active_mem);
+         ReadOnlyMemTable* active_mem,
+         std::shared_ptr<HotspotManager> hotspot_manager);
 
   class BlobReader {
    public:
@@ -525,5 +528,8 @@ class DBIter final : public Iterator {
   bool allow_unprepared_value_;
   bool is_blob_;
   bool arena_mode_;
+  
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager_;
 };
 }  // namespace ROCKSDB_NAMESPACE

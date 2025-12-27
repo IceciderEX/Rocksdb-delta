@@ -42,7 +42,8 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
                const Comparator* cmp, InternalIterator* iter,
                const Version* version, SequenceNumber s, bool arena_mode,
                ReadCallback* read_callback, ColumnFamilyHandleImpl* cfh,
-               bool expose_blob_index, ReadOnlyMemTable* active_mem)
+               bool expose_blob_index, ReadOnlyMemTable* active_mem,
+               std::shared_ptr<HotspotManager> hotspot_manager)
     : prefix_extractor_(mutable_cf_options.prefix_extractor.get()),
       env_(_env),
       clock_(ioptions.clock),
@@ -84,7 +85,8 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       expose_blob_index_(expose_blob_index),
       allow_unprepared_value_(read_options.allow_unprepared_value),
       is_blob_(false),
-      arena_mode_(arena_mode) {
+      arena_mode_(arena_mode),
+      hotspot_manager_(hotspot_manager) {
   RecordTick(statistics_, NO_ITERATOR_CREATED);
   if (pin_thru_lifetime_) {
     pinned_iters_mgr_.StartPinning();
@@ -510,7 +512,12 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
             }
 
             valid_ = true;
+            // for delta
+            if (hotspot_manager_) {
+              hotspot_manager_->OnUserScan(saved_key_.GetUserKey(), value());
+            }
             return true;
+            // TODO：这个 merge 怎么处理？
           case kTypeMerge:
             if (!PrepareValueInternal()) {
               return false;

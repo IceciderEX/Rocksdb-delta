@@ -47,6 +47,9 @@
 #include "db/wal_manager.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
+#include "delta/hotspot_manager.h"
+#include "delta/hot_data_buffer.h"
+#include "delta/hot_index_table.h"
 #include "logging/event_logger.h"
 #include "memtable/wbwi_memtable.h"
 #include "monitoring/instrumented_mutex.h"
@@ -3205,6 +3208,9 @@ class GetWithTimestampReadCallback : public ReadCallback {
   bool IsVisibleFullCheck(SequenceNumber seq) override {
     return seq <= max_visible_seq_;
   }
+
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager_;
 };
 
 Options SanitizeOptions(const std::string& db, const Options& src,
