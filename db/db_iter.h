@@ -531,6 +531,12 @@ class DBIter final : public Iterator {
   bool arena_mode_;
   
   // for delta
+  struct DeltaScanContext {
+    uint64_t last_cuid = 0;
+    // 记录当前 CUID 已经统计过的物理单元 ID
+    std::unordered_set<uint64_t> visited_units_for_cuid; 
+  } delta_ctx_;
+
   std::shared_ptr<HotspotManager> hotspot_manager_;
 };
 }  // namespace ROCKSDB_NAMESPACE

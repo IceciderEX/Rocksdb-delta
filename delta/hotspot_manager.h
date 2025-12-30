@@ -13,6 +13,12 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+struct ScanContext {
+    uint64_t current_cuid = 0;
+    // 当前 CUID 已访问的物理 ID (FileNumber...)
+    std::unordered_set<uint64_t> visited_phys_units; 
+};
+
 class HotspotManager {
  public:
   // db_options: 用于初始化 SstFileWriter
@@ -22,7 +28,7 @@ class HotspotManager {
   ~HotspotManager() = default;
 
   // 拦截接口：由 DBIterator 在准备返回数据给用户前调用
-  void OnUserScan(const Slice& key, const Slice& value);
+  void HotspotManager::OnUserScan(const Slice& key, const Slice& value, uint64_t phys_unit_id);
 
   Status FlushBufferToSST(uint64_t cuid);
 
@@ -33,7 +39,6 @@ class HotspotManager {
   // 拦截 Delete 操作?
   bool InterceptDelete(const Slice& key);
 
- private:
   uint64_t ExtractCUID(const Slice& key);
 
   std::string GenerateSstFileName(uint64_t cuid);

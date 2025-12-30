@@ -48,6 +48,8 @@ void HotspotManager::OnUserScan(const Slice& key, const Slice& value) {
   // hot cuid check
   bool is_hot = frequency_table_.RecordAndCheckHot(cuid);
 
+  delete_table_.IncrementRefCount(cuid);
+
   if (!is_hot) {
     // no scan-as-compaction
     return;
