@@ -30,6 +30,9 @@ class HotspotManager {
 
   GlobalDeleteCountTable& GetDeleteTable() { return delete_table_; }
 
+  // 拦截 Delete 操作?
+  bool InterceptDelete(const Slice& key);
+
  private:
   uint64_t ExtractCUID(const Slice& key);
 

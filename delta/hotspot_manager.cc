@@ -54,7 +54,7 @@ void HotspotManager::OnUserScan(const Slice& key, const Slice& value) {
   }
 
   // 尝试追加到 buffer
-  // Append 内部已经加锁
+  // Append 内部已经加锁  
   bool needs_flush = buffer_.Append(cuid, key, value);
 
   if (needs_flush) {
@@ -65,6 +65,22 @@ void HotspotManager::OnUserScan(const Slice& key, const Slice& value) {
               cuid, s.ToString().c_str());
     }
   }
+}
+
+bool HotspotManager::InterceptDelete(const Slice& key) {
+  uint64_t cuid = ExtractCUID(key);
+  if (cuid == 0) return false;
+
+  // 在 GDCT 中查询是否该 cuid 被标记为删除
+  bool marked = delete_table_.MarkDeleted(cuid);
+  
+  if (marked) {
+    // fprintf(stderr, "[HotspotManager] Intercepted Delete for CUID: %lu\n", cuid);
+    return true;
+  }
+
+  // CUID 不在热点管理范围内
+  return false;
 }
 
 std::string HotspotManager::GenerateSstFileName(uint64_t cuid) {
