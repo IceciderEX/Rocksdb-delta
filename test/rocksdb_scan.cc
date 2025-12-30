@@ -31,7 +31,7 @@ int main() {
         return 1;
     }
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 1000; i++) {
         std::string key = Key(i);
         std::string value = "value_" + std::to_string(i);
         s = db->Put(WriteOptions(), key, value);
@@ -47,8 +47,8 @@ int main() {
     std::unique_ptr<Iterator> it(db->NewIterator(read_options));
 
     // 从 key_003 开始 scan
-    std::string start_key = Key(3);
-    std::string end_key   = Key(8);
+    std::string start_key = Key(50);
+    std::string end_key   = Key(400);
 
     for (it->Seek(start_key);
          it->Valid() && it->key().ToString() < end_key;

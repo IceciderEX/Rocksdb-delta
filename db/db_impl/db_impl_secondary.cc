@@ -571,7 +571,8 @@ ArenaWrappedDBIter* DBImplSecondary::NewIteratorImpl(
   return NewArenaWrappedDbIterator(env_, read_options, cfh, super_version,
                                    snapshot, read_callback, this,
                                    expose_blob_index, allow_refresh,
-                                   /*allow_mark_memtable_for_flush=*/false);
+                                   /*allow_mark_memtable_for_flush=*/false,
+                                   /*hotspot_manager=*/nullptr);
 }
 
 Status DBImplSecondary::NewIterators(

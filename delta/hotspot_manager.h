@@ -7,6 +7,9 @@
 #include "rocksdb/status.h"
 #include "delta/hot_data_buffer.h"
 #include "delta/hot_index_table.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "delta/scan_frequency_table.h"
+#include "delta/global_delete_count_table.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -25,6 +28,8 @@ class HotspotManager {
 
   HotIndexTable& GetIndexTable() { return index_table_; }
 
+  GlobalDeleteCountTable& GetDeleteTable() { return delete_table_; }
+
  private:
   uint64_t ExtractCUID(const Slice& key);
 
@@ -36,6 +41,9 @@ class HotspotManager {
 
   HotDataBuffer buffer_;
   HotIndexTable index_table_;
+
+  ScanFrequencyTable frequency_table_;
+  GlobalDeleteCountTable delete_table_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

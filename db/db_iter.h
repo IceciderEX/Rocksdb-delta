@@ -19,6 +19,7 @@
 #include "rocksdb/wide_columns.h"
 #include "table/iterator_wrapper.h"
 #include "util/autovector.h"
+#include "delta/hotspot_manager.h"
 
 namespace ROCKSDB_NAMESPACE {
 class Version;

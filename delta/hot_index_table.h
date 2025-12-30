@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rocksdb/rocksdb_namespace.h"
 #include <string>
 #include <unordered_map>
 #include <mutex>

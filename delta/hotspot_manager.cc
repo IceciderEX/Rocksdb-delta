@@ -14,44 +14,51 @@
 namespace ROCKSDB_NAMESPACE {
 
 HotspotManager::HotspotManager(const Options& db_options, const std::string& data_dir)
-    : db_options_(db_options), data_dir_(data_dir) {
-  // 确保存储目录存在
-  // 注意：实际生产环境可能需要更严谨的 Env::CreateDir 处理
+    : db_options_(db_options), 
+      data_dir_(data_dir),
+      frequency_table_(4, 600) { 
   db_options_.env->CreateDirIfMissing(data_dir_);
 }
 
 uint64_t HotspotManager::ExtractCUID(const Slice& key) {
-  // TODO: 【关键】请在此处根据你的 Key Schema 实现 CUID 解析逻辑
-  // 你的 Key 格式: dbid_tableid_cuid_row_id_event_seq
-  // 假设 dbid(8字节) + tableid(8字节) + cuid(8字节) ...
-  
+  // TODO: 根据 Key Schema 实现 CUID 解析逻辑
   if (key.size() < 24) {
-    // 长度不足，可能不是数据 Key，或者 Schema 不对
     return 0; 
   }
 
-  // 示例：假设 CUID 位于偏移量 16 处，是 64 位大端整数
-  // const char* ptr = key.data() + 16;
-  // uint64_t cuid = DecodeFixed64(ptr); 
-  
-  // 临时模拟：为了编译通过，假设前 8 字节通过某种哈希映射得到 CUID，或者直接硬编码
-  // 实际代码请务必替换为真实的解析逻辑
-  return 12345; // Placeholder
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(key.data()) + 16;
+
+  // Big-Endian Decoding
+  uint64_t cuid = (static_cast<uint64_t>(p[0]) << 56) |
+                  (static_cast<uint64_t>(p[1]) << 48) |
+                  (static_cast<uint64_t>(p[2]) << 40) |
+                  (static_cast<uint64_t>(p[3]) << 32) |
+                  (static_cast<uint64_t>(p[4]) << 24) |
+                  (static_cast<uint64_t>(p[5]) << 16) |
+                  (static_cast<uint64_t>(p[6]) << 8)  |
+                  (static_cast<uint64_t>(p[7]));
+
+  return cuid;
 }
 
 void HotspotManager::OnUserScan(const Slice& key, const Slice& value) {
   uint64_t cuid = ExtractCUID(key);
   if (cuid == 0) return; // 解析失败或非目标 Key
 
+  // hot cuid check
+  bool is_hot = frequency_table_.RecordAndCheckHot(cuid);
+
+  if (!is_hot) {
+    // no scan-as-compaction
+    return;
+  }
+
   // 尝试追加到 buffer
   // Append 内部已经加锁
   bool needs_flush = buffer_.Append(cuid, key, value);
 
   if (needs_flush) {
-    // 触发刷盘
-    // 注意：在第一阶段验证中，我们直接在当前线程同步执行 Flush。
-    // 这会阻塞用户的 Scan 一小会儿，但在验证逻辑时是安全的。
-    // 后续阶段（Task 3/4）我们会把这里改成异步后台线程执行。
+    // TODO：目前实现，直接在当前线程 flush，后续需要改为后台线程？
     Status s = FlushBufferToSST(cuid);
     if (!s.ok()) {
       fprintf(stderr, "[HotspotManager] Flush SST failed for CUID %lu: %s\n", 
@@ -88,7 +95,7 @@ Status HotspotManager::FlushBufferToSST(uint64_t cuid) {
   }
 
   for (size_t i = 0; i < batch.keys.size(); ++i) {
-    s = sst_writer.Add(batch.keys[i], batch.values[i]);
+    s = sst_writer.Put(batch.keys[i], batch.values[i]);
     if (!s.ok()) {
       return s;
     }

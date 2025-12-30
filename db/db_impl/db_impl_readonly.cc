@@ -188,7 +188,8 @@ Iterator* DBImplReadOnly::NewIterator(const ReadOptions& _read_options,
   return NewArenaWrappedDbIterator(
       env_, read_options, cfh, super_version, read_seq, read_callback, this,
       /*expose_blob_index=*/false, /*allow_refresh=*/false,
-      /*allow_mark_memtable_for_flush=*/false);
+      /*allow_mark_memtable_for_flush=*/false,
+      /*hotspot_manager=*/nullptr);
 }
 
 Status DBImplReadOnly::NewIterators(
@@ -250,7 +251,8 @@ Status DBImplReadOnly::NewIterators(
     auto* db_iter = NewArenaWrappedDbIterator(
         env_, read_options, cfh, sv, read_seq, read_callback, this,
         /*expose_blob_index=*/false, /*allow_refresh=*/false,
-        /*allow_mark_memtable_for_flush=*/false);
+        /*allow_mark_memtable_for_flush=*/false,
+        /*hotspot_manager=*/nullptr);
     iterators->push_back(db_iter);
   }
 

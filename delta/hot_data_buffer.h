@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <mutex>
 #include "rocksdb/slice.h"
+#include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -27,7 +28,8 @@ struct HotBufferBatch {
 
 class HotDataBuffer {
  public:
-  explicit HotDataBuffer(size_t threshold_bytes = 64 * 1024 * 1024); // 默认 64MB
+  // explicit HotDataBuffer(size_t threshold_bytes = 64 * 1024 * 1024); // 默认 64MB
+  explicit HotDataBuffer(size_t threshold_bytes = 1024); // 默认 1KB
 
   // 将数据追加到对应 CUID 的 buffer 中
   // 如果 buffer 大小超过阈值，返回 true (need Flush)

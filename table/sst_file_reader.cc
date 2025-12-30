@@ -171,7 +171,8 @@ Iterator* SstFileReader::NewIterator(const ReadOptions& roptions) {
             nullptr /* version */, sequence, 0 /* version_number */,
             nullptr /* read_callback */, nullptr /* cfh */,
             true /* expose_blob_index */, false /* allow_refresh */,
-            /*active_mem=*/nullptr);
+            /*active_mem=*/nullptr,
+            /*hotspot_manager=*/nullptr);
   auto internal_iter = r->table_reader->NewIterator(
       res->GetReadOptions(), r->moptions.prefix_extractor.get(),
       res->GetArena(), false /* skip_filters */,

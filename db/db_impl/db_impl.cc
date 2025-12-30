@@ -3924,7 +3924,9 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                              (read_options.snapshot != nullptr)
                                  ? read_options.snapshot->GetSequenceNumber()
                                  : kMaxSequenceNumber,
-                             nullptr /* read_callback */,
+                             nullptr /* read_callback */, 
+                             /*expose_blob_index=*/ false,  
+                             /*allow_refresh=*/ true,
                              hotspot_manager_);
   }
   return result;
@@ -3933,7 +3935,7 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
 ArenaWrappedDBIter* DBImpl::NewIteratorImpl(
     const ReadOptions& read_options, ColumnFamilyHandleImpl* cfh,
     SuperVersion* sv, SequenceNumber snapshot, ReadCallback* read_callback,
-    bool expose_blob_index, bool allow_refresh) {
+    bool expose_blob_index, bool allow_refresh, std::shared_ptr<HotspotManager> hotspot_manager) {
   TEST_SYNC_POINT("DBImpl::NewIterator:1");
   TEST_SYNC_POINT("DBImpl::NewIterator:2");
 
