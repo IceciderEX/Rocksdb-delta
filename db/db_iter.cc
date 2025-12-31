@@ -545,7 +545,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                       hotspot_manager_->GetDeleteTable().IncrementRefCount(cuid);
                       delta_ctx_.visited_units_for_cuid.insert(phys_id);
                   }
-                  hotspot_manager_->OnUserScan(saved_key_.GetUserKey(), value());                          
+                  hotspot_manager_->OnUserScan(cuid, saved_key_.GetUserKey(), value());                          
               }
             }
             return true;

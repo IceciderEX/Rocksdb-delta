@@ -6,37 +6,34 @@
 #include <mutex>
 #include "rocksdb/slice.h"
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/status.h"
+#include "rocksdb/env.h"
+#include "rocksdb/options.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-// 一个 CUID 对应的数据
-struct HotBufferBatch {
-  std::vector<std::string> keys;
-  std::vector<std::string> values;
-  size_t size_bytes = 0;
-
-  void Clear() {
-    keys.clear();
-    values.clear();
-    size_bytes = 0;
-  }
-
-  bool IsEmpty() const {
-    return keys.empty();
+struct HotEntry {
+  uint64_t cuid;
+  std::string key;
+  std::string value;
+  
+  // 用于排序
+  bool operator<(const HotEntry& other) const {
+    return key < other.key; 
   }
 };
+
 
 class HotDataBuffer {
  public:
   // explicit HotDataBuffer(size_t threshold_bytes = 64 * 1024 * 1024); // 默认 64MB
-  explicit HotDataBuffer(size_t threshold_bytes = 1024); // 默认 1KB
+  explicit HotDataBuffer(size_t threshold_bytes = 1 * 1024 * 1024); // 先用 1MB 测试
 
   // 将数据追加到对应 CUID 的 buffer 中
   // 如果 buffer 大小超过阈值，返回 true (need Flush)
   bool Append(uint64_t cuid, const Slice& key, const Slice& value);
 
-  // 获取并清空指定 CUID 的数据 
-  HotBufferBatch ExtractBatch(uint64_t cuid);
+  std::vector<HotEntry> ExtractAndReset();
 
   size_t GetTotalSize() const;
 
@@ -44,10 +41,36 @@ class HotDataBuffer {
   // flush threshold
   size_t threshold_bytes_;
   mutable std::mutex mutex_;
-  // CUID -> BufferBatch 
-  std::unordered_map<uint64_t, HotBufferBatch> buffers_;
+
+  std::vector<HotEntry> buffer_; // 共享 Buffer
   // 全局总大小统计
   size_t total_size_bytes_;
+};
+
+class HotSstLifecycleManager {
+ public:
+  HotSstLifecycleManager(const Options& options) : env_(options.env) {}
+
+  // 注册一个新生成的文件，初始引用计数为 0
+  void RegisterFile(uint64_t file_number, const std::string& file_path);
+
+  // 增加引用计数 (当 IndexTable 添加指向该文件的 Segment 时调用)
+  void Ref(uint64_t file_number);
+
+  // 减少引用计数 (当 IndexTable 删除 Segment 或 Compaction 完成后调用)
+  // 如果计数归零，物理删除文件
+  void Unref(uint64_t file_number);
+
+ private:
+  Env* env_;
+  std::mutex mutex_;
+  
+  struct FileState {
+    std::string file_path;
+    int ref_count;
+  };
+  
+  std::unordered_map<uint64_t, FileState> files_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

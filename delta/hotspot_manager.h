@@ -30,7 +30,7 @@ class HotspotManager {
   // 拦截接口：由 DBIterator 在准备返回数据给用户前调用
   void HotspotManager::OnUserScan(const Slice& key, const Slice& value, uint64_t phys_unit_id);
 
-  Status FlushBufferToSST(uint64_t cuid);
+  Status FlushGlobalBufferToSST();
 
   HotIndexTable& GetIndexTable() { return index_table_; }
 
@@ -52,6 +52,7 @@ class HotspotManager {
 
   ScanFrequencyTable frequency_table_;
   GlobalDeleteCountTable delete_table_;
+  std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

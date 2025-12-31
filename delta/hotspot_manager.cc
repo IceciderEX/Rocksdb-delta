@@ -47,8 +47,7 @@ void HotspotManager::OnUserScan(const Slice& key, const Slice& value) {
 
   // hot cuid check
   bool is_hot = frequency_table_.RecordAndCheckHot(cuid);
-
-  delete_table_.IncrementRefCount(cuid);
+  // delete_table_.IncrementRefCount(cuid);
 
   if (!is_hot) {
     // no scan-as-compaction
@@ -61,7 +60,7 @@ void HotspotManager::OnUserScan(const Slice& key, const Slice& value) {
 
   if (needs_flush) {
     // TODO：目前实现，直接在当前线程 flush，后续需要改为后台线程？
-    Status s = FlushBufferToSST(cuid);
+    Status s = FlushGlobalBufferToSST();
     if (!s.ok()) {
       fprintf(stderr, "[HotspotManager] Flush SST failed for CUID %lu: %s\n", 
               cuid, s.ToString().c_str());
@@ -96,40 +95,76 @@ std::string HotspotManager::GenerateSstFileName(uint64_t cuid) {
   return ss.str();
 }
 
-Status HotspotManager::FlushBufferToSST(uint64_t cuid) {
-  HotBufferBatch batch = buffer_.ExtractBatch(cuid);
-  if (batch.IsEmpty()) {
-    return Status::OK();
-  }
+Status HotspotManager::FlushGlobalBufferToSST() {
+  std::vector<HotEntry> entries = buffer_.ExtractAndReset();
+  if (entries.empty()) return Status::OK();
+
+  // TODO: 生产环境应使用 ColumnFamily 的 Comparator 
+  std::sort(entries.begin(), entries.end(), [](const HotEntry& a, const HotEntry& b) {
+    if (a.cuid != b.cuid) {
+      return a.cuid < b.cuid;
+    }
+    return a.key < b.key;
+  });
 
   EnvOptions env_options;
   SstFileWriter sst_writer(env_options, db_options_);
-
-  std::string file_path = GenerateSstFileName(cuid);
+  
+  // filename: hot_shared_{timestamp}.sst
+  auto now = std::chrono::system_clock::now();
+  uint64_t file_number = std::chrono::duration_cast<std::chrono::microseconds>(
+                             now.time_since_epoch()).count(); // timestamp
+  std::string file_path = data_dir_ + "/hot_shared_" + std::to_string(file_number) + ".sst";
 
   Status s = sst_writer.Open(file_path);
-  if (!s.ok()) {
-    return s;
+  if (!s.ok()) return s;
+
+  lifecycle_manager_->RegisterFile(file_number, file_path);
+
+  // 写入数据并记录涉及的 CUID
+  uint64_t current_cuid = 0;
+  uint64_t start_offset = 0; 
+  bool first_entry = true;
+
+  start_offset = sst_writer.FileSize(); 
+
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& entry = entries[i];
+
+    // CUID 切换
+    if (!first_entry && entry.cuid != current_cuid) {
+      // 结算上一个 CUID 的 Segment
+      uint64_t current_size = sst_writer.FileSize();
+      uint64_t length = current_size - start_offset;
+      
+      if (length > 0) {
+        index_table_.AddSegment(current_cuid, {file_number, start_offset, length});
+      }
+
+      // 更新状态
+      start_offset = current_size;
+      current_cuid = entry.cuid;
+    } 
   }
 
-  for (size_t i = 0; i < batch.keys.size(); ++i) {
-    s = sst_writer.Put(batch.keys[i], batch.values[i]);
-    if (!s.ok()) {
-      return s;
-    }
+  if (!entries.empty()) {
+    // Finish 之前需要计算最后一段的 Size? 
+    // 注意：SstFileWriter 此时还没有写 Footer/IndexBlock。
+    // 我们记录的 Length 是 "Data Block 的累计大小"，不包含文件 Footer。
+    // 这对于 Read 来说是可以接受的，只要读取时知道大致范围。
+    // 实际上，更精确的做法是 Read 时只依赖 FileID，Offset/Length 仅作为预读/IO优化的 hint。
+    
+    uint64_t current_size = sst_writer.FileSize();
+    uint64_t length = current_size - start_offset;
+    index_table_.AddSegment(current_cuid, {file_number, start_offset, length});
   }
 
   ExternalSstFileInfo file_info;
   s = sst_writer.Finish(&file_info);
-  if (!s.ok()) {
-    return s;
-  }
+  if (!s.ok()) return s;
 
-  index_table_.UpdateSnapshot(cuid, file_path);
-
-  // log
-  fprintf(stdout, "[HotspotManager] Generated SST: %s (Size: %lu bytes, Rows: %lu)\n", 
-          file_path.c_str(), file_info.file_size, file_info.num_entries);
+  fprintf(stdout, "[HotspotManager] Generated Shared SST: %s (Num: %lu, Size: %lu)\n", 
+          file_path.c_str(), file_number, file_info.file_size);
 
   return Status::OK();
 }

@@ -1,40 +1,53 @@
 #pragma once
 
-#include "rocksdb/rocksdb_namespace.h"
 #include <string>
 #include <unordered_map>
 #include <mutex>
 #include <shared_mutex>
 #include <optional>
+#include "rocksdb/rocksdb_namespace.h"
+#include "delta/hot_data_buffer.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-struct HotspotEntry {
-  std::string snapshot_file_path;
+struct DataSegment {
+  uint64_t file_number;
+  uint64_t offset;
+  uint64_t length;
+};
 
-  // std::vector<...> deltas; 
+struct HotspotEntry {
+  std::vector<DataSegment> snapshot_segments;
+  // std::vector<DataSegment> delta_segments; 
 
   bool IsValid() const {
-    return !snapshot_file_path.empty();
+    return !snapshot_segments.empty();
   }
+};
+
+struct HotIndexEntry {
+  // 一个 CUID 的数据可能分散在多个共享 SST 中
+  // 按写入时间顺序排列
+  std::vector<DataSegment> segments;
 };
 
 class HotIndexTable {
  public:
   HotIndexTable() = default;
 
-  // 更新某个 CUID 的快照文件路径
-  void UpdateSnapshot(uint64_t cuid, const std::string& path);
+  // 添加一个新的数据片段 (Segment)
+  void AddSegment(uint64_t cuid, const DataSegment& segment);
 
-  // 查询 CUID 是否有热点数据文件
-  bool GetEntry(uint64_t cuid, HotspotEntry* entry) const;
+  // 获取某个 CUID 的所有数据位置
+  bool GetEntry(uint64_t cuid, HotIndexEntry* entry) const;
 
-  // 移除某个 CUID 的索引（例如数据过期或被彻底删除）
-  void RemoveEntry(uint64_t cuid);
+  // 彻底移除某个 CUID (例如被 Tombstone 彻底清理)
+  void RemoveCUID(uint64_t cuid);
 
  private:
   mutable std::shared_mutex mutex_;
   std::unordered_map<uint64_t, HotspotEntry> table_;
+  std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
