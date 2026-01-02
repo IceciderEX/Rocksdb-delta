@@ -1,5 +1,4 @@
 #include "delta/hot_data_buffer.h"
-#include "delta/hot_sst_lifecycle_manager.h"
 #include "logging/logging.h"
 
 namespace ROCKSDB_NAMESPACE {

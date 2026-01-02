@@ -253,6 +253,13 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
     return !multi_scan_->pinned_data_blocks[block_idx].IsEmpty();
   }
 
+  // for delta physical
+  uint64_t GetPhysicalId() override {
+    // 这里我们需要一个唯一标识 SST 的东西。
+    // block_based_table_ 也就是 TableReader 的指针是最好的 ID，每个 SST 文件对应一个 reader 实例。
+    return reinterpret_cast<uint64_t>(table_);
+  }
+
  private:
   enum class IterDirection {
     kForward,

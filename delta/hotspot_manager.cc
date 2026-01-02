@@ -16,6 +16,8 @@ namespace ROCKSDB_NAMESPACE {
 HotspotManager::HotspotManager(const Options& db_options, const std::string& data_dir)
     : db_options_(db_options), 
       data_dir_(data_dir),
+      lifecycle_manager_(std::make_shared<HotSstLifecycleManager>(db_options)),
+      index_table_(lifecycle_manager_),
       frequency_table_(4, 600) { 
   db_options_.env->CreateDirIfMissing(data_dir_);
 }
@@ -41,25 +43,16 @@ uint64_t HotspotManager::ExtractCUID(const Slice& key) {
   return cuid;
 }
 
-void HotspotManager::OnUserScan(const Slice& key, const Slice& value) {
-  uint64_t cuid = ExtractCUID(key);
-  if (cuid == 0) return; // 解析失败或非目标 Key
+bool HotspotManager::RegisterScan(uint64_t cuid) {
+  if (cuid == 0) return false;
+  
+  return frequency_table_.RecordAndCheckHot(cuid);
+}
 
-  // hot cuid check
-  bool is_hot = frequency_table_.RecordAndCheckHot(cuid);
-  // delete_table_.IncrementRefCount(cuid);
-
-  if (!is_hot) {
-    // no scan-as-compaction
-    return;
-  }
-
-  // 尝试追加到 buffer
-  // Append 内部已经加锁  
+void HotspotManager::BufferHotData(uint64_t cuid, const Slice& key, const Slice& value) {
   bool needs_flush = buffer_.Append(cuid, key, value);
 
   if (needs_flush) {
-    // TODO：目前实现，直接在当前线程 flush，后续需要改为后台线程？
     Status s = FlushGlobalBufferToSST();
     if (!s.ok()) {
       fprintf(stderr, "[HotspotManager] Flush SST failed for CUID %lu: %s\n", 
@@ -67,6 +60,37 @@ void HotspotManager::OnUserScan(const Slice& key, const Slice& value) {
     }
   }
 }
+
+// void HotspotManager::OnUserScan(const Slice& key, const Slice& value) {
+//   uint64_t cuid = ExtractCUID(key);
+//   if (cuid == 0) return; // 解析失败或非目标 Key
+
+//   if (delete_table_.IsDeleted(cuid)) {
+//       return; 
+//   }
+
+//   // hot cuid check
+//   bool is_hot = frequency_table_.RecordAndCheckHot(cuid);
+//   // delete_table_.IncrementRefCount(cuid);
+
+//   if (!is_hot) {
+//     // no scan-as-compaction
+//     return;
+//   }
+
+//   // 尝试追加到 buffer
+//   // Append 内部已经加锁  
+//   bool needs_flush = buffer_.Append(cuid, key, value);
+
+//   if (needs_flush) {
+//     // TODO：目前实现，直接在当前线程 flush，后续需要改为后台线程？
+//     Status s = FlushGlobalBufferToSST();
+//     if (!s.ok()) {
+//       fprintf(stderr, "[HotspotManager] Flush SST failed for CUID %lu: %s\n", 
+//               cuid, s.ToString().c_str());
+//     }
+//   }
+// }
 
 bool HotspotManager::InterceptDelete(const Slice& key) {
   uint64_t cuid = ExtractCUID(key);
@@ -122,41 +146,31 @@ Status HotspotManager::FlushGlobalBufferToSST() {
   lifecycle_manager_->RegisterFile(file_number, file_path);
 
   // 写入数据并记录涉及的 CUID
-  uint64_t current_cuid = 0;
-  uint64_t start_offset = 0; 
-  bool first_entry = true;
+  size_t idx = 0;
+  while (idx < entries.size()) {
+    uint64_t current_cuid = entries[idx].cuid;
+    // TODO: 检查 filesize 是否正确
+    uint64_t start_offset = sst_writer.FileSize();
+    while (idx < entries.size() && entries[idx].cuid == current_cuid) {
+      s = sst_writer.Put(entries[idx].key, entries[idx].value);
+      if (!s.ok()) return s;
+      idx++;
+    }
 
-  start_offset = sst_writer.FileSize(); 
+    uint64_t end_offset = sst_writer.FileSize();
+    uint64_t length = end_offset - start_offset;
 
-  for (size_t i = 0; i < entries.size(); ++i) {
-    const auto& entry = entries[i];
+    if (length > 0) {
+      DataSegment segment;
+      segment.file_number = file_number;
+      segment.offset = start_offset;
+      segment.length = length;
 
-    // CUID 切换
-    if (!first_entry && entry.cuid != current_cuid) {
-      // 结算上一个 CUID 的 Segment
-      uint64_t current_size = sst_writer.FileSize();
-      uint64_t length = current_size - start_offset;
-      
-      if (length > 0) {
-        index_table_.AddSegment(current_cuid, {file_number, start_offset, length});
-      }
-
-      // 更新状态
-      start_offset = current_size;
-      current_cuid = entry.cuid;
-    } 
-  }
-
-  if (!entries.empty()) {
-    // Finish 之前需要计算最后一段的 Size? 
-    // 注意：SstFileWriter 此时还没有写 Footer/IndexBlock。
-    // 我们记录的 Length 是 "Data Block 的累计大小"，不包含文件 Footer。
-    // 这对于 Read 来说是可以接受的，只要读取时知道大致范围。
-    // 实际上，更精确的做法是 Read 时只依赖 FileID，Offset/Length 仅作为预读/IO优化的 hint。
-    
-    uint64_t current_size = sst_writer.FileSize();
-    uint64_t length = current_size - start_offset;
-    index_table_.AddSegment(current_cuid, {file_number, start_offset, length});
+      index_table_.AppendSnapshotSegment(current_cuid, segment);
+    } else {
+      // 极端情况：数据极少还在 Writer 的内存 Buffer 中未刷入 Block
+      // TODO：如果数据未刷入 block？
+    }
   }
 
   ExternalSstFileInfo file_info;

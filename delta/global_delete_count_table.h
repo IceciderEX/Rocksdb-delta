@@ -21,6 +21,26 @@ class GlobalDeleteCountTable {
   // 增加引用计数 (当 Scan 发现一个新的 SST/Memtable 包含该 CUID 时调用)
   void IncrementRefCount(uint64_t cuid);
 
+  //  检查是否已经追踪了该 CUID
+  bool IsTracked(uint64_t cuid) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return table_.find(cuid) != table_.end();
+  }
+
+  void InitRefCount(uint64_t cuid, int count = 1) {
+      std::unique_lock<std::shared_mutex> lock(mutex_);
+      table_[cuid].ref_count += count;
+  }
+
+  bool TryRegister(uint64_t cuid) {
+      std::unique_lock<std::shared_mutex> lock(mutex_);
+      if (table_.find(cuid) == table_.end()) {
+          table_[cuid] = {0, false}; 
+          return true;
+      }
+      return false;
+  }
+
   // 【Delete 阶段调用】
   // 直接在表中标记为 True，避免写 Tombstone
   bool MarkDeleted(uint64_t cuid);

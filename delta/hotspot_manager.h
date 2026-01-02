@@ -28,13 +28,23 @@ class HotspotManager {
   ~HotspotManager() = default;
 
   // 拦截接口：由 DBIterator 在准备返回数据给用户前调用
-  void HotspotManager::OnUserScan(const Slice& key, const Slice& value, uint64_t phys_unit_id);
+  //   void OnUserScan(const Slice& key, const Slice& value);
+  
+  // 返回 true 表示该 CUID 是热点
+  bool RegisterScan(uint64_t cuid);
+
+  // 收集数据 (只有 RegisterScan 返回 true 时才调用此函数)
+  void BufferHotData(uint64_t cuid, const Slice& key, const Slice& value);
 
   Status FlushGlobalBufferToSST();
 
   HotIndexTable& GetIndexTable() { return index_table_; }
 
   GlobalDeleteCountTable& GetDeleteTable() { return delete_table_; }
+
+  bool IsCuidDeleted(uint64_t cuid) {
+      return delete_table_.IsDeleted(cuid);
+  }
 
   // 拦截 Delete 操作?
   bool InterceptDelete(const Slice& key);
@@ -47,12 +57,12 @@ class HotspotManager {
   Options db_options_;
   std::string data_dir_;
 
+  std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
   HotDataBuffer buffer_;
   HotIndexTable index_table_;
 
   ScanFrequencyTable frequency_table_;
   GlobalDeleteCountTable delete_table_;
-  std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

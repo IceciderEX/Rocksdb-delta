@@ -14,39 +14,37 @@ struct DataSegment {
   uint64_t file_number;
   uint64_t offset;
   uint64_t length;
-};
-
-struct HotspotEntry {
-  std::vector<DataSegment> snapshot_segments;
-  // std::vector<DataSegment> delta_segments; 
-
-  bool IsValid() const {
-    return !snapshot_segments.empty();
-  }
+  
+  bool Valid() const { return length > 0; }
 };
 
 struct HotIndexEntry {
-  // 一个 CUID 的数据可能分散在多个共享 SST 中
-  // 按写入时间顺序排列
-  std::vector<DataSegment> segments;
+  std::vector<DataSegment> snapshot_segments;
+  // std::vector<DataSegment> delta_segments; 
+
+  std::vector<DataSegment> deltas;
+
+  bool HasSnapshot() const { return !snapshot_segments.empty(); }
 };
 
 class HotIndexTable {
  public:
-  HotIndexTable() = default;
+  explicit HotIndexTable(std::shared_ptr<HotSstLifecycleManager> lifecycle_manager)
+      : lifecycle_manager_(lifecycle_manager) {}
 
-  // 添加一个新的数据片段 (Segment)
-  void AddSegment(uint64_t cuid, const DataSegment& segment);
+  void UpdateSnapshot(uint64_t cuid, const std::vector<DataSegment>& new_segments);
+  // scan-as-compaction -> add snapshots
+  void AppendSnapshotSegment(uint64_t cuid, const DataSegment& segment);
 
-  // 获取某个 CUID 的所有数据位置
+  void AddDelta(uint64_t cuid, const DataSegment& segment);
+
   bool GetEntry(uint64_t cuid, HotIndexEntry* entry) const;
 
-  // 彻底移除某个 CUID (例如被 Tombstone 彻底清理)
   void RemoveCUID(uint64_t cuid);
 
  private:
   mutable std::shared_mutex mutex_;
-  std::unordered_map<uint64_t, HotspotEntry> table_;
+  std::unordered_map<uint64_t, HotIndexEntry> table_;
   std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
 };
 

@@ -3203,6 +3203,7 @@ class DBImpl : public DB {
   
   // for delta
   std::shared_ptr<HotspotManager> hotspot_manager_;
+  public: std::shared_ptr<HotspotManager> GetHotspotManager() { return hotspot_manager_; }
 };
 
 class GetWithTimestampReadCallback : public ReadCallback {

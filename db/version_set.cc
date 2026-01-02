@@ -1113,6 +1113,14 @@ class LevelIterator final : public InternalIterator {
     read_seq_ = read_seq;
   }
 
+  // for delta physical
+  uint64_t GetPhysicalId() override {
+    if (file_iter_.iter()) {
+      return file_iter_.iter()->GetPhysicalId();
+    }
+    return 0;
+  }
+
   inline bool FileHasMultiScanArg(size_t file_index) {
     if (file_to_scan_opts_.get()) {
       auto it = file_to_scan_opts_->find(file_index);

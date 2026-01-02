@@ -28,6 +28,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/system_clock.h"
 #include "delta/hotspot_manager.h"
+#include "delta/global_delete_count_table.h"
 #include "table/internal_iterator.h"
 #include "table/iterator_wrapper.h"
 #include "trace_replay/trace_replay.h"
@@ -350,19 +351,10 @@ bool DBIter::PrepareValue() {
   return result;
 }
 
-// for delta
+// for delta physical
 uint64_t GetCurrentPhysUnitId(InternalIterator* internal_iter) {
   if (internal_iter == nullptr) return 0;
-  
-  std::string prop;
-  if (internal_iter->GetProperty("rocksdb.sstable.number", &prop).ok()) {
-    return std::stoull(prop);
-  }
-  // 如果是 Memtable，先使用特殊大值代表 Memtable
-  if (internal_iter->GetProperty("rocksdb.iterator.is-memtable", &prop).ok() && prop == "1") {
-    return kMaxSequenceNumber; 
-  }
-  return 0;
+  return internal_iter->GetPhysicalId();
 }
 
 // PRE: saved_key_ has the current user key if skipping_saved_key
@@ -532,20 +524,37 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
             if (hotspot_manager_) {
               uint64_t cuid = hotspot_manager_->ExtractCUID(saved_key_.GetUserKey());
               if (cuid != 0) {
+                  // 如果 CUID 已被删除，跳过
+                  if (hotspot_manager_->IsCuidDeleted(cuid)) {
+                    valid_ = false;
+                    ResetValueAndColumns(); // 这个函数用于清理 value_
+                    // RecordTick(statistics_, DELTA_LOGICAL_DELETE_SKIPPED);
+                    iter_.Next();
+                    continue;
+                  }
+
                   uint64_t phys_id = GetCurrentPhysUnitId(iter_.iter());
-                  
+              
                   // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
                   if (delta_ctx_.last_cuid != cuid) {
                       delta_ctx_.last_cuid = cuid;
                       delta_ctx_.visited_units_for_cuid.clear();
+                      delta_ctx_.is_counting_mode = hotspot_manager_->GetDeleteTable().TryRegister(cuid);
+                      // 对这个 cuid 进行一次访问计数，用于判断是否为热点
+                      delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(cuid);
                   }
 
-                  if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
-                      // 引用计数增加
-                      hotspot_manager_->GetDeleteTable().IncrementRefCount(cuid);
-                      delta_ctx_.visited_units_for_cuid.insert(phys_id);
+                  if (delta_ctx_.is_counting_mode) {
+                      if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
+                          hotspot_manager_->GetDeleteTable().InitRefCount(cuid, 1);
+                          delta_ctx_.visited_units_for_cuid.insert(phys_id);
+                      }
                   }
-                  hotspot_manager_->OnUserScan(cuid, saved_key_.GetUserKey(), value());                          
+
+                  // 如果当前 CUID 是热点，收集数据
+                  if (delta_ctx_.is_current_hot) {
+                      hotspot_manager_->BufferHotData(cuid, saved_key_.GetUserKey(), value());                          
+                  }                      
               }
             }
             return true;
