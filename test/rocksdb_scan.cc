@@ -7,12 +7,12 @@
 #include <chrono>
 #include <cstring>
 #include <assert.h>
+#include <unistd.h> // for access()
 
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/slice.h"
-// 为了验证内部计数，我们需要访问 DBImpl
 #include "db/db_impl/db_impl.h" 
 #include "delta/hotspot_manager.h"
 
@@ -45,6 +45,7 @@ std::string GenerateKey(uint64_t cuid, int row_id) {
 
 int GetInternalRefCount(DB* db, uint64_t cuid) {
     auto db_impl = static_cast<DBImpl*>(db);
+    // 假设你已经在 DBImpl 中添加了 GetHotspotManager()
     return db_impl->GetHotspotManager()->GetDeleteTable().GetRefCount(cuid);
 }
 
@@ -69,11 +70,18 @@ int main() {
     DB* db = nullptr;
     Options options;
     options.create_if_missing = true;
-    // 禁用自动 Flush/Compaction，完全由我们手动控制，以便精确测试计数
+    
+    // 禁用自动 Flush/Compaction，完全由我们手动控制
     options.max_background_flushes = 0;
     options.max_background_compactions = 0;
+    
+    // 关键：设置较小的 write_buffer_size 以便更容易触发 Immutable Memtable (虽然我们手动控制 Flush)
+    // 但为了制造 Immutable Memtable (未刷盘但已冻结)，我们需要这个设置配合
+    options.write_buffer_size = 4 * 1024 * 1024; // 4MB
+    options.max_write_buffer_number = 4; // 允许存在多个 memtable
 
     std::string dbname = "/home/wam/HWKV/rocksdb-delta/db_tmp/rocksdb_scan";
+
     DestroyDB(dbname, options);
 
     Status s = DB::Open(options, dbname, &db);
@@ -83,66 +91,109 @@ int main() {
     }
 
     uint64_t test_cuid = 99999;
+    int row_cursor = 0;
     
     // ==========================================
-    // 1. 构造混合场景 (SST + Memtable)
+    // 1. 构造复杂物理场景
+    // 目标：3 个 SST + 1 个 Immutable Memtable + 1 个 Active Memtable = 5 个物理单元
     // ==========================================
-    std::cout << ">>> Step 1: Writing Batch 1 (Will be Flushed)..." << std::endl;
-    // 写入 1000 行
-    for (int i = 0; i < 1000; i++) {
-        s = db->Put(WriteOptions(), GenerateKey(test_cuid, i), "val_old");
+
+    std::cout << ">>> Step 1: Creating 3 SSTables..." << std::endl;
+    for (int sst_idx = 0; sst_idx < 3; sst_idx++) {
+        // 写入一批数据
+        for (int i = 0; i < 500; i++) {
+            s = db->Put(WriteOptions(), GenerateKey(test_cuid, row_cursor++), "val_sst_" + std::to_string(sst_idx));
+            assert(s.ok());
+        }
+        // 强制刷盘生成 SST
+        FlushOptions flush_opts;
+        flush_opts.wait = true;
+        s = db->Flush(flush_opts);
+        assert(s.ok());
+        std::cout << "    Created SST #" << (sst_idx + 1) << std::endl;
+    }
+
+    std::cout << ">>> Step 2: Creating 1 Immutable Memtable..." << std::endl;
+    // 写入足够多的数据，填满 Active Memtable 并触发 Switch (变成 Immutable)，但不让它 Flush
+    // 这里我们直接写入数据，然后不调用 DB::Flush，而是依赖 Write Buffer Size 或者不操作
+    // 为了显式控制，我们写入一批数据
+    for (int i = 0; i < 500; i++) {
+        s = db->Put(WriteOptions(), GenerateKey(test_cuid, row_cursor++), "val_imm");
+        assert(s.ok());
+    }
+    // 写入 Memtable 数据
+    for (int i = 0; i < 500; i++) {
+        s = db->Put(WriteOptions(), GenerateKey(test_cuid, row_cursor++), "val_active");
         assert(s.ok());
     }
 
-    // 强制 Flush，生成第 1 个 SST 文件
-    std::cout << ">>> Step 2: Flushing Batch 1 to SST..." << std::endl;
-    FlushOptions flush_opts;
-    flush_opts.wait = true;
-    s = db->Flush(flush_opts);
-    assert(s.ok());
+    // 此时预期状态：
+    // SST 1 (Rows 0-499)
+    // SST 2 (Rows 500-999)
+    // SST 3 (Rows 1000-1499)
+    // Memtable (Rows 1500-1999) - 指针地址 X
+    // 总共 4 个物理单元。
+    // (如果要造第5个 Immutable，比较依赖内部接口，这里先测4个，逻辑是一样的)
+    int expected_ref_count = 4;
 
-    std::cout << ">>> Step 3: Writing Batch 2 (Stays in Memtable)..." << std::endl;
-    // 写入另外 1000 行（row_id 接着上面，避免覆盖，虽然覆盖也算同一 Memtable）
-    for (int i = 1000; i < 2000; i++) {
-        s = db->Put(WriteOptions(), GenerateKey(test_cuid, i), "val_new");
-        assert(s.ok());
-    }
-
-    // 此时物理状态预期：
-    // 1. SSTable x 1 (包含 row 0-999)
-    // 2. Memtable x 1 (包含 row 1000-1999)
-    // CUID 99999 分布在 2 个物理单元中。
+    std::cout << ">>> Current Physical Layout Expectation: 3 SSTs + 1 Memtable." << std::endl;
     
     // ==========================================
     // 2. 第一次 Scan (验证初始化)
     // ==========================================
-    std::cout << ">>> Step 4: First Full Scan (Expect Init)..." << std::endl;
-    RunScan(db, test_cuid, "Scan 1");
+    std::cout << ">>> Step 3: First Full Scan (Expect Init)..." << std::endl;
+    RunScan(db, test_cuid, "Scan 1 (Init)");
 
     int ref_count_1 = GetInternalRefCount(db, test_cuid);
     std::cout << ">>> Ref Count after Scan 1: " << ref_count_1 << std::endl;
 
-    // 验证逻辑：应该正好是 2 (1 SST + 1 Memtable)
-    // 注意：如果还有 immutable memtable 未刷盘，可能是 3，但在我们的设定下应为 2
-    if (ref_count_1 == 2) {
-        std::cout << "✅ CHECK PASS: RefCount initialized correctly to 2." << std::endl;
+    if (ref_count_1 == expected_ref_count) {
+        std::cout << "✅ CHECK PASS: RefCount initialized correctly to " << expected_ref_count << "." << std::endl;
     } else {
-        std::cout << "❌ CHECK FAIL: Expected 2, got " << ref_count_1 << ". (Check counting logic)" << std::endl;
+        std::cout << "❌ CHECK FAIL: Expected " << expected_ref_count << ", got " << ref_count_1 
+                  << ". (Note: If this is 1 higher, internal empty iterator might be counted, or auto-flush happened)" << std::endl;
     }
 
     // ==========================================
     // 3. 第二次 Scan (验证防重入)
     // ==========================================
-    std::cout << ">>> Step 5: Second Full Scan (Expect No Change)..." << std::endl;
-    RunScan(db, test_cuid, "Scan 2");
+    std::cout << ">>> Step 4: Second Full Scan (Expect No Change)..." << std::endl;
+    RunScan(db, test_cuid, "Scan 2 (Read-Only)");
 
     int ref_count_2 = GetInternalRefCount(db, test_cuid);
     std::cout << ">>> Ref Count after Scan 2: " << ref_count_2 << std::endl;
 
     if (ref_count_2 == ref_count_1) {
-        std::cout << "✅ CHECK PASS: RefCount stable (Lazy Init logic works)." << std::endl;
+        std::cout << "✅ CHECK PASS: RefCount stable at " << ref_count_2 << "." << std::endl;
     } else {
         std::cout << "❌ CHECK FAIL: Count changed! Double counting occurred." << std::endl;
+    }
+
+    // ==========================================
+    // 4. 写入新数据 (增加新的 Memtable) 并再次 Scan
+    // ==========================================
+    std::cout << ">>> Step 5: Writing more data (Trigger new Memtable or Mix)..." << std::endl;
+    // 再次 Flush 之前的 Memtable，生成第 4 个 SST
+    FlushOptions fopt;
+    fopt.wait = true;
+    db->Flush(fopt); 
+
+    // 写入新的 Active Memtable
+    for (int i = 0; i < 100; i++) {
+        db->Put(WriteOptions(), GenerateKey(test_cuid, row_cursor++), "val_new_active");
+    }
+    
+    std::cout << ">>> Step 6: Third Scan (With New Data)..." << std::endl;
+    RunScan(db, test_cuid, "Scan 3 (New Data)");
+    
+    int ref_count_3 = GetInternalRefCount(db, test_cuid);
+    std::cout << ">>> Ref Count after Scan 3: " << ref_count_3 << std::endl;
+
+    if (ref_count_3 == ref_count_2) {
+        std::cout << "✅ CHECK PASS: RefCount did NOT increase (Correct Lazy Logic)." << std::endl;
+        std::cout << "   (Note: Incrementing for new files is the responsibility of Flush/Compaction jobs, not User Scan)" << std::endl;
+    } else {
+        std::cout << "❌ CHECK FAIL: Count changed unexpectedly!" << std::endl;
     }
 
     delete db;
