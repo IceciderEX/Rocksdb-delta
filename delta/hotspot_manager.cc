@@ -119,6 +119,28 @@ std::string HotspotManager::GenerateSstFileName(uint64_t cuid) {
   return ss.str();
 }
 
+
+bool HotspotManager::ShouldTriggerScanAsCompaction(uint64_t cuid) {
+  HotIndexEntry entry;
+  if (!index_table_.GetEntry(cuid, &entry)) {
+    // a)	当前热点CUid无Snapshot。
+    return true;
+  }
+  // b)	已有Snapshot，且新增的Deltas片段数量超过5个。
+  if (!entry.HasSnapshot() || entry.deltas.size() > 5) {
+    return true;
+  }
+  return false;
+}
+
+void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
+  // 生成该 CUID 的 Snapshot
+  Status s = FlushGlobalBufferToSST(); 
+  if (!s.ok()) {
+    // 错误处理
+  }
+}
+
 Status HotspotManager::FlushGlobalBufferToSST() {
   std::vector<HotEntry> entries = buffer_.ExtractAndReset();
   if (entries.empty()) return Status::OK();

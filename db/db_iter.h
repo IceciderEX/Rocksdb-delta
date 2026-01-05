@@ -162,6 +162,7 @@ class DBIter final : public Iterator {
     local_stats_.BumpGlobalStatistics(statistics_);
     iter_.DeleteIter(arena_mode_);
     ThreadStatusUtil::SetThreadOperation(cur_op_type);
+    
   }
   void SetIter(InternalIterator* iter) {
     assert(iter_.iter() == nullptr);
@@ -537,6 +538,14 @@ class DBIter final : public Iterator {
     std::unordered_set<uint64_t> visited_units_for_cuid;
     // bool is_counting_mode = false; // [NOTUSE] 标记本次 Scan 是否负责计数?
     bool is_current_hot = false; 
+    bool trigger_scan_as_compaction = false;
+
+    void Reset() {
+      last_cuid = 0;
+      visited_units_for_cuid.clear();
+      is_current_hot = false;
+      trigger_scan_as_compaction = false;
+    }
   } delta_ctx_;
 
   std::shared_ptr<HotspotManager> hotspot_manager_;

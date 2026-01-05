@@ -537,23 +537,36 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
               
                   // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
                   if (delta_ctx_.last_cuid != cuid) {
+                      if (delta_ctx_.trigger_scan_as_compaction && delta_ctx_.last_cuid != 0) {
+                        hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+                      }
                       delta_ctx_.last_cuid = cuid;
                       delta_ctx_.visited_units_for_cuid.clear();
                       // delta_ctx_.is_counting_mode = hotspot_manager_->GetDeleteTable().TryRegister(cuid);
                       // 对这个 cuid 进行一次访问计数，用于判断是否为热点
                       delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(cuid);
-                  }
-                  
-                  // 对 scan 到的 memtable/sst 进行计数
-                  if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
-                      hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id); // 加入 set
-                      delta_ctx_.visited_units_for_cuid.insert(phys_id);
+
+                      if (delta_ctx_.is_current_hot) {
+                        // 是否触发 Scan-as-Compaction
+                        delta_ctx_.trigger_scan_as_compaction = hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
+                      } else {
+                        delta_ctx_.trigger_scan_as_compaction = false;
+                      }
                   }
 
-                  // 如果当前 CUID 是热点，收集数据
-                  if (delta_ctx_.is_current_hot) {
-                      hotspot_manager_->BufferHotData(cuid, saved_key_.GetUserKey(), value());                          
-                  }                      
+                  // 维护引用计数
+                if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
+                  hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
+                  delta_ctx_.visited_units_for_cuid.insert(phys_id);
+                  
+                  // // 记录该 Delta 片段在原始 LSM 中的位置？
+
+                }
+
+                // 将 scan数据送入热点 Buffer
+                if (delta_ctx_.trigger_scan_as_compaction) {
+                  hotspot_manager_->BufferHotData(cuid, saved_key_.GetUserKey(), value());
+                }              
               }
             }
             return true;

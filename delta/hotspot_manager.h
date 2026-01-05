@@ -42,6 +42,10 @@ class HotspotManager {
 
   GlobalDeleteCountTable& GetDeleteTable() { return delete_table_; }
 
+  bool ShouldTriggerScanAsCompaction(uint64_t cuid);
+
+  void FinalizeScanAsCompaction(uint64_t cuid);
+
   bool IsCuidDeleted(uint64_t cuid) {
       return delete_table_.IsDeleted(cuid);
   }
