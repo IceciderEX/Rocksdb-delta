@@ -539,16 +539,15 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   if (delta_ctx_.last_cuid != cuid) {
                       delta_ctx_.last_cuid = cuid;
                       delta_ctx_.visited_units_for_cuid.clear();
-                      delta_ctx_.is_counting_mode = hotspot_manager_->GetDeleteTable().TryRegister(cuid);
+                      // delta_ctx_.is_counting_mode = hotspot_manager_->GetDeleteTable().TryRegister(cuid);
                       // 对这个 cuid 进行一次访问计数，用于判断是否为热点
                       delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(cuid);
                   }
-
-                  if (delta_ctx_.is_counting_mode) {
-                      if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
-                          hotspot_manager_->GetDeleteTable().InitRefCount(cuid, 1);
-                          delta_ctx_.visited_units_for_cuid.insert(phys_id);
-                      }
+                  
+                  // 对 scan 到的 memtable/sst 进行计数
+                  if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
+                      hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id); // 加入 set
+                      delta_ctx_.visited_units_for_cuid.insert(phys_id);
                   }
 
                   // 如果当前 CUID 是热点，收集数据

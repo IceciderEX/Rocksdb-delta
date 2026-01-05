@@ -1115,8 +1115,13 @@ class LevelIterator final : public InternalIterator {
 
   // for delta physical
   uint64_t GetPhysicalId() override {
-    if (file_iter_.iter()) {
-      return file_iter_.iter()->GetPhysicalId();
+    // file_index_
+    // if (file_iter_.iter()) {
+    //   return file_iter_.iter()->GetPhysicalId();
+    // }
+    // return 0;
+    if (flevel_ != nullptr && file_index_ < flevel_->num_files) {
+      return flevel_->files[file_index_].file_metadata->fd.GetNumber();
     }
     return 0;
   }

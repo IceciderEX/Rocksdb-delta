@@ -4,13 +4,16 @@
 #include <unordered_map>
 #include <shared_mutex>
 #include <mutex>
+#include <unordered_set>
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 struct GDCTEntry {
-  int ref_count = 0;    
-  bool is_deleted = false; 
+  std::unordered_set<uint64_t> tracked_phys_ids;
+  bool is_deleted = false;
+
+  int GetRefCount() const { return static_cast<int>(tracked_phys_ids.size()); }
 };
 
 class GlobalDeleteCountTable {
@@ -19,27 +22,12 @@ class GlobalDeleteCountTable {
 
   // 【Scan 阶段调用】
   // 增加引用计数 (当 Scan 发现一个新的 SST/Memtable 包含该 CUID 时调用)
-  void IncrementRefCount(uint64_t cuid);
+  bool TrackPhysicalUnit(uint64_t cuid, uint64_t phys_id);
+
+  void UntrackPhysicalUnit(uint64_t cuid, uint64_t phys_id);
 
   //  检查是否已经追踪了该 CUID
-  bool IsTracked(uint64_t cuid) const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    return table_.find(cuid) != table_.end();
-  }
-
-  void InitRefCount(uint64_t cuid, int count = 1) {
-      std::unique_lock<std::shared_mutex> lock(mutex_);
-      table_[cuid].ref_count += count;
-  }
-
-  bool TryRegister(uint64_t cuid) {
-      std::unique_lock<std::shared_mutex> lock(mutex_);
-      if (table_.find(cuid) == table_.end()) {
-          table_[cuid] = {0, false}; 
-          return true;
-      }
-      return false;
-  }
+  bool IsTracked(uint64_t cuid) const;
 
   // 【Delete 阶段调用】
   // 直接在表中标记为 True，避免写 Tombstone

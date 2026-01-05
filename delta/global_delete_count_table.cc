@@ -4,9 +4,27 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-void GlobalDeleteCountTable::IncrementRefCount(uint64_t cuid) {
+bool GlobalDeleteCountTable::TrackPhysicalUnit(uint64_t cuid, uint64_t phys_id) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
-  table_[cuid].ref_count++;
+  auto& entry = table_[cuid]; // Lazy Init
+  
+  if (entry.tracked_phys_ids.find(phys_id) == entry.tracked_phys_ids.end()) {
+    entry.tracked_phys_ids.insert(phys_id);
+    return true; // 新文件，Ref++
+  }
+  return false;
+}
+
+void GlobalDeleteCountTable::UntrackPhysicalUnit(uint64_t cuid, uint64_t phys_id) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it != table_.end()) {
+    it->second.tracked_phys_ids.erase(phys_id);
+    // 如果计数归零且已标记删除的清理？
+    // if (it->second.is_deleted && it->second.tracked_phys_ids.empty()) {
+    //     table_.erase(it);
+    // }
+  }
 }
 
 bool GlobalDeleteCountTable::MarkDeleted(uint64_t cuid) {
@@ -21,32 +39,25 @@ bool GlobalDeleteCountTable::MarkDeleted(uint64_t cuid) {
 
 bool GlobalDeleteCountTable::IsDeleted(uint64_t cuid) const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
-  auto it = table_.find(cuid);
+  auto it = table_.find(cuid);  
   if (it != table_.end()) {
     return it->second.is_deleted;
   }
   return false;
 }
 
-void GlobalDeleteCountTable::DecrementRefCount(uint64_t cuid) {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  auto it = table_.find(cuid);
-  if (it != table_.end()) {
-    it->second.ref_count--;
-    
-    if (it->second.ref_count <= 0) {
-      table_.erase(it);
-    }
-  }
-}
-
 int GlobalDeleteCountTable::GetRefCount(uint64_t cuid) const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
   auto it = table_.find(cuid);
   if (it != table_.end()) {
-    return it->second.ref_count;
+    return it->second.GetRefCount();
   }
   return 0;
+}
+
+bool GlobalDeleteCountTable::IsTracked(uint64_t cuid) const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  return table_.find(cuid) != table_.end();
 }
 
 } // namespace ROCKSDB_NAMESPACE

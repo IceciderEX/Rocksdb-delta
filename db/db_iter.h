@@ -535,7 +535,7 @@ class DBIter final : public Iterator {
     uint64_t last_cuid = 0;
     // 记录当前 CUID 已经统计过的物理单元 ID
     std::unordered_set<uint64_t> visited_units_for_cuid;
-    bool is_counting_mode = false; // 标记本次 Scan 是否负责计数?
+    // bool is_counting_mode = false; // [NOTUSE] 标记本次 Scan 是否负责计数?
     bool is_current_hot = false; 
   } delta_ctx_;
 
