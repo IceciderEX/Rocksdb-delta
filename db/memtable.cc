@@ -603,7 +603,7 @@ class MemTableIterator : public InternalIterator {
 
   // for delta physical
   uint64_t GetPhysicalId() override {
-    // 返回 Memtable 对象的内存地址作为 ID
+    // memtable pointer
     return reinterpret_cast<uint64_t>(mem_); 
   }
 

@@ -15,7 +15,7 @@ namespace ROCKSDB_NAMESPACE {
 
 struct ScanContext {
     uint64_t current_cuid = 0;
-    // 当前 CUID 已访问的物理 ID (FileNumber...)
+    // 当前 cuid 已访问的文件 ID (FileNumber...)
     std::unordered_set<uint64_t> visited_phys_units; 
 };
 
@@ -27,7 +27,7 @@ class HotspotManager {
 
   ~HotspotManager() = default;
 
-  // 拦截接口：由 DBIterator 在准备返回数据给用户前调用
+  // 返回数据给用户前调用 【暂时不要了】
   //   void OnUserScan(const Slice& key, const Slice& value);
   
   // 返回 true 表示该 CUID 是热点
@@ -36,7 +36,11 @@ class HotspotManager {
   // 收集数据 (只有 RegisterScan 返回 true 时才调用此函数)
   void BufferHotData(uint64_t cuid, const Slice& key, const Slice& value);
 
-  Status FlushGlobalBufferToSST();
+  Status FlushBlockToSharedSST(
+    std::unique_ptr<HotDataBlock> block,
+    std::unordered_map<uint64_t, DataSegment>* output_segments);
+
+  void HotspotManager::TriggerBufferFlush();
 
   HotIndexTable& GetIndexTable() { return index_table_; }
 
@@ -45,6 +49,10 @@ class HotspotManager {
   bool ShouldTriggerScanAsCompaction(uint64_t cuid);
 
   void FinalizeScanAsCompaction(uint64_t cuid);
+
+  Status MergeAndFlush(uint64_t cuid, 
+                                     const std::vector<HotEntry>& new_data, 
+                                     const std::string& old_file_path);
 
   bool IsCuidDeleted(uint64_t cuid) {
       return delete_table_.IsDeleted(cuid);

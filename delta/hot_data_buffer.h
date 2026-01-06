@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
+#include <deque>
 #include "rocksdb/slice.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
@@ -16,11 +17,25 @@ struct HotEntry {
   uint64_t cuid;
   std::string key;
   std::string value;
+  // uint64_t seq;
   
   // 用于排序
   bool operator<(const HotEntry& other) const {
     return key < other.key; 
   }
+};
+
+// buffer block
+struct HotDataBlock {
+  std::vector<HotEntry> entries;
+  size_t current_size_bytes = 0;
+  
+  void Add(uint64_t c, const Slice& k, const Slice& v) {
+    entries.push_back({c, k.ToString(), v.ToString()});
+    current_size_bytes += (k.size() + v.size());
+  }
+  
+  void Sort(); // 按 CUID, Key 排序
 };
 
 
@@ -33,18 +48,24 @@ class HotDataBuffer {
   // 如果 buffer 大小超过阈值，返回 true (need Flush)
   bool Append(uint64_t cuid, const Slice& key, const Slice& value);
 
-  std::vector<HotEntry> ExtractAndReset();
+  // Active Buffer -> Immutable Queue
+  bool RotateBuffer();
 
-  size_t GetTotalSize() const;
+  std::unique_ptr<HotDataBlock> ExtractBlockToFlush();
+
+  // std::vector<HotEntry> ExtractAndReset();
+
+  size_t GetTotalBufferedSize() const { return total_buffered_size_; }
 
  private:
   // flush threshold
   size_t threshold_bytes_;
+  std::atomic<size_t> total_buffered_size_;
   mutable std::mutex mutex_;
 
-  std::vector<HotEntry> buffer_; // 共享 Buffer
-  // 全局总大小统计
-  size_t total_size_bytes_;
+  std::mutex mutex_;
+  std::unique_ptr<HotDataBlock> active_block_;
+  std::deque<std::unique_ptr<HotDataBlock>> immutable_queue_;
 };
 
 class HotSstLifecycleManager {

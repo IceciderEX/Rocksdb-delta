@@ -558,9 +558,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                 if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
                   hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
                   delta_ctx_.visited_units_for_cuid.insert(phys_id);
-                  
-                  // // 记录该 Delta 片段在原始 LSM 中的位置？
-
+                  // // 记录该 Delta 片段在原始 LSM 中的位置？delta 列表
                 }
 
                 // 将 scan数据送入热点 Buffer
@@ -675,6 +673,15 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
       return false;
     }
   } while (iter_.Valid());
+
+  // for delta
+  if (hotspot_manager_) {
+    // 处理最后一个 cuid 可能的 sac
+    if (delta_ctx_.trigger_scan_as_compaction && delta_ctx_.last_cuid != 0) {
+      hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+    }
+    delta_ctx_.Reset();
+  }
 
   valid_ = false;
   return iter_.status().ok();

@@ -254,6 +254,7 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   }
 
   // for delta physical
+  // 【暂时不用】
   uint64_t GetPhysicalId() override {
     // 这里我们需要一个唯一标识 SST 的东西。
     // block_based_table_ 也就是 TableReader 的指针是最好的 ID，每个 SST 文件对应一个 reader 实例。

@@ -3,42 +3,64 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+void HotDataBlock::Sort() {
+  // CUID 的数据连续
+  std::sort(entries.begin(), entries.end(), 
+    [](const HotEntry& a, const HotEntry& b) {
+      if (a.cuid != b.cuid) {
+        return a.cuid < b.cuid;
+      }
+      return a.key < b.key;
+    });
+}
+
 HotDataBuffer::HotDataBuffer(size_t threshold_bytes)
-    : threshold_bytes_(threshold_bytes), total_size_bytes_(0) {
-  buffer_.reserve(10000);
+    : threshold_bytes_(threshold_bytes), total_buffered_size_(0) {
+  active_block_ = std::make_unique<HotDataBlock>();
+  active_block_->entries.reserve(10000);
 }
 
 bool HotDataBuffer::Append(uint64_t cuid, const Slice& key, const Slice& value) {
   std::lock_guard<std::mutex> lock(mutex_);
-
-  // shared buffer
-  buffer_.push_back({cuid, key.ToString(), value.ToString()});
   
-  size_t entry_size = key.size() + value.size();
-  total_size_bytes_ += entry_size;
-
-  // 检查 threshold
-  return total_size_bytes_ >= threshold_bytes_;
+  active_block_->Add(cuid, key, value);
+  total_buffered_size_ += (key.size() + value.size());
+  // threshold
+  return active_block_->current_size_bytes >= threshold_bytes_;
 }
 
-std::vector<HotEntry> HotDataBuffer::ExtractAndReset() {
+bool HotDataBuffer::RotateBuffer() {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (active_block_->entries.empty()) {
+    return false;
+  }
 
-  std::vector<HotEntry> result;
-  // 交换 ownership，clear buffer_
-  result.swap(buffer_);
+  immutable_queue_.push_back(std::move(active_block_));
   
-  // 重置全局计数
-  total_size_bytes_ = 0;
-  buffer_.reserve(10000);
-  
-  return result;
+  // new Active Block
+  active_block_ = std::make_unique<HotDataBlock>();
+  active_block_->entries.reserve(10000);
+  return true;
 }
 
-size_t HotDataBuffer::GetTotalSize() const {
+std::unique_ptr<HotDataBlock> HotDataBuffer::ExtractBlockToFlush() {
   std::lock_guard<std::mutex> lock(mutex_);
-  return total_size_bytes_;
+  if (immutable_queue_.empty()) {
+    return nullptr;
+  }
+
+  auto block = std::move(immutable_queue_.front());
+  immutable_queue_.pop_front();
+  
+  total_buffered_size_ -= block->current_size_bytes;
+  
+  return block;
 }
+
+// size_t HotDataBuffer::GetTotalSize() const {
+//   std::lock_guard<std::mutex> lock(mutex_);
+//   return total_size_bytes_;
+// }
 
 // --------------------- SST Lifecycle Management --------------------- //  
 
