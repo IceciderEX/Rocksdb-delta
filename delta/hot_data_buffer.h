@@ -63,7 +63,6 @@ class HotDataBuffer {
   std::atomic<size_t> total_buffered_size_;
   mutable std::mutex mutex_;
 
-  std::mutex mutex_;
   std::unique_ptr<HotDataBlock> active_block_;
   std::deque<std::unique_ptr<HotDataBlock>> immutable_queue_;
 };

@@ -537,9 +537,6 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
               
                   // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
                   if (delta_ctx_.last_cuid != cuid) {
-                      if (delta_ctx_.trigger_scan_as_compaction && delta_ctx_.last_cuid != 0) {
-                        hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
-                      }
                       delta_ctx_.last_cuid = cuid;
                       delta_ctx_.visited_units_for_cuid.clear();
                       // delta_ctx_.is_counting_mode = hotspot_manager_->GetDeleteTable().TryRegister(cuid);
@@ -563,8 +560,12 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
 
                 // 将 scan数据送入热点 Buffer
                 if (delta_ctx_.trigger_scan_as_compaction) {
-                  hotspot_manager_->BufferHotData(cuid, saved_key_.GetUserKey(), value());
-                }              
+                  // 尝试追加到共享 Buffer
+                  bool buffer_full = hotspot_manager_->BufferHotData(cuid, saved_key_.GetUserKey(), value());
+                  if (buffer_full) {
+                      hotspot_manager_->TriggerBufferFlush();
+                  }
+                }       
               }
             }
             return true;
@@ -676,10 +677,6 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
 
   // for delta
   if (hotspot_manager_) {
-    // 处理最后一个 cuid 可能的 sac
-    if (delta_ctx_.trigger_scan_as_compaction && delta_ctx_.last_cuid != 0) {
-      hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
-    }
     delta_ctx_.Reset();
   }
 

@@ -34,13 +34,13 @@ class HotspotManager {
   bool RegisterScan(uint64_t cuid);
 
   // 收集数据 (只有 RegisterScan 返回 true 时才调用此函数)
-  void BufferHotData(uint64_t cuid, const Slice& key, const Slice& value);
+  bool BufferHotData(uint64_t cuid, const Slice& key, const Slice& value);
 
   Status FlushBlockToSharedSST(
     std::unique_ptr<HotDataBlock> block,
     std::unordered_map<uint64_t, DataSegment>* output_segments);
 
-  void HotspotManager::TriggerBufferFlush();
+  void TriggerBufferFlush();
 
   HotIndexTable& GetIndexTable() { return index_table_; }
 
@@ -49,10 +49,6 @@ class HotspotManager {
   bool ShouldTriggerScanAsCompaction(uint64_t cuid);
 
   void FinalizeScanAsCompaction(uint64_t cuid);
-
-  Status MergeAndFlush(uint64_t cuid, 
-                                     const std::vector<HotEntry>& new_data, 
-                                     const std::string& old_file_path);
 
   bool IsCuidDeleted(uint64_t cuid) {
       return delete_table_.IsDeleted(cuid);
