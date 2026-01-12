@@ -1639,7 +1639,8 @@ Status DBImpl::CompactFilesImpl(
       kManualCompactionCanceledFalse_, db_id_, db_session_id_,
       c->column_family_data()->GetFullHistoryTsLow(), c->trim_ts(),
       &blob_callback_, &bg_compaction_scheduled_,
-      &bg_bottom_compaction_scheduled_);
+      &bg_bottom_compaction_scheduled_,
+      GetHotspotManager());
 
   // Creating a compaction influences the compaction score because the score
   // takes running compactions into account (by skipping files that are already
@@ -4288,7 +4289,8 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
                   : kManualCompactionCanceledFalse_,
         db_id_, db_session_id_, c->column_family_data()->GetFullHistoryTsLow(),
         c->trim_ts(), &blob_callback_, &bg_compaction_scheduled_,
-        &bg_bottom_compaction_scheduled_);
+        &bg_bottom_compaction_scheduled_,
+        GetHotspotManager());
     compaction_job.Prepare(std::nullopt /*subcompact to be computed*/);
 
     std::unique_ptr<std::list<uint64_t>::iterator> min_options_file_number_elem;

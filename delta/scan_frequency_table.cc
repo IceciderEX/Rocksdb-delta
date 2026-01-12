@@ -22,6 +22,14 @@ void ScanFrequencyTable::CheckAndRotateWindow() {
   }
 }
 
+bool ScanFrequencyTable::IsHot(uint64_t cuid) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it != table_.end()) {
+    return it->second.is_hot;
+  }
+  return false;
+}
 
 bool ScanFrequencyTable::RecordAndCheckHot(uint64_t cuid) {
   std::lock_guard<std::mutex> lock(mutex_);

@@ -27,6 +27,22 @@ void GlobalDeleteCountTable::UntrackPhysicalUnit(uint64_t cuid, uint64_t phys_id
   }
 }
 
+// 用于 L0Compaction 对 delete cuid 的清理
+void GlobalDeleteCountTable::UntrackFiles(uint64_t cuid, const std::vector<uint64_t>& file_ids) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it != table_.end()) {
+    // 遍历本次 Compaction 的所有输入文件
+    for (uint64_t fid : file_ids) {
+      it->second.tracked_phys_ids.erase(fid);
+    }
+    // 检查是否归零且标记删除，如果是则清理条目
+    if (it->second.tracked_phys_ids.empty() && it->second.is_deleted) {
+      table_.erase(it);
+    }
+  }
+}
+
 bool GlobalDeleteCountTable::MarkDeleted(uint64_t cuid) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto it = table_.find(cuid);

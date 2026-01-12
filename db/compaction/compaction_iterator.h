@@ -17,6 +17,7 @@
 #include "db/pinned_iterators_manager.h"
 #include "db/range_del_aggregator.h"
 #include "db/snapshot_checker.h"
+#include "delta/hotspot_manager.h"
 #include "options/cf_options.h"
 #include "rocksdb/compaction_filter.h"
 
@@ -213,7 +214,9 @@ class CompactionIterator {
       const std::atomic<bool>* shutting_down = nullptr,
       const std::shared_ptr<Logger> info_log = nullptr,
       const std::string* full_history_ts_low = nullptr,
-      std::optional<SequenceNumber> preserve_seqno_min = {});
+      std::optional<SequenceNumber> preserve_seqno_min = {},
+      std::shared_ptr<HotspotManager> hotspot_manager = nullptr,
+      std::vector<uint64_t> input_file_numbers = {});
 
   // Constructor with custom CompactionProxy, used for tests.
   CompactionIterator(InternalIterator* input, const Comparator* cmp,
@@ -235,7 +238,9 @@ class CompactionIterator {
                      const std::atomic<bool>* shutting_down = nullptr,
                      const std::shared_ptr<Logger> info_log = nullptr,
                      const std::string* full_history_ts_low = nullptr,
-                     std::optional<SequenceNumber> preserve_seqno_min = {});
+                     std::optional<SequenceNumber> preserve_seqno_min = {},
+                     std::shared_ptr<HotspotManager> hotspot_manager = nullptr, 
+                     std::vector<uint64_t> input_file_numbers = {});
 
   ~CompactionIterator();
 
@@ -521,6 +526,14 @@ class CompactionIterator {
   // Stores whether the current compaction iterator output
   // is a range tombstone start key.
   bool is_range_del_{false};
+
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+  uint64_t current_cuid_ = 0;   // 正在处理的 cuid
+  bool skip_current_cuid_ = false; // 缓存当前cuid是否需要被跳过
+  std::vector<uint64_t> input_file_numbers_;
+
+  void CheckHotspotFilters();
 };
 
 inline bool CompactionIterator::DefinitelyInSnapshot(SequenceNumber seq,

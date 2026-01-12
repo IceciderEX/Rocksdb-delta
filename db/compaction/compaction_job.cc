@@ -144,7 +144,9 @@ CompactionJob::CompactionJob(
     const std::string& db_id, const std::string& db_session_id,
     std::string full_history_ts_low, std::string trim_ts,
     BlobFileCompletionCallback* blob_callback, int* bg_compaction_scheduled,
-    int* bg_bottom_compaction_scheduled)
+    int* bg_bottom_compaction_scheduled,
+    // for delta
+    std::shared_ptr<HotspotManager> hotspot_manager)
     : compact_(new CompactionState(compaction)),
       internal_stats_(compaction->compaction_reason(), 1),
       db_options_(db_options),
@@ -1449,6 +1451,18 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
   const std::string* const full_history_ts_low =
       full_history_ts_low_.empty() ? nullptr : &full_history_ts_low_;
   assert(job_context_);
+  
+  // for delta
+  std::vector<uint64_t> input_file_numbers;
+  // Level
+  for (size_t i = 0; i < sub_compact->compaction->num_input_levels(); ++i) {
+      // Files
+      for (const auto& file : *sub_compact->compaction->inputs(i)) {
+          input_file_numbers.push_back(file->fd.GetNumber());
+      }
+  }
+
+  std::shared_ptr<HotspotManager> hotspot_manager = hotspot_manager_;
 
   return std::make_unique<CompactionIterator>(
       input, cfd->user_comparator(), &merge, versions_->LastSequence(),
@@ -1461,7 +1475,9 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
       sub_compact->compaction
           ->DoesInputReferenceBlobFiles() /* must_count_input_entries */,
       sub_compact->compaction, compaction_filter, shutting_down_,
-      db_options_.info_log, full_history_ts_low, preserve_seqno_after_);
+      db_options_.info_log, full_history_ts_low, preserve_seqno_after_,
+      hotspot_manager,
+      input_file_numbers);
 }
 
 std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc>

@@ -58,6 +58,8 @@ class InternalKeyComparator;
 class WalFilter;
 class FileSystem;
 class UserDefinedIndexFactory;
+// for delta
+class HotspotManager;
 
 struct Options;
 struct DbPath;
@@ -1726,6 +1728,9 @@ struct DBOptions {
   CompactionStyleSet calculate_sst_write_lifetime_hint_set = {
       CompactionStyle::kCompactionStyleLevel};
   // End EXPERIMENTAL
+
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager = nullptr;
 };
 
 // Options to control the behavior of a database (passed to DB::Open)

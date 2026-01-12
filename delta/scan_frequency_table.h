@@ -21,6 +21,8 @@ class ScanFrequencyTable {
 
   void RemoveCUID(uint64_t cuid);
 
+  bool IsHot(uint64_t cuid) const;
+
  private:
   void CheckAndRotateWindow();
 

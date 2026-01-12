@@ -675,7 +675,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
     }
   } while (iter_.Valid());
 
-  // for delta
+  // for delta, this scan ends
   if (hotspot_manager_) {
     delta_ctx_.Reset();
   }

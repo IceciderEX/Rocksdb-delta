@@ -15,6 +15,7 @@
 #include "db/snapshot_checker.h"
 #include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
+#include "delta/hotspot_manager.h"
 #include "logging/logging.h"
 #include "port/likely.h"
 #include "rocksdb/listener.h"
@@ -38,7 +39,9 @@ CompactionIterator::CompactionIterator(
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
-    std::optional<SequenceNumber> preserve_seqno_min)
+    std::optional<SequenceNumber> preserve_seqno_min,
+    std::shared_ptr<HotspotManager> hotspot_manager,
+    std::vector<uint64_t> input_file_numbers)
     : CompactionIterator(
           input, cmp, merge_helper, last_sequence, snapshots, earliest_snapshot,
           earliest_write_conflict_snapshot, job_snapshot, snapshot_checker, env,
@@ -47,7 +50,8 @@ CompactionIterator::CompactionIterator(
           manual_compaction_canceled,
           compaction ? std::make_unique<RealCompaction>(compaction) : nullptr,
           must_count_input_entries, compaction_filter, shutting_down, info_log,
-          full_history_ts_low, preserve_seqno_min) {}
+          full_history_ts_low, preserve_seqno_min,
+          hotspot_manager, input_file_numbers) {}
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
@@ -65,7 +69,9 @@ CompactionIterator::CompactionIterator(
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
-    std::optional<SequenceNumber> preserve_seqno_min)
+    std::optional<SequenceNumber> preserve_seqno_min,
+    std::shared_ptr<HotspotManager> hotspot_manager,
+    std::vector<uint64_t> input_file_numbers)
     : input_(input, cmp, must_count_input_entries),
       cmp_(cmp),
       merge_helper_(merge_helper),
@@ -104,7 +110,11 @@ CompactionIterator::CompactionIterator(
       current_key_committed_(false),
       cmp_with_history_ts_low_(0),
       level_(compaction_ == nullptr ? 0 : compaction_->level()),
-      preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)) {
+      preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)),
+      hotspot_manager_(hotspot_manager), // for delta new Init
+      input_file_numbers_(std::move(input_file_numbers)),
+      current_cuid_(0),
+      skip_current_cuid_(false) {
   assert(snapshots_ != nullptr);
   assert(preserve_seqno_after_ <= earliest_snapshot_);
 
@@ -447,12 +457,61 @@ bool CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
   return true;
 }
 
+// for delta
+void CompactionIterator::CheckHotspotFilters() {
+  if (!hotspot_manager_) return;
+
+  // 1. 提取当前 Key 的 CUID
+  uint64_t cuid = hotspot_manager_->ExtractCUID(input_.key());
+
+  if (cuid == current_cuid_ && cuid != 0) {
+    return;
+  }
+
+  current_cuid_ = cuid;
+  skip_current_cuid_ = false;
+  if (cuid == 0) return;
+
+  // c)	当读取到某个CUid的数据时，检查全局CUid删除计数表，若该CUid已被标记为删除，
+  // 则直接跳过该段数据，不写入新文件，并减去一次该CUid在计数表中的引用计数
+  if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid)) {
+    skip_current_cuid_ = true;
+    hotspot_manager_->GetDeleteTable().UntrackFiles(cuid, input_file_numbers_);
+    return; 
+  }
+
+  // d)	若遇到热点CUid，检查其热点索引表，若发现Deltas列表中对应的该段数据已被标记为 Obsolete，
+  // 则直接跳过该段数据，并删除对应的Deltas记录。
+  HotIndexEntry entry;
+  if (hotspot_manager_->GetIndexTable().GetEntry(cuid, &entry)) {
+      if (entry.HasSnapshot()) {
+          skip_current_cuid_ = true;
+          hotspot_manager_->GetIndexTable().RemoveDeltas(cuid);
+      }
+  }
+}
+
 void CompactionIterator::NextFromInput() {
   at_next_ = false;
   validity_info_.Invalidate();
 
   while (!Valid() && input_.Valid() && !IsPausingManualCompaction() &&
          !IsShuttingDown()) {
+
+    if (hotspot_manager_) {
+        // 执行检查逻辑，更新 skip_current_cuid_ 状态
+        CheckHotspotFilters();
+
+        if (skip_current_cuid_) {
+            // 统计被跳过的记录数 (可选)
+            iter_stats_.num_record_drop_obsolete++;
+            
+            // 直接跳过当前 Key，不进行 ParseInternalKey 等开销操作
+            input_.Next();
+            continue; 
+        }
+    }
+
     key_ = input_.key();
     value_ = input_.value();
     blob_value_.Reset();

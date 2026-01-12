@@ -75,7 +75,10 @@ Status BuildTable(
     Env::WriteLifeTimeHint write_hint, const std::string* full_history_ts_low,
     BlobFileCompletionCallback* blob_callback, Version* version,
     uint64_t* memtable_payload_bytes, uint64_t* memtable_garbage_bytes,
-    InternalStats::CompactionStats* flush_stats) {
+    InternalStats::CompactionStats* flush_stats,
+    // for delta
+    std::unordered_map<uint64_t, DataSegment>* output_segments,
+    HotspotManager* hotspot_manager) {
   assert((tboptions.column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          tboptions.column_family_name.empty());
@@ -212,6 +215,13 @@ Status BuildTable(
     SequenceNumber smallest_preferred_seqno = kMaxSequenceNumber;
     std::string key_after_flush_buf;
     std::string value_buf;
+
+    // delta
+    uint64_t current_cuid = 0;
+    uint64_t segment_start_offset = 0;
+    std::string segment_first_key;
+    bool is_segment_active = false;
+
     c_iter.SeekToFirst();
     for (; c_iter.Valid(); c_iter.Next()) {
       const Slice& key = c_iter.key();
@@ -250,6 +260,38 @@ Status BuildTable(
       if (!s.ok()) {
         break;
       }
+      
+      // for delta
+      if (hotspot_manager && output_segments) {
+        uint64_t cuid = hotspot_manager->ExtractCUID(key);
+        
+        if (cuid != current_cuid) {
+          // end last Segment
+          if (is_segment_active && current_cuid != 0) {
+            uint64_t current_offset = builder->FileSize();
+            DataSegment& seg = (*output_segments)[current_cuid];
+            seg.offset = segment_start_offset;
+            seg.length = current_offset - segment_start_offset;
+            // seg.first_key 在开始时记录
+          }
+
+          // new Segment
+          if (cuid != 0) {
+            current_cuid = cuid;
+            segment_start_offset = builder->FileSize();
+            segment_first_key = key.ToString(); // 记录 key 的副本
+            
+            DataSegment& seg = (*output_segments)[current_cuid];
+            seg.first_key = segment_first_key;
+            
+            is_segment_active = true;
+          } else {
+            is_segment_active = false;
+            current_cuid = 0;
+          }
+        }
+      }
+
       builder->Add(key_after_flush, value_after_flush);
 
       if (flush_stats) {
@@ -273,6 +315,15 @@ Status BuildTable(
             ThreadStatus::FLUSH_BYTES_WRITTEN, IOSTATS(bytes_written));
       }
     }
+
+    // for delta, end last Segment
+    if (hotspot_manager && output_segments && is_segment_active && current_cuid != 0) {
+        uint64_t current_offset = builder->FileSize();
+        DataSegment& seg = (*output_segments)[current_cuid];
+        seg.offset = segment_start_offset;
+        seg.length = current_offset - segment_start_offset;
+    }
+    
     if (!s.ok()) {
       c_iter.status().PermitUncheckedError();
     } else if (!c_iter.status().ok()) {

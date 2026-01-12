@@ -151,6 +151,7 @@ Status HotspotManager::FlushBlockToSharedSST(
   block->Sort();
 
   // 2. 准备 Writer
+  // 确认一下 VersionSet？
   EnvOptions env_options;
   SstFileWriter sst_writer(env_options, db_options_);
   
@@ -253,6 +254,10 @@ void HotspotManager::TriggerBufferFlush() {
         }
         block = buffer_.ExtractBlockToFlush();
     }
+}
+
+bool HotspotManager::IsHot(uint64_t cuid) {
+  return frequency_table_.IsHot(cuid);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

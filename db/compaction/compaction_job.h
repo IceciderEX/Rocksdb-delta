@@ -31,6 +31,7 @@
 #include "db/version_edit.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
+#include "delta/hotspot_manager.h"
 #include "logging/event_logger.h"
 #include "options/cf_options.h"
 #include "options/db_options.h"
@@ -162,7 +163,9 @@ class CompactionJob {
                 std::string full_history_ts_low = "", std::string trim_ts = "",
                 BlobFileCompletionCallback* blob_callback = nullptr,
                 int* bg_compaction_scheduled = nullptr,
-                int* bg_bottom_compaction_scheduled = nullptr);
+                int* bg_bottom_compaction_scheduled = nullptr,
+                // for delta
+                std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
 
   virtual ~CompactionJob();
 
@@ -557,6 +560,9 @@ class CompactionJob {
   void UpdateSubcompactionProgressPerLevel(
       SubcompactionState* sub_compact, bool is_proximal_level,
       SubcompactionProgress& subcompaction_progress);
+  
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager_;
 };
 
 // CompactionServiceInput is used the pass compaction information between two

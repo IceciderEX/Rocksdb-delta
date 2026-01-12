@@ -54,6 +54,8 @@ class HotspotManager {
       return delete_table_.IsDeleted(cuid);
   }
 
+  bool IsHot(uint64_t cuid);
+
   // 拦截 Delete 操作?
   bool InterceptDelete(const Slice& key);
 

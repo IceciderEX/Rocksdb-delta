@@ -283,6 +283,10 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   Options hotspot_opts(initial_db_options_, default_cf_opts);
   
   hotspot_manager_ = std::make_shared<HotspotManager>(hotspot_opts, hotspot_dir);
+  immutable_db_options_.hotspot_manager = hotspot_manager_;
+
+  ROCKS_LOG_INFO(immutable_db_options_.info_log, 
+               "HotspotManager initialized at %s", hotspot_dir.c_str());
 }
 
 Status DBImpl::Resume() {
