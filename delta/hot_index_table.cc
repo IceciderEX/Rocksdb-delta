@@ -47,6 +47,34 @@ void HotIndexTable::AppendSnapshotSegment(uint64_t cuid, const DataSegment& segm
   }
 }
 
+bool HotIndexTable::PromoteSnapshot(uint64_t cuid, const DataSegment& new_segment) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) {
+    return false;
+  }
+
+  auto& entry = it->second;
+  bool found_mem_segment = false;
+
+  // 遍历 Snapshot 片段，寻找 file_number 为 -1 的片段
+  for (auto& seg : entry.snapshot_segments) {
+    if (seg.file_number == static_cast<uint64_t>(-1)) {
+      // 找到了内存片段，原地更新为真实文件信息 (Offset/Length/FileNum)
+      seg = new_segment; 
+      found_mem_segment = true;
+      break; 
+    }
+  }
+
+  if (found_mem_segment && lifecycle_manager_) {
+    lifecycle_manager_->Ref(new_segment.file_number);
+    // -1 状态没有 Ref
+  }
+
+  return found_mem_segment;
+}
+
 void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {
   {
     std::unique_lock<std::shared_mutex> lock(mutex_);

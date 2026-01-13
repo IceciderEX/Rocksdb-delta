@@ -37,6 +37,10 @@ class HotIndexTable {
   // scan-as-compaction -> add snapshots
   void AppendSnapshotSegment(uint64_t cuid, const DataSegment& segment);
 
+  // 将内存中的 Snapshot (file_id = -1) 替换为真实 new_segment
+  // 返回 true 表示成功找到并替换，false 表示未找到 -1 记录
+  bool PromoteSnapshot(uint64_t cuid, const DataSegment& new_segment);
+
   void AddDelta(uint64_t cuid, const DataSegment& segment);
 
   bool GetEntry(uint64_t cuid, HotIndexEntry* entry) const;

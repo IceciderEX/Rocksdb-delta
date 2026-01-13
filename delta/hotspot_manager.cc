@@ -49,40 +49,25 @@ bool HotspotManager::RegisterScan(uint64_t cuid) {
   return frequency_table_.RecordAndCheckHot(cuid);
 }
 
+bool HotspotManager::RegisterScan(uint64_t cuid) {
+    if (cuid == 0) return false;
+    
+    bool is_hot = frequency_table_.RecordAndCheckHot(cuid);
+    if (is_hot) {
+        // 初始化 pending 列表
+        if (ShouldTriggerScanAsCompaction(cuid)) {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            if (pending_snapshots_.find(cuid) == pending_snapshots_.end()) {
+                pending_snapshots_[cuid] = std::vector<DataSegment>();
+            }
+        }
+    }
+    return is_hot;
+}
+
 bool HotspotManager::BufferHotData(uint64_t cuid, const Slice& key, const Slice& value) {
   return buffer_.Append(cuid, key, value);
 }
-
-// void HotspotManager::OnUserScan(const Slice& key, const Slice& value) {
-//   uint64_t cuid = ExtractCUID(key);
-//   if (cuid == 0) return; // 解析失败或非目标 Key
-
-//   if (delete_table_.IsDeleted(cuid)) {
-//       return; 
-//   }
-
-//   // hot cuid check
-//   bool is_hot = frequency_table_.RecordAndCheckHot(cuid);
-//   // delete_table_.IncrementRefCount(cuid);
-
-//   if (!is_hot) {
-//     // no scan-as-compaction
-//     return;
-//   }
-
-//   // 尝试追加到 buffer
-//   // Append 内部已经加锁  
-//   bool needs_flush = buffer_.Append(cuid, key, value);
-
-//   if (needs_flush) {
-//     // TODO：目前实现，直接在当前线程 flush，后续需要改为后台线程？
-//     Status s = FlushGlobalBufferToSST();
-//     if (!s.ok()) {
-//       fprintf(stderr, "[HotspotManager] Flush SST failed for CUID %lu: %s\n", 
-//               cuid, s.ToString().c_str());
-//     }
-//   }
-// }
 
 bool HotspotManager::InterceptDelete(const Slice& key) {
   uint64_t cuid = ExtractCUID(key);
@@ -241,12 +226,24 @@ void HotspotManager::TriggerBufferFlush() {
         Status s = FlushBlockToSharedSST(std::move(block), &new_segments);
         
         if (s.ok()) {
-            // 批量更新索引
             for (const auto& kv : new_segments) {
                 uint64_t cuid = kv.first;
-                const DataSegment& segment = kv.second;
-                // 简化实现：直接作为 Snapshot 片段追加?
-                index_table_.AppendSnapshotSegment(kv.first, kv.second);
+                const DataSegment& real_segment = kv.second;
+                // 直接作为 Snapshot 片段追加?
+                // index_table_.AppendSnapshotSegment(kv.first, kv.second);
+                auto it = pending_snapshots_.find(cuid);
+                if (it != pending_snapshots_.end()) {
+                    // Case A: Scan 过程中触发的 Flush, Finalize 时一起提交
+                    it->second.push_back(real_segment);
+                } else {
+                    // Case B: scan 之后被其他cuid数据填满 flush，
+                    // 检查 Index 中 {-1} 的记录
+                    bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
+                    if (!promoted) {
+                        // 如果没有 -1?
+                        index_table_.AppendSnapshotSegment(kv.first, kv.second);
+                    }
+                }
             }
         } else {
           fprintf(stderr, "[HotspotManager] Failed to flush shared block: %s\n", 
@@ -254,6 +251,36 @@ void HotspotManager::TriggerBufferFlush() {
         }
         block = buffer_.ExtractBlockToFlush();
     }
+}
+
+void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
+    if (cuid == 0) return;
+
+    std::vector<DataSegment> final_segments;
+
+    // Scan 过程中产生的 Pending SSTs
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        auto it = pending_snapshots_.find(cuid);
+        if (it != pending_snapshots_.end()) {
+            final_segments = it->second;
+            pending_snapshots_.erase(it); 
+        }
+    }
+
+    // tail segment
+    DataSegment tail_segment;
+    tail_segment.file_number = static_cast<uint64_t>(-1);
+    tail_segment.offset = 0; 
+    tail_segment.length = 0; 
+    
+    final_segments.push_back(tail_segment);
+
+    // 更新这个 cuid 的 Snapshot
+    index_table_.UpdateSnapshot(cuid, final_segments);
+    
+    // fprintf(stdout, "[HotspotManager] Finalized CUID %lu. Snapshot has %zu segments (incl tail).\n", 
+    //         cuid, final_segments.size());
 }
 
 bool HotspotManager::IsHot(uint64_t cuid) {

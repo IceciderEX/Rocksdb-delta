@@ -537,6 +537,10 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
               
                   // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
                   if (delta_ctx_.last_cuid != cuid) {
+                      // 将上个 cuid 的 Scan-as-Compaction 结果提交
+                      if (delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
+                          hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+                      }
                       delta_ctx_.last_cuid = cuid;
                       delta_ctx_.visited_units_for_cuid.clear();
                       // delta_ctx_.is_counting_mode = hotspot_manager_->GetDeleteTable().TryRegister(cuid);
@@ -677,6 +681,10 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
 
   // for delta, this scan ends
   if (hotspot_manager_) {
+    // 最后一个 CUID 正在进行 Scan-as-Compaction，需要 Finalize
+    if (delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
+        hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+    }
     delta_ctx_.Reset();
   }
 

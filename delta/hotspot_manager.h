@@ -73,6 +73,11 @@ class HotspotManager {
 
   ScanFrequencyTable frequency_table_;
   GlobalDeleteCountTable delete_table_;
+
+  // 暂存正在进行的 Scan 所生成的 SST 片段
+  // FinalizeScanAsCompaction -> IndexTable
+  std::unordered_map<uint64_t, std::vector<DataSegment>> pending_snapshots_;
+  std::mutex pending_mutex_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
