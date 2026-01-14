@@ -482,11 +482,12 @@ void CompactionIterator::CheckHotspotFilters() {
 
   // d)	若遇到热点CUid，检查其热点索引表，若发现Deltas列表中对应的该段数据已被标记为 Obsolete，
   // 则直接跳过该段数据，并删除对应的Deltas记录。
-  HotIndexEntry entry;
-  if (hotspot_manager_->GetIndexTable().GetEntry(cuid, &entry)) {
-      if (entry.HasSnapshot()) {
-          skip_current_cuid_ = true;
-          hotspot_manager_->GetIndexTable().RemoveDeltas(cuid);
+  if (hotspot_manager_->IsHot(cuid)) {
+      // 传入当前正在 Compact 的文件列表
+      // CheckAndRemoveObsoleteDeltas 会执行查找、Unref 和 Erase 操作
+      if (hotspot_manager_->GetIndexTable().CheckAndRemoveObsoleteDeltas(cuid, input_file_numbers_)) {
+        skip_current_cuid_ = true;  
+        return;
       }
   }
 }
@@ -497,16 +498,14 @@ void CompactionIterator::NextFromInput() {
 
   while (!Valid() && input_.Valid() && !IsPausingManualCompaction() &&
          !IsShuttingDown()) {
-
+    
+    // for delta
     if (hotspot_manager_) {
-        // 执行检查逻辑，更新 skip_current_cuid_ 状态
         CheckHotspotFilters();
-
+        // 当前 cuid 是否跳过
         if (skip_current_cuid_) {
-            // 统计被跳过的记录数 (可选)
-            iter_stats_.num_record_drop_obsolete++;
-            
-            // 直接跳过当前 Key，不进行 ParseInternalKey 等开销操作
+            iter_stats_.num_record_drop_obsolete++;    
+            // 直接跳过当前 Key
             input_.Next();
             continue; 
         }

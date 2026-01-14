@@ -190,7 +190,9 @@ CompactionJob::CompactionJob(
       blob_callback_(blob_callback),
       extra_num_subcompaction_threads_reserved_(0),
       bg_compaction_scheduled_(bg_compaction_scheduled),
-      bg_bottom_compaction_scheduled_(bg_bottom_compaction_scheduled) {
+      bg_bottom_compaction_scheduled_(bg_bottom_compaction_scheduled),
+      // for delta
+      hotspot_manager_(std::move(hotspot_manager)) {
   assert(job_stats_ != nullptr);
   assert(log_buffer_ != nullptr);
   assert(job_context);

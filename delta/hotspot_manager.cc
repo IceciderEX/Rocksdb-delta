@@ -136,7 +136,7 @@ Status HotspotManager::FlushBlockToSharedSST(
   block->Sort();
 
   // 2. 准备 Writer
-  // 确认一下 VersionSet？
+  // 确认一下 VersionSet？【不会进入】
   EnvOptions env_options;
   SstFileWriter sst_writer(env_options, db_options_);
   
@@ -278,6 +278,8 @@ void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
 
     // 更新这个 cuid 的 Snapshot
     index_table_.UpdateSnapshot(cuid, final_segments);
+
+    index_table_.MarkDeltasAsObsolete(cuid);
     
     // fprintf(stdout, "[HotspotManager] Finalized CUID %lu. Snapshot has %zu segments (incl tail).\n", 
     //         cuid, final_segments.size());

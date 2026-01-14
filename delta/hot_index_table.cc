@@ -15,13 +15,13 @@ void HotIndexTable::UpdateSnapshot(uint64_t cuid, const std::vector<DataSegment>
     }
     
     // TODO(delta)：进一步确认
-    // Old Deltas -> new Snapshot? 也需要 ref?
-    if (!entry.deltas.empty()) {
-      segments_to_unref.insert(segments_to_unref.end(), 
-                               entry.deltas.begin(), 
-                               entry.deltas.end());
-      entry.deltas.clear(); 
-    }
+    // // Old Deltas -> new Snapshot? 也需要 ref?
+    // if (!entry.deltas.empty()) {
+    //   segments_to_unref.insert(segments_to_unref.end(), 
+    //                            entry.deltas.begin(), 
+    //                            entry.deltas.end());
+    //   entry.deltas.clear(); 
+    // }
 
     entry.snapshot_segments = new_segments;
   } 
@@ -96,6 +96,56 @@ bool HotIndexTable::GetEntry(uint64_t cuid, HotIndexEntry* entry) const {
     return true;
   }
   return false;
+}
+
+void HotIndexTable::MarkDeltasAsObsolete(uint64_t cuid) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) return;
+
+  auto& entry = it->second;
+  if (entry.deltas.empty()) return;
+
+  // 将 deltas 移动到 obsolete_deltas
+  entry.obsolete_deltas.insert(entry.obsolete_deltas.end(), 
+                               entry.deltas.begin(), 
+                               entry.deltas.end());
+  entry.deltas.clear();
+  // 等待L0Compaction清理它们
+}
+
+// d)	若遇到热点CUid，检查其热点索引表，若发现Deltas列表中对应的该段数据已被标记为 Obsolete，
+// 则直接跳过该段数据，并删除对应的Deltas记录。
+bool HotIndexTable::CheckAndRemoveObsoleteDeltas(uint64_t cuid, const std::vector<uint64_t>& input_files) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) return false;
+
+  auto& entry = it->second;
+  if (entry.obsolete_deltas.empty()) return false;
+
+  bool found_obsolete = false;
+  
+  for (auto d_it = entry.obsolete_deltas.begin(); d_it != entry.obsolete_deltas.end(); ) {
+    bool is_input_file = false;
+    for (uint64_t fid : input_files) {
+        if (d_it->file_number == fid) {
+            is_input_file = true;
+            break;
+        }
+    }
+    if (is_input_file) {
+        found_obsolete = true;    
+        // 减少 SST 引用计数
+        if (lifecycle_manager_) {
+            lifecycle_manager_->Unref(d_it->file_number);
+        }
+        d_it = entry.obsolete_deltas.erase(d_it);
+    } else {
+        ++d_it;
+    }
+  }
+  return found_obsolete;
 }
 
 void HotIndexTable::RemoveCUID(uint64_t cuid) {

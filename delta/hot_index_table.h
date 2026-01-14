@@ -24,6 +24,8 @@ struct HotIndexEntry {
   // std::vector<DataSegment> delta_segments; 
 
   std::vector<DataSegment> deltas;
+  // Scan-as-Compaction 标记
+  std::vector<DataSegment> obsolete_deltas;
 
   bool HasSnapshot() const { return !snapshot_segments.empty(); }
 };
@@ -42,6 +44,10 @@ class HotIndexTable {
   bool PromoteSnapshot(uint64_t cuid, const DataSegment& new_segment);
 
   void AddDelta(uint64_t cuid, const DataSegment& segment);
+
+  void MarkDeltasAsObsolete(uint64_t cuid);
+
+  bool CheckAndRemoveObsoleteDeltas(uint64_t cuid, const std::vector<uint64_t>& input_files);
 
   bool GetEntry(uint64_t cuid, HotIndexEntry* entry) const;
 
