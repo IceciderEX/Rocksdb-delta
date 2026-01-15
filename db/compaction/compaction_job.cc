@@ -128,6 +128,31 @@ const char* GetCompactionProximalOutputRangeTypeString(
   }
 }
 
+// for delta
+struct DeltaCompactionContext {
+    std::shared_ptr<HotspotManager> manager;
+    std::vector<uint64_t> input_files;
+    
+    uint64_t current_cuid = 0;
+    uint64_t cuid_start_offset = 0; 
+    uint64_t current_file_number = 0;
+    
+    // 考虑 FileSize不更新，length=0
+    uint64_t current_cuid_logical_size = 0; 
+
+    void FlushSegment(uint64_t current_physical_offset) {
+        if (current_cuid != 0 && manager) {
+            uint64_t length = current_cuid_logical_size; 
+            if (length > 0) {
+                manager->UpdateCompactionDelta(current_cuid, input_files, 
+                                             current_file_number, 
+                                             cuid_start_offset, length);
+            }
+        }
+        current_cuid_logical_size = 0;
+    }
+};
+
 CompactionJob::CompactionJob(
     int job_id, Compaction* compaction, const ImmutableDBOptions& db_options,
     const MutableDBOptions& mutable_db_options, const FileOptions& file_options,
@@ -1484,23 +1509,42 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
 
 std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc>
 CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
-                                  SubcompactionKeyBoundaries& boundaries) {
+                                  SubcompactionKeyBoundaries& boundaries,
+                                  std::shared_ptr<DeltaCompactionContext> delta_ctx) {
+  // for delta
+  // auto delta_ctx = std::make_shared<DeltaCompactionContext>();
   const CompactionFileOpenFunc open_file_func =
-      [this, sub_compact](CompactionOutputs& outputs) {
-        return this->OpenCompactionOutputFile(sub_compact, outputs);
+      [this, sub_compact, delta_ctx](CompactionOutputs& outputs) {
+        Status s = this->OpenCompactionOutputFile(sub_compact, outputs);
+        if (s.ok()) {
+          FileMetaData* meta = outputs.GetMetaData();
+          if (meta) {
+            delta_ctx->current_file_number = meta->fd.GetNumber();
+            // new file
+            delta_ctx->cuid_start_offset = 0;
+          }
+        }
+        return s;
       };
 
   const Slice* start_user_key =
       sub_compact->start.has_value() ? &boundaries.start_user_key : nullptr;
   const Slice* end_user_key =
       sub_compact->end.has_value() ? &boundaries.end_user_key : nullptr;
-
+  
+  // for delta
   const CompactionFileCloseFunc close_file_func =
-      [this, sub_compact, start_user_key, end_user_key](
+      [this, sub_compact, start_user_key, end_user_key, delta_ctx](
           const Status& status,
           const ParsedInternalKey& prev_iter_output_internal_key,
           const Slice& next_table_min_key, const CompactionIterator* c_iter,
           CompactionOutputs& outputs) {
+        
+        if (delta_ctx->current_cuid != 0) {
+          uint64_t file_size = outputs.GetBuilder() ? outputs.GetBuilder()->FileSize() : 0;
+          delta_ctx->FlushSegment(file_size);
+        }
+
         return this->FinishCompactionOutputFile(
             status, prev_iter_output_internal_key, next_table_min_key,
             start_user_key, end_user_key, c_iter, sub_compact, outputs);
@@ -1512,7 +1556,9 @@ CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
 Status CompactionJob::ProcessKeyValue(
     SubcompactionState* sub_compact, ColumnFamilyData* cfd,
     CompactionIterator* c_iter, const CompactionFileOpenFunc& open_file_func,
-    const CompactionFileCloseFunc& close_file_func, uint64_t& prev_cpu_micros) {
+    const CompactionFileCloseFunc& close_file_func, uint64_t& prev_cpu_micros,
+    // for delta
+    std::shared_ptr<DeltaCompactionContext> delta_ctx) {
   Status status;
   const uint64_t kRecordStatsEvery = 1000;
   [[maybe_unused]] const std::optional<const Slice> end = sub_compact->end;
@@ -1528,6 +1574,25 @@ Status CompactionJob::ProcessKeyValue(
          c_iter->status().ok()) {
     assert(!end.has_value() ||
            cfd->user_comparator()->Compare(c_iter->user_key(), *end) < 0);
+
+    if (delta_ctx && delta_ctx->manager) {
+        uint64_t cuid = delta_ctx->manager->ExtractCUID(c_iter->key());
+        
+        if (cuid != delta_ctx->current_cuid) {
+             CompactionOutputs& outputs = sub_compact->Current();
+             uint64_t current_phys_offset = 0;
+             if (outputs.GetBuilder()) {
+                 current_phys_offset = outputs.GetBuilder()->FileSize();
+             }
+
+             delta_ctx->FlushSegment(current_phys_offset);
+             // newcuid
+             delta_ctx->current_cuid = cuid;
+             delta_ctx->cuid_start_offset = current_phys_offset;
+             // current_cuid_logical_size 已经在 FlushSegment 中重置为 0
+        }
+        delta_ctx->current_cuid_logical_size += (c_iter->key().size() + c_iter->value().size());
+    }
 
     if (c_iter->iter_stats().num_input_records % kRecordStatsEvery ==
         kRecordStatsEvery - 1) {
@@ -1594,6 +1659,16 @@ Status CompactionJob::ProcessKeyValue(
       break;
     }
 #endif  // NDEBUG
+  }
+
+  // last cuid
+  if (status.ok() && delta_ctx && delta_ctx->manager && delta_ctx->current_cuid != 0) {
+      CompactionOutputs& outputs = sub_compact->Current();
+      uint64_t end_offset = 0;
+      if (outputs.GetBuilder()) {
+          end_offset = outputs.GetBuilder()->FileSize();
+      }
+      delta_ctx->FlushSegment(end_offset);
   }
 
   return status;
@@ -1802,12 +1877,25 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   TEST_SYNC_POINT_CALLBACK("CompactionJob::Run():PausingManualCompaction:1",
                            static_cast<void*>(const_cast<std::atomic<bool>*>(
                                &manual_compaction_canceled_)));
+  
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager = hotspot_manager_;
+  auto delta_ctx = std::make_shared<DeltaCompactionContext>();
+  if (hotspot_manager) {
+      delta_ctx->manager = hotspot_manager;
+      // gather Compaction Inputs
+      for (size_t i = 0; i < sub_compact->compaction->num_input_levels(); ++i) {
+          for (const auto& file : *sub_compact->compaction->inputs(i)) {
+              delta_ctx->input_files.push_back(file->fd.GetNumber());
+          }
+      }
+  }
 
   auto [open_file_func, close_file_func] =
-      CreateFileHandlers(sub_compact, boundaries);
+      CreateFileHandlers(sub_compact, boundaries, delta_ctx);
 
   status = ProcessKeyValue(sub_compact, cfd, c_iter.get(), open_file_func,
-                           close_file_func, prev_cpu_micros);
+                           close_file_func, prev_cpu_micros, delta_ctx);
 
   status = FinalizeProcessKeyValueStatus(cfd, input_iter, c_iter.get(), status);
 
@@ -3102,4 +3190,5 @@ Status CompactionJob::VerifyOutputRecordCount() const {
   }
   return Status::OK();
 }
+
 }  // namespace ROCKSDB_NAMESPACE

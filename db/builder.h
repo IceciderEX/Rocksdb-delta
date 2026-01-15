@@ -15,6 +15,7 @@
 #include "db/seqno_to_time_mapping.h"
 #include "db/table_properties_collector.h"
 #include "db/version_set.h"
+#include "delta/hotspot_manager.h"
 #include "logging/event_logger.h"
 #include "options/cf_options.h"
 #include "rocksdb/comparator.h"
@@ -74,7 +75,7 @@ Status BuildTable(
     uint64_t* memtable_garbage_bytes = nullptr,
     InternalStats::CompactionStats* flush_stats = nullptr,
     // for delta
-    std::unordered_map<uint64_t, DataSegment>* output_segments,
-    HotspotManager* hotspot_manager);
+    std::unordered_map<uint64_t, DataSegment>* output_segments = nullptr,
+    HotspotManager* hotspot_manager = nullptr);
 
 }  // namespace ROCKSDB_NAMESPACE

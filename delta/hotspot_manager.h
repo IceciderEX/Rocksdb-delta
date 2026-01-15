@@ -61,6 +61,12 @@ class HotspotManager {
 
   uint64_t ExtractCUID(const Slice& key);
 
+  void UpdateCompactionDelta(uint64_t cuid, 
+                                           const std::vector<uint64_t>& input_files,
+                                           uint64_t output_file_number,
+                                           uint64_t offset,
+                                           uint64_t length);
+
   std::string GenerateSstFileName(uint64_t cuid);
 
  private:

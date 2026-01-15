@@ -60,6 +60,7 @@ class VersionEdit;
 class VersionSet;
 
 class SubcompactionState;
+struct DeltaCompactionContext;
 
 // CompactionJob is responsible for executing the compaction. Each (manual or
 // automated) compaction corresponds to a CompactionJob object, and usually
@@ -394,13 +395,17 @@ class CompactionJob {
       InternalIterator* input_iter, const CompactionFilter* compaction_filter,
       MergeHelper& merge, BlobFileResources& blob_resources,
       const WriteOptions& write_options);
+  // for delta
   std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc> CreateFileHandlers(
-      SubcompactionState* sub_compact, SubcompactionKeyBoundaries& boundaries);
+      SubcompactionState* sub_compact, SubcompactionKeyBoundaries& boundaries,
+      std::shared_ptr<DeltaCompactionContext> delta_ctx = nullptr);
   Status ProcessKeyValue(SubcompactionState* sub_compact, ColumnFamilyData* cfd,
                          CompactionIterator* c_iter,
                          const CompactionFileOpenFunc& open_file_func,
                          const CompactionFileCloseFunc& close_file_func,
-                         uint64_t& prev_cpu_micros);
+                         uint64_t& prev_cpu_micros,
+                         // for delta
+                         std::shared_ptr<DeltaCompactionContext> delta_ctx = nullptr);
   void UpdateSubcompactionJobStatsIncrementally(
       CompactionIterator* c_iter, CompactionJobStats* compaction_job_stats,
       uint64_t cur_cpu_micros, uint64_t& prev_cpu_micros);

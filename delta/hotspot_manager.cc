@@ -44,12 +44,6 @@ uint64_t HotspotManager::ExtractCUID(const Slice& key) {
 }
 
 bool HotspotManager::RegisterScan(uint64_t cuid) {
-  if (cuid == 0) return false;
-  
-  return frequency_table_.RecordAndCheckHot(cuid);
-}
-
-bool HotspotManager::RegisterScan(uint64_t cuid) {
     if (cuid == 0) return false;
     
     bool is_hot = frequency_table_.RecordAndCheckHot(cuid);
@@ -283,6 +277,22 @@ void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
     
     // fprintf(stdout, "[HotspotManager] Finalized CUID %lu. Snapshot has %zu segments (incl tail).\n", 
     //         cuid, final_segments.size());
+}
+
+void HotspotManager::UpdateCompactionDelta(uint64_t cuid, 
+                                           const std::vector<uint64_t>& input_files,
+                                           uint64_t output_file_number,
+                                           uint64_t offset,
+                                           uint64_t length) {
+    if (length == 0) return;
+    
+    DataSegment seg;
+    seg.file_number = output_file_number;
+    seg.offset = offset;
+    seg.length = length;
+    // seg.first_key = ?; // TODO: 怎么提取？
+
+    index_table_.UpdateDeltaIndex(cuid, input_files, seg);
 }
 
 bool HotspotManager::IsHot(uint64_t cuid) {

@@ -53,6 +53,10 @@ class HotIndexTable {
 
   void RemoveCUID(uint64_t cuid);
 
+  void UpdateDeltaIndex(uint64_t cuid, 
+                                     const std::vector<uint64_t>& input_files,
+                                     const DataSegment& new_delta);
+
  private:
   mutable std::shared_mutex mutex_;
   std::unordered_map<uint64_t, HotIndexEntry> table_;

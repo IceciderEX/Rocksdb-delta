@@ -569,6 +569,7 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
   size_t start_index = total_files - pick_count;
   start_level_inputs_.level = 0;
   start_level_inputs_.files.clear();
+  start_level_ = 0;
   output_level_ = 0; // L0 -> L0
 
   for (size_t i = start_index; i < total_files; ++i) {
@@ -595,7 +596,7 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
 Compaction* LevelCompactionBuilder::PickCompaction() {
   // Pick up the first file to start compaction. It may have been extended
   // to a clean cut.
-  SetupInitialFiles();
+  SetupInitialFilesDelta();
   if (start_level_inputs_.empty()) {
     return nullptr;
   }
@@ -608,6 +609,10 @@ Compaction* LevelCompactionBuilder::PickCompaction() {
       TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
       return c;
   }
+
+  // 原来的逻辑
+  SetupInitialFiles();
+  assert(start_level_ >= 0 && output_level_ >= 0);
 
   // If it is a L0 -> base level compaction, we need to set up other L0
   // files if needed.

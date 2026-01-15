@@ -148,6 +148,60 @@ bool HotIndexTable::CheckAndRemoveObsoleteDeltas(uint64_t cuid, const std::vecto
   return found_obsolete;
 }
 
+// L0Compaction更新 Delta 索引
+// remove delta and add new data
+void HotIndexTable::UpdateDeltaIndex(uint64_t cuid, 
+                                     const std::vector<uint64_t>& input_files,
+                                     const DataSegment& new_delta) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto& entry = table_[cuid];
+  
+  // 清理本次 Compaction 涉及的文件
+  for (auto it = entry.deltas.begin(); it != entry.deltas.end(); ) {
+    bool is_input = false;
+    for (uint64_t fid : input_files) {
+      if (it->file_number == fid) {
+        is_input = true;
+        break;
+      }
+    }
+
+    if (is_input) {
+      if (lifecycle_manager_) {
+        lifecycle_manager_->Unref(it->file_number);
+      }
+      it = entry.deltas.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  // double check obsolete_deltas
+  for (auto it = entry.obsolete_deltas.begin(); it != entry.obsolete_deltas.end(); ) {
+    bool is_input = false;
+    for (uint64_t fid : input_files) {
+      if (it->file_number == fid) {
+        is_input = true;
+        break;
+      }
+    }
+    if (is_input) {
+      if (lifecycle_manager_) {
+        lifecycle_manager_->Unref(it->file_number);
+      }
+      it = entry.obsolete_deltas.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  // new delta
+  entry.deltas.push_back(new_delta);
+  if (lifecycle_manager_) {
+    lifecycle_manager_->Ref(new_delta.file_number);
+  }
+}
+
 void HotIndexTable::RemoveCUID(uint64_t cuid) {
   std::vector<DataSegment> segments_to_unref;
   {
