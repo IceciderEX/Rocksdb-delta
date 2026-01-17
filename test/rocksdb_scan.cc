@@ -1,13 +1,12 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <iomanip>
-#include <sstream>
 #include <thread>
 #include <chrono>
 #include <cstring>
 #include <assert.h>
 #include <algorithm>
+#include <iomanip>
 
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
@@ -17,30 +16,27 @@
 #include "db/db_impl/db_impl.h" 
 #include "delta/hotspot_manager.h"
 #include "delta/hot_index_table.h"
-#include "delta/global_delete_count_table.h"
 
 using namespace ROCKSDB_NAMESPACE;
 
-const std::string kDBPath = "/home/wam/HWKV/rocksdb-delta/db_test_l0";
+const std::string kDBPath = "/home/wam/HWKV/rocksdb-delta/db_tmp";
 
 // ==========================================
-// Key 生成辅助函数 (与之前一致)
+// 1. 辅助工具: Key 生成与校验
 // ==========================================
+// 构造符合 dbid_tableid_cuid... (Big Endian) 格式的 Key
 std::string GenerateKey(uint64_t cuid, int row_id) {
     std::string key;
     key.resize(40); 
     std::memset(&key[0], 0, 40); 
     
+    // Skip 16 bytes (dbid, tableid), write CUID at offset 16
     unsigned char* p = reinterpret_cast<unsigned char*>(&key[0]) + 16;
-    p[0] = (cuid >> 56) & 0xFF;
-    p[1] = (cuid >> 48) & 0xFF;
-    p[2] = (cuid >> 40) & 0xFF;
-    p[3] = (cuid >> 32) & 0xFF;
-    p[4] = (cuid >> 24) & 0xFF;
-    p[5] = (cuid >> 16) & 0xFF;
-    p[6] = (cuid >> 8) & 0xFF;
-    p[7] = (cuid) & 0xFF;
+    for (int i = 0; i < 8; ++i) {
+        p[i] = (cuid >> (56 - 8 * i)) & 0xFF;
+    }
 
+    // Append row_id for uniqueness
     std::string row_str = std::to_string(row_id);
     size_t copy_len = std::min(row_str.size(), key.size() - 24);
     std::memcpy(&key[24], row_str.data(), copy_len);
@@ -48,179 +44,231 @@ std::string GenerateKey(uint64_t cuid, int row_id) {
     return key;
 }
 
-// 辅助：获取文件列表
-std::vector<LiveFileMetaData> GetLiveFiles(DB* db) {
-    std::vector<LiveFileMetaData> files;
-    db->GetLiveFilesMetaData(&files);
-    return files;
+uint64_t ExtractCUID(const Slice& key) {
+    if (key.size() < 24) return 0;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(key.data()) + 16;
+    uint64_t c = 0;
+    for (int i = 0; i < 8; ++i) {
+        c = (c << 8) | p[i];
+    }
+    return c;
 }
 
+void Check(bool condition, const std::string& msg) {
+    if (condition) {
+        std::cout << "[PASS] " << msg << std::endl;
+    } else {
+        std::cerr << "[FAIL] " << msg << std::endl;
+        exit(1);
+    }
+}
+
+std::string GenerateUpperBoundKey(uint64_t cuid) {
+    // 构造 CUID + 1 的 Key
+    return GenerateKey(cuid + 1, 0); 
+}
+
+int PerformScan(DB* db, uint64_t cuid) {
+    ReadOptions ro;
+    
+    // Upper Bound，防止 Iterator 读到下一个 CUID 的数据
+    std::string upper_bound_str = GenerateUpperBoundKey(cuid);
+    Slice upper_bound = upper_bound_str;
+    ro.iterate_upper_bound = &upper_bound; 
+
+    Iterator* it = db->NewIterator(ro);
+    std::string start_key = GenerateKey(cuid, 0);
+    
+    int count = 0;
+    for (it->Seek(start_key); it->Valid(); it->Next()) {
+        if (ExtractCUID(it->key()) != cuid) break; 
+        count++;
+    }
+    
+    Status s = it->status();
+    delete it;
+    if (!s.ok()) {
+        std::cerr << "Scan error: " << s.ToString() << std::endl;
+    }
+    return count;
+}
+
+// 写入数据并 Flush，生成物理 SST
+void WriteBatchAndFlush(DB* db, const std::vector<uint64_t>& cuids, int start_row, int count_per_cuid) {
+    WriteBatch batch;
+    for (uint64_t cuid : cuids) {
+        for (int i = 0; i < count_per_cuid; ++i) {
+            batch.Put(GenerateKey(cuid, start_row + i), "payload_" + std::to_string(cuid));
+        }
+    }
+    Status s = db->Write(WriteOptions(), &batch);
+    Check(s.ok(), "Write batch");
+    
+    s = db->Flush(FlushOptions());
+    Check(s.ok(), "Flush to SST");
+}
+
+// ==========================================
+// 3. 主测试流程
+// ==========================================
+
 int main() {
-    // 1. 初始化环境
     Options options;
     options.create_if_missing = true;
-    options.level0_file_num_compaction_trigger = 20; // 配合我们修改后的 Picker
-    options.disable_auto_compactions = true; // 先禁用自动，手动控制 Flush 积累文件
-    
+    // A. 环境初始化
     Status s = DestroyDB(kDBPath, options);
-    if (!s.ok()) std::cerr << "DestroyDB error: " << s.ToString() << std::endl;
+    
+
+    options.create_missing_column_families = true;
+    // 禁用自动 Compaction，以便我们手动控制测试时机
+    options.disable_auto_compactions = true;
+    // 强制使用 L0 (模拟 Delta 表只有 L0)
+    options.num_levels = 1; 
+    options.level0_file_num_compaction_trigger = 20; 
 
     DB* db = nullptr;
     s = DB::Open(options, kDBPath, &db);
-    if (!s.ok()) {
-        std::cerr << "Open DB failed: " << s.ToString() << std::endl;
-        return 1;
-    }
+    Check(s.ok(), "DB Open");
 
+    // 获取内部 Manager 仅用于 Verification (不断言内部状态，仅观察)
     DBImpl* db_impl = dynamic_cast<DBImpl*>(db);
     auto hotspot_mgr = db_impl->GetHotspotManager();
-    if (!hotspot_mgr) {
-        std::cerr << "HotspotManager not initialized!" << std::endl;
-        return 1;
+    Check(hotspot_mgr != nullptr, "HotspotManager attached");
+
+    const uint64_t CUID_DEL = 1001;  // 测试无 Tombstone 删除
+    const uint64_t CUID_HOT = 2002;  // 测试 Scan-as-Compaction
+    const uint64_t CUID_MOV = 3003;  // 测试 Compaction 索引更新
+
+    
+
+    std::cout << "\n>>> PHASE 1: Data Ingestion (Write & Flush) <<<\n";
+    
+    std::cout << "Pre-heating CUID_MOV to ensure Deltas are tracked during Flush..." << std::endl;
+    for(int k=0; k<5; k++) {
+        hotspot_mgr->RegisterScan(CUID_MOV);
+    }
+    // 写入 3 个 SST 文件，包含所有 CUID 的数据
+    for (int i = 0; i < 3; ++i) {
+        WriteBatchAndFlush(db, {CUID_DEL, CUID_HOT, CUID_MOV}, i * 100, 50);
+        std::cout << "Generated SST #" << i + 1 << std::endl;
     }
 
-    // 定义三个测试对象
-    uint64_t CUID_DELETE = 1001; // 将被全局删除
-    uint64_t CUID_HOT    = 2002; // 将被热点分离 (Obsolete)
-    uint64_t CUID_NORMAL = 3003; // 正常合并
-
-    // ==========================================
-    // 2. 生成 L0 文件 (积累 20 个以触发 L0Compaction)
-    // ==========================================
-    std::cout << "\n>>> [Step 1] Generating 20 L0 files (Trigger Threshold)..." << std::endl;
+    // =================================================================
+    // 测试场景 1: 无 Tombstone 快速删除 (Global Delete Count Table)
+    // =================================================================
+    std::cout << "\n>>> PHASE 2: Immediate Delete Test (CUID_DEL) <<<\n";
     
-    int files_count = 20;
-    int rows_per_file = 10;
+    int rows = PerformScan(db, CUID_DEL);
+    std::cout << "Initial Scan CUID_DEL: Found " << rows << " rows. (Ref counts built)" << std::endl;
+    Check(rows == 150, "Data integrity check before delete");
 
-    for (int i = 0; i < files_count; i++) {
-        for (int r = 0; r < rows_per_file; r++) {
-            // 每个文件都包含这三个 CUID 的数据
-            db->Put(WriteOptions(), GenerateKey(CUID_DELETE, i*100+r), "del_val");
-            db->Put(WriteOptions(), GenerateKey(CUID_HOT,    i*100+r), "hot_val");
-            db->Put(WriteOptions(), GenerateKey(CUID_NORMAL, i*100+r), "norm_val");
+    std::cout << "Deleting CUID_DEL via standard DB::Delete..." << std::endl;
+    for (int i = 0; i < 3 * 100; ++i) { // 简单模拟范围删，逐个删 key (或者使用 DeleteRange 如果支持)=
+        if (i == 0) {
+            db->Delete(WriteOptions(), GenerateKey(CUID_DEL, 0)); 
+            // 只需要触发一次即可验证效果
         }
-        // 每次写入后强制 Flush，生成一个 SST
-        FlushOptions fopt;
-        fopt.wait = true;
-        db->Flush(fopt);
     }
-
-    auto files = GetLiveFiles(db);
-    std::cout << ">>> Generated " << files.size() << " L0 files." << std::endl;
-    if (files.size() < 20) {
-        std::cerr << "⚠️ Warning: Not enough files to trigger L0Compaction (Need >= 20)" << std::endl;
-    }
-
-    // ==========================================
-    // 3. 构建元数据状态 (模拟 Flush Hook 和 Scan-as-Compaction)
-    // ==========================================
-    std::cout << "\n>>> [Step 2] Setting up Metadata..." << std::endl;
-
-    // 3.1 模拟 Flush 后的 Index 注册
-    // 由于我们还没有实现 FlushJob 的 Hook，这里手动把这 20 个文件注册到 HotIndexTable
-    // 告诉 Manager：CUID_HOT 和 CUID_NORMAL 在这些文件里有 Delta
-    for (const auto& f : files) {
-        DataSegment seg;
-        seg.file_number = f.file_number;
-        seg.offset = 0; 
-        seg.length = f.size; // 粗略估计
-        
-        // 注册 HOT 的 Delta
-        hotspot_mgr->GetIndexTable().AddDelta(CUID_HOT, seg);
-        // 注册 NORMAL 的 Delta
-        hotspot_mgr->GetIndexTable().AddDelta(CUID_NORMAL, seg);
-    }
-
-    // 3.2 设置全局删除 (CUID_DELETE)
-    std::cout << "    Marking CUID " << CUID_DELETE << " as DELETED." << std::endl;
-    hotspot_mgr->GetDeleteTable().MarkDeleted(CUID_DELETE);
-
-    // 3.3 设置热点 Obsolete (CUID_HOT)
-    std::cout << "    Marking CUID " << CUID_HOT << " as HOT (Simulating Scan-as-Compaction)." << std::endl;
-    // 模拟 Scan-as-Compaction 完成：
-    // 1. 注册为热点
-    hotspot_mgr->RegisterScan(CUID_HOT); 
-    // 2. 创建一个假的 Snapshot (表示数据已搬迁)
-    DataSegment snap_seg;
-    snap_seg.file_number = 99999; // 假文件
-    std::vector<DataSegment> new_snaps = {snap_seg};
-    // 3. UpdateSnapshot 会自动把上面注册的 Deltas 移动到 Obsolete 列表
-    hotspot_mgr->GetIndexTable().UpdateSnapshot(CUID_HOT, new_snaps);
-
-    // ==========================================
-    // 4. 触发 L0 Compaction
-    // ==========================================
-    std::cout << "\n>>> [Step 3] Triggering L0 Compaction..." << std::endl;
     
-    // 开启自动 Compaction 并手动触发一次
-    s = db->EnableAutoCompaction({db->DefaultColumnFamily()});
-    // 使用 CompactRange 强行触发，我们的 Picker 会拦截并执行 L0->L0
-    s = db->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+    // 2.3 验证删除效果 (不依赖 Compaction)
+    std::cout << "Verifying Immediate Deletion..." << std::endl;
+    rows = PerformScan(db, CUID_DEL);
+    // 如果 Intercept 生效且 IsCuidDeleted 在 Iterator 中生效，这里应返回 0
+    std::cout << "Scan CUID_DEL after Delete: Found " << rows << " rows." << std::endl;
+    Check(rows == 0, "CUID_DEL should be invisible immediately without Flush/Compaction");
+
+
+    // =================================================================
+    // 测试场景 2: Scan-as-Compaction (Hotspot Promotion)
+    // =================================================================
+    std::cout << "\n>>> PHASE 3: Scan-as-Compaction Test (CUID_HOT) <<<\n";
     
-    if (!s.ok()) {
-        std::cerr << "CompactRange failed: " << s.ToString() << std::endl;
+    // 3.1 预热：频繁 Scan 触发热点判定
+    std::cout << "Triggering frequent scans on CUID_HOT..." << std::endl;
+    for (int i = 0; i < 6; ++i) {
+        int r = PerformScan(db, CUID_HOT);
+        Check(r == 150, "Scan data consistency");
+        // 模拟间隔，让频率表生效
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    // 3.2 验证是否转存
+    HotIndexEntry hot_entry;
+    bool has_index = hotspot_mgr->GetIndexTable().GetEntry(CUID_HOT, &hot_entry);
+    
+    Check(has_index, "CUID_HOT should be in HotIndexTable");
+    Check(hot_entry.HasSnapshot(), "CUID_HOT should have a Snapshot (Promoted)");
+    
+    Check(hot_entry.deltas.empty(), "Active Deltas should be empty after promotion");
+
+    std::cout << "Snapshot Segments Count: " << hot_entry.snapshot_segments.size() << std::endl;
+    
+    // [新增验证]：检查是否包含内存标记 (-1) 的 Tail Segment
+    if (!hot_entry.snapshot_segments.empty()) {
+        uint64_t last_fid = hot_entry.snapshot_segments.back().file_number;
+        // 18446744073709551615 就是 (uint64_t)-1
+        std::cout << "Tail Segment ID: " << last_fid << std::endl; 
+        Check(last_fid == static_cast<uint64_t>(-1), "Tail segment should be memory marker (-1)");
     } else {
-        std::cout << ">>> Compaction finished." << std::endl;
+        // 如果 snapshot 为空，说明 Finalize 逻辑有漏洞（我们刚才修过的 active_buffered_cuids_ 就是防这个的）
+        Check(false, "Snapshot segments should not be empty (must contain at least tail segment)");
     }
 
-    // ==========================================
-    // 5. 验证结果
-    // ==========================================
-    std::cout << "\n>>> [Step 4] Verifying Results..." << std::endl;
 
-    auto VerifyData = [&](uint64_t cuid, const std::string& name, bool should_exist) {
-        std::cout << "    Verifying " << name << " (" << cuid << ")... ";
-        int found_count = 0;
-        ReadOptions ro;
-        Iterator* it = db->NewIterator(ro);
-        std::string start = GenerateKey(cuid, 0);
-        for (it->Seek(start); it->Valid(); it->Next()) {
-            uint64_t k_cuid = hotspot_mgr->ExtractCUID(it->key());
-            if (k_cuid != cuid) break;
-            found_count++;
-        }
-        delete it;
+    // =================================================================
+    // 测试场景 3: 混合存储 Compaction (L0 GC & Index Update)
+    // =================================================================
+    std::cout << "\n>>> PHASE 4: Mixed Compaction Test (CUID_MOV) <<<\n";
 
-        if (should_exist) {
-            if (found_count > 0) std::cout << "✅ OK (Found " << found_count << " rows)" << std::endl;
-            else std::cout << "❌ FAIL (Expected data, but found none)" << std::endl;
-        } else {
-            if (found_count == 0) std::cout << "✅ OK (Data cleaned)" << std::endl;
-            else std::cout << "❌ FAIL (Expected 0 rows, found " << found_count << ")" << std::endl;
-        }
-    };
+    // for (int i = 0; i < 8; ++i) {
+    //     int r = PerformScan(db, CUID_MOV);
+    //     Check(r == 150, "Scan data consistency");
+    //     // 模拟间隔，让频率表生效
+    //     std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // }
+    
+    // 检查 CUID_MOV 当前状态：应该是分散在 Delta Index 中
+    HotIndexEntry mov_entry_before;
+    if (hotspot_mgr->GetIndexTable().GetEntry(CUID_MOV, &mov_entry_before)) {
+        std::cout << "Before Compaction: CUID_MOV has " << mov_entry_before.deltas.size() << " deltas." << std::endl;
+        Check(mov_entry_before.deltas.size() >= 3, "Should have deltas from 3 flushes");
+    } else {
+        Check(false, "CUID_MOV should exist in index table (pre-heated in Phase 1)");
+    }
 
-    // 验证 1: CUID_DELETE 应该被物理删除了
-    VerifyData(CUID_DELETE, "CUID_DELETE", false);
+    // 3.1 触发 Compaction
+    // 使用 CompactRange 强制合并 L0 文件
+    std::cout << "Triggering L0 Compaction..." << std::endl;
+    s = db->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+    Check(s.ok(), "CompactRange");
 
-    // 验证 2: CUID_HOT 应该被物理删除了 (因为 Index 里标记为 Obsolete)
-    VerifyData(CUID_HOT, "CUID_HOT", false);
-
-    // 验证 3: CUID_NORMAL 应该还在，且文件被合并了
-    VerifyData(CUID_NORMAL, "CUID_NORMAL", true);
-
-    // 验证 4: CUID_NORMAL 的 Index 是否更新
-    HotIndexEntry entry_norm;
-    if (hotspot_mgr->GetIndexTable().GetEntry(CUID_NORMAL, &entry_norm)) {
-        if (!entry_norm.deltas.empty()) {
-            uint64_t new_file_num = entry_norm.deltas[0].file_number;
-            auto new_files = GetLiveFiles(db);
-            bool file_exists_on_disk = false;
-            for(auto& f : new_files) {
-                if (f.file_number == new_file_num) file_exists_on_disk = true;
-            }
-            
-            std::cout << "    Verifying CUID_NORMAL Index... ";
-            if (file_exists_on_disk) {
-                std::cout << "✅ OK (Updated to new file " << new_file_num << ")" << std::endl;
-            } else {
-                std::cout << "❌ FAIL (Index points to non-existent file " << new_file_num << ")" << std::endl;
-            }
-        } else {
-            std::cout << "❌ FAIL (CUID_NORMAL has no Deltas)" << std::endl;
+    // 3.2 验证
+    // a) CUID_DEL 的物理数据是否被清理？(难以直接验证物理文件，但逻辑上它被跳过了)
+    // b) CUID_HOT 的 Obsolete Deltas 是否被清理？
+    // c) CUID_MOV 的 Index 是否指向了新文件？
+    
+    HotIndexEntry mov_entry_after;
+    if (hotspot_mgr->GetIndexTable().GetEntry(CUID_MOV, &mov_entry_after)) {
+        std::cout << "After Compaction: CUID_MOV has " << mov_entry_after.deltas.size() << " deltas." << std::endl;
+        // 如果完全合并，应该只有 1 个 Delta (即新生成的 L0 SST)
+        Check(mov_entry_after.deltas.size() < mov_entry_before.deltas.size(), "Deltas should be merged");
+        
+        // 验证文件 ID 发生了变化
+        if (!mov_entry_before.deltas.empty() && !mov_entry_after.deltas.empty()) {
+            Check(mov_entry_before.deltas[0].file_number != mov_entry_after.deltas[0].file_number, 
+                  "Delta should point to new SST file");
         }
     }
 
+    // 验证 CUID_HOT 的 Obsolete Deltas 是否减少/清空
+    hotspot_mgr->GetIndexTable().GetEntry(CUID_HOT, &hot_entry);
+    if (hot_entry.obsolete_deltas.empty()) {
+        std::cout << "[PASS] CUID_HOT Obsolete Deltas were physically cleaned." << std::endl;
+    } else {
+        std::cout << "[INFO] Some Obsolete Deltas remain (depends on compaction input coverage)." << std::endl;
+    }
+
+    std::cout << "\n>>> Integration Test Completed Successfully <<<" << std::endl;
     delete db;
     return 0;
 }

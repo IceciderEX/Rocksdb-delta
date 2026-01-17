@@ -84,6 +84,8 @@ class HotspotManager {
   // FinalizeScanAsCompaction -> IndexTable
   std::unordered_map<uint64_t, std::vector<DataSegment>> pending_snapshots_;
   std::mutex pending_mutex_;
+  std::unordered_set<uint64_t> active_buffered_cuids_;
+  std::mutex buffered_cuids_mutex_; // 保护上述集合
 };
 
 }  // namespace ROCKSDB_NAMESPACE

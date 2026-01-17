@@ -60,6 +60,10 @@ bool HotspotManager::RegisterScan(uint64_t cuid) {
 }
 
 bool HotspotManager::BufferHotData(uint64_t cuid, const Slice& key, const Slice& value) {
+  {
+    std::lock_guard<std::mutex> lock(buffered_cuids_mutex_);
+    active_buffered_cuids_.insert(cuid);
+  }
   return buffer_.Append(cuid, key, value);
 }
 
@@ -260,6 +264,21 @@ void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
             final_segments = it->second;
             pending_snapshots_.erase(it); 
         }
+    }
+
+    bool has_buffered_data = false;
+    {
+        std::lock_guard<std::mutex> lock(buffered_cuids_mutex_);
+        auto it = active_buffered_cuids_.find(cuid);
+        if (it != active_buffered_cuids_.end()) {
+            has_buffered_data = true;
+            active_buffered_cuids_.erase(it); // 清理状态
+        }
+    }
+    
+    // 防止空scan写入snapshot的情况
+    if (final_segments.empty() && !has_buffered_data) {
+        return; 
     }
 
     // tail segment

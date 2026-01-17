@@ -162,8 +162,12 @@ class DBIter final : public Iterator {
     local_stats_.BumpGlobalStatistics(statistics_);
     iter_.DeleteIter(arena_mode_);
     ThreadStatusUtil::SetThreadOperation(cur_op_type);
-    
+
+    if (hotspot_manager_ && delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
+        hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+    }
   }
+
   void SetIter(InternalIterator* iter) {
     assert(iter_.iter() == nullptr);
     iter_.Set(iter);

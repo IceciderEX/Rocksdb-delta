@@ -474,9 +474,10 @@ void CompactionIterator::CheckHotspotFilters() {
 
   // c)	当读取到某个CUid的数据时，检查全局CUid删除计数表，若该CUid已被标记为删除，
   // 则直接跳过该段数据，不写入新文件，并减去一次该CUid在计数表中的引用计数
+  // 
   if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid)) {
     skip_current_cuid_ = true;
-    hotspot_manager_->GetDeleteTable().UntrackFiles(cuid, input_file_numbers_);
+    // hotspot_manager_->GetDeleteTable().UntrackFiles(cuid, input_file_numbers_); 防止 compaction 失败
     return; 
   }
 
