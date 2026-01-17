@@ -472,6 +472,10 @@ void CompactionIterator::CheckHotspotFilters() {
   skip_current_cuid_ = false;
   if (cuid == 0) return;
 
+  if (involved_cuids_) {
+      involved_cuids_->insert(cuid);
+  }
+
   // c)	当读取到某个CUid的数据时，检查全局CUid删除计数表，若该CUid已被标记为删除，
   // 则直接跳过该段数据，不写入新文件，并减去一次该CUid在计数表中的引用计数
   // 
@@ -484,12 +488,14 @@ void CompactionIterator::CheckHotspotFilters() {
   // d)	若遇到热点CUid，检查其热点索引表，若发现Deltas列表中对应的该段数据已被标记为 Obsolete，
   // 则直接跳过该段数据，并删除对应的Deltas记录。
   if (hotspot_manager_->IsHot(cuid)) {
-      // 传入当前正在 Compact 的文件列表
-      // CheckAndRemoveObsoleteDeltas 会执行查找、Unref 和 Erase 操作
-      if (hotspot_manager_->GetIndexTable().CheckAndRemoveObsoleteDeltas(cuid, input_file_numbers_)) {
+      if (hotspot_manager_->ShouldSkipObsoleteDelta(cuid, input_file_numbers_)) {
         skip_current_cuid_ = true;  
         return;
       }
+      // if (hotspot_manager_->GetIndexTable().CheckAndRemoveObsoleteDeltas(cuid, input_file_numbers_)) {
+      //   skip_current_cuid_ = true;  
+      //   return;
+      // }
   }
 }
 

@@ -289,6 +289,11 @@ class CompactionIterator {
 
   bool IsDeleteRangeSentinelKey() const { return is_range_del_; }
 
+  // for delta
+  void SetInvolvedCuids(std::unordered_set<uint64_t>* cuids) {
+    involved_cuids_ = cuids;
+  }
+
  private:
   // Processes the input stream to find the next output
   void NextFromInput();
@@ -532,6 +537,7 @@ class CompactionIterator {
   uint64_t current_cuid_ = 0;   // 正在处理的 cuid
   bool skip_current_cuid_ = false; // 缓存当前cuid是否需要被跳过
   std::vector<uint64_t> input_file_numbers_;
+  std::unordered_set<uint64_t>* involved_cuids_ = nullptr;
 
   void CheckHotspotFilters();
 };

@@ -56,6 +56,13 @@ class HotIndexTable {
   void UpdateDeltaIndex(uint64_t cuid, 
                                      const std::vector<uint64_t>& input_files,
                                      const DataSegment& new_delta);
+  
+  // 用于 CompactionIterator 决定是否 Skip
+  bool IsDeltaObsolete(uint64_t cuid, const std::vector<uint64_t>& input_files) const;
+
+  // 用于清理cuid的 Obsolete Deltas
+  void RemoveObsoleteDeltasForCUIDs(const std::unordered_set<uint64_t>& cuids, 
+                                    const std::vector<uint64_t>& input_files);                                   
 
  private:
   mutable std::shared_mutex mutex_;

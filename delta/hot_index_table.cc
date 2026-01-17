@@ -116,6 +116,7 @@ void HotIndexTable::MarkDeltasAsObsolete(uint64_t cuid) {
 
 // d)	若遇到热点CUid，检查其热点索引表，若发现Deltas列表中对应的该段数据已被标记为 Obsolete，
 // 则直接跳过该段数据，并删除对应的Deltas记录。
+// deprecated：不能在 compaction 时直接清理
 bool HotIndexTable::CheckAndRemoveObsoleteDeltas(uint64_t cuid, const std::vector<uint64_t>& input_files) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto it = table_.find(cuid);
@@ -146,6 +147,58 @@ bool HotIndexTable::CheckAndRemoveObsoleteDeltas(uint64_t cuid, const std::vecto
     }
   }
   return found_obsolete;
+}
+
+bool HotIndexTable::IsDeltaObsolete(uint64_t cuid, const std::vector<uint64_t>& input_files) const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) return false;
+
+  const auto& entry = it->second;
+  if (entry.obsolete_deltas.empty()) return false;
+  
+  for (const auto& delta : entry.obsolete_deltas) {
+    for (uint64_t fid : input_files) {
+      if (delta.file_number == fid) {
+        return true; 
+      }
+    }
+  }
+  return false;
+}
+
+
+void HotIndexTable::RemoveObsoleteDeltasForCUIDs(const std::unordered_set<uint64_t>& cuids, 
+                                                 const std::vector<uint64_t>& input_files) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  
+  for (uint64_t cuid : cuids) {
+    auto entry_it = table_.find(cuid);
+    if (entry_it == table_.end()) continue;
+
+    auto& entry = entry_it->second;
+    if (entry.obsolete_deltas.empty()) continue;
+
+    // 移除 matched 文件
+    for (auto it = entry.obsolete_deltas.begin(); it != entry.obsolete_deltas.end(); ) {
+      bool is_input = false;
+      for (uint64_t fid : input_files) {
+        if (it->file_number == fid) {
+          is_input = true;
+          break;
+        }
+      }
+
+      if (is_input) {
+        if (lifecycle_manager_) {
+          lifecycle_manager_->Unref(it->file_number);
+        }
+        it = entry.obsolete_deltas.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
 }
 
 // L0Compaction更新 Delta 索引

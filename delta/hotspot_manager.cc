@@ -298,6 +298,8 @@ void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
     //         cuid, final_segments.size());
 }
 
+// ----------------- L0Compaction --------------------
+
 void HotspotManager::UpdateCompactionDelta(uint64_t cuid, 
                                            const std::vector<uint64_t>& input_files,
                                            uint64_t output_file_number,
@@ -312,6 +314,23 @@ void HotspotManager::UpdateCompactionDelta(uint64_t cuid,
     // seg.first_key = ?; // TODO: 怎么提取？
 
     index_table_.UpdateDeltaIndex(cuid, input_files, seg);
+}
+
+bool HotspotManager::ShouldSkipObsoleteDelta(uint64_t cuid, const std::vector<uint64_t>& input_files) {
+    return index_table_.IsDeltaObsolete(cuid, input_files);
+}
+
+void HotspotManager::CleanUpMetadataAfterCompaction(const std::unordered_set<uint64_t>& involved_cuids,
+                                                    const std::vector<uint64_t>& input_files) {
+    if (input_files.empty() || involved_cuids.empty()) return;
+
+    // 步骤d：热点索引表的处理
+    index_table_.RemoveObsoleteDeltasForCUIDs(involved_cuids, input_files);
+
+    // 步骤c：已删除cuid的处理
+    for (uint64_t cuid : involved_cuids) {
+        delete_table_.UntrackFiles(cuid, input_files);
+    }
 }
 
 bool HotspotManager::IsHot(uint64_t cuid) {

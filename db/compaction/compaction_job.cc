@@ -1468,11 +1468,13 @@ void CompactionJob::CreateBlobFileBuilder(SubcompactionState* sub_compact,
   }
 }
 
+// for delta
 std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
     SubcompactionState* sub_compact, ColumnFamilyData* cfd,
     InternalIterator* input, const CompactionFilter* compaction_filter,
     MergeHelper& merge, BlobFileResources& blob_resources,
-    const WriteOptions& write_options) {
+    const WriteOptions& write_options,
+    std::unordered_set<uint64_t>* local_involved_cuids) {
   CreateBlobFileBuilder(sub_compact, cfd, blob_resources, write_options);
 
   const std::string* const full_history_ts_low =
@@ -1490,8 +1492,9 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
   }
 
   std::shared_ptr<HotspotManager> hotspot_manager = hotspot_manager_;
+  input_file_numbers_ = input_file_numbers;
 
-  return std::make_unique<CompactionIterator>(
+  auto c_iter = std::make_unique<CompactionIterator>(
       input, cfd->user_comparator(), &merge, versions_->LastSequence(),
       &(job_context_->snapshot_seqs), earliest_snapshot_,
       job_context_->earliest_write_conflict_snapshot,
@@ -1505,6 +1508,13 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
       db_options_.info_log, full_history_ts_low, preserve_seqno_after_,
       hotspot_manager,
       input_file_numbers);
+
+  // [关键] 将局部集合注入给 Iterator
+  if (c_iter) {
+      c_iter->SetInvolvedCuids(local_involved_cuids);
+  }
+
+  return c_iter;
 }
 
 std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc>
@@ -2518,6 +2528,11 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
 }
 
 void CompactionJob::CleanupCompaction() {
+  // for delta
+  if (hotspot_manager_ && compact_ && compact_->compaction) {
+      hotspot_manager_->CleanUpMetadataAfterCompaction(compaction_involved_cuids_, input_file_numbers_);
+          compaction_involved_cuids_.clear();
+  }
   for (SubcompactionState& sub_compact : compact_->sub_compact_states) {
     sub_compact.Cleanup(table_cache_.get());
   }

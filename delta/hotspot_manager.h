@@ -66,6 +66,13 @@ class HotspotManager {
                                            uint64_t output_file_number,
                                            uint64_t offset,
                                            uint64_t length);
+  
+  // CompactionIterator 使用 否应该跳过
+  bool ShouldSkipObsoleteDelta(uint64_t cuid, const std::vector<uint64_t>& input_files);
+
+  // CompactionJob cleanup：obsolete
+  void CleanUpMetadataAfterCompaction(const std::unordered_set<uint64_t>& involved_cuids,
+                                      const std::vector<uint64_t>& input_files);
 
   std::string GenerateSstFileName(uint64_t cuid);
 

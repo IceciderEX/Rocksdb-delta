@@ -568,6 +568,9 @@ class CompactionJob {
   
   // for delta
   std::shared_ptr<HotspotManager> hotspot_manager_;
+  std::vector<uint64_t> input_file_numbers_;
+  std::unordered_set<uint64_t> global_involved_cuids_;
+  std::mutex cuids_mutex_;
 };
 
 // CompactionServiceInput is used the pass compaction information between two
