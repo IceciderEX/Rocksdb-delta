@@ -216,12 +216,12 @@ Status BuildTable(
     std::string key_after_flush_buf;
     std::string value_buf;
 
-    // delta
+    // for delta
     uint64_t current_cuid = 0;
-    uint64_t segment_start_offset = 0;
-    std::string segment_first_key;
+    std::string segment_first_key; 
     bool is_segment_active = false;
     uint64_t current_cuid_logical_size = 0;
+    uint64_t segment_start_file_size = 0; // 记录物理起始位置
 
     c_iter.SeekToFirst();
     for (; c_iter.Valid(); c_iter.Next()) {
@@ -271,22 +271,23 @@ Status BuildTable(
           if (is_segment_active && current_cuid != 0) {
             uint64_t current_offset = builder->FileSize();
             DataSegment& seg = (*output_segments)[current_cuid];
-            seg.offset = segment_start_offset;
-            seg.length = current_offset - segment_start_offset;
+            seg.length = current_cuid_logical_size;
             // seg.first_key 在开始时记录
 
-            seg.length = current_cuid_logical_size;
+            // seg.physical_length = builder->FileSize() - segment_start_file_size;
           }
 
           // new Segment
           if (cuid != 0) {
             current_cuid = cuid;
-            segment_start_offset = builder->FileSize();
-            segment_first_key = key.ToString(); // 记录 key 的副本
             current_cuid_logical_size = 0;
+            segment_start_file_size = builder->FileSize();
+            // first key
+            segment_first_key = key_after_flush.ToString();
             
             DataSegment& seg = (*output_segments)[current_cuid];
-            seg.first_key = segment_first_key;
+            seg.first_key = segment_first_key; // 用于 Seek
+            seg.offset = segment_start_file_size; // 记录物理偏移
             
             is_segment_active = true;
           } else {
@@ -296,7 +297,7 @@ Status BuildTable(
         }
 
         if (current_cuid != 0) {
-            current_cuid_logical_size += (key.size() + value.size());
+            current_cuid_logical_size += (key_after_flush.size() + value_after_flush.size());
         }
       }
 
@@ -326,12 +327,11 @@ Status BuildTable(
 
     // for delta, end last Segment
     if (hotspot_manager && output_segments && is_segment_active && current_cuid != 0) {
-        uint64_t current_offset = builder->FileSize();
         DataSegment& seg = (*output_segments)[current_cuid];
-        seg.offset = segment_start_offset;
-        // seg.length = current_offset - segment_start_offset;
-
         seg.length = current_cuid_logical_size;
+        if (seg.offset == 0 && segment_start_file_size > 0) {
+             seg.offset = segment_start_file_size;
+        }
     }
     
     if (!s.ok()) {

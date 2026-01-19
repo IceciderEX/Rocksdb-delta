@@ -1509,7 +1509,6 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
       hotspot_manager,
       input_file_numbers);
 
-  // [关键] 将局部集合注入给 Iterator
   if (c_iter) {
       c_iter->SetInvolvedCuids(local_involved_cuids);
   }
@@ -1853,6 +1852,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   ReadOptions read_options;
   const WriteOptions write_options(Env::IOPriority::IO_LOW,
                                    Env::IOActivity::kCompaction);
+  // for delta
+  std::unordered_set<uint64_t> local_involved_cuids;
 
   InternalIterator* input_iter = CreateInputIterator(
       sub_compact, cfd, iterators, boundaries, read_options);
@@ -1879,7 +1880,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 
   auto c_iter =
       CreateCompactionIterator(sub_compact, cfd, input_iter, compaction_filter,
-                               merge, blob_resources, write_options);
+                               merge, blob_resources, write_options, &local_involved_cuids);
   assert(c_iter);
   c_iter->SeekToFirst();
 
@@ -1908,6 +1909,13 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
                            close_file_func, prev_cpu_micros, delta_ctx);
 
   status = FinalizeProcessKeyValueStatus(cfd, input_iter, c_iter.get(), status);
+
+  // 将这个 subcompaction 涉及到的 cuids 加入到 compaction_involved_cuids_ 中
+  if (!local_involved_cuids.empty()) {
+      std::lock_guard<std::mutex> lock(cuids_mutex_);
+      compaction_involved_cuids_.insert(local_involved_cuids.begin(), 
+                                        local_involved_cuids.end());
+  }
 
   FinalizeSubcompaction(sub_compact, status, open_file_func, close_file_func,
                         blob_resources.blob_file_builder.get(), c_iter.get(),
@@ -2530,9 +2538,15 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
 void CompactionJob::CleanupCompaction() {
   // for delta
   if (hotspot_manager_ && compact_ && compact_->compaction) {
-      hotspot_manager_->CleanUpMetadataAfterCompaction(compaction_involved_cuids_, input_file_numbers_);
-          compaction_involved_cuids_.clear();
+      if (!compaction_involved_cuids_.empty()) {
+          hotspot_manager_->CleanUpMetadataAfterCompaction(
+              compaction_involved_cuids_, 
+              input_file_numbers_
+          );
+      }
+      compaction_involved_cuids_.clear();
   }
+
   for (SubcompactionState& sub_compact : compact_->sub_compact_states) {
     sub_compact.Cleanup(table_cache_.get());
   }

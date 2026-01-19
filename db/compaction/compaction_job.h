@@ -390,12 +390,13 @@ class CompactionJob {
                              ColumnFamilyData* cfd,
                              BlobFileResources& blob_resources,
                              const WriteOptions& write_options);
+  // for delta
   std::unique_ptr<CompactionIterator> CreateCompactionIterator(
       SubcompactionState* sub_compact, ColumnFamilyData* cfd,
       InternalIterator* input_iter, const CompactionFilter* compaction_filter,
       MergeHelper& merge, BlobFileResources& blob_resources,
-      const WriteOptions& write_options);
-  // for delta
+      const WriteOptions& write_options,
+      std::unordered_set<uint64_t>* local_involved_cuids);
   std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc> CreateFileHandlers(
       SubcompactionState* sub_compact, SubcompactionKeyBoundaries& boundaries,
       std::shared_ptr<DeltaCompactionContext> delta_ctx = nullptr);
@@ -569,7 +570,7 @@ class CompactionJob {
   // for delta
   std::shared_ptr<HotspotManager> hotspot_manager_;
   std::vector<uint64_t> input_file_numbers_;
-  std::unordered_set<uint64_t> global_involved_cuids_;
+  std::unordered_set<uint64_t> compaction_involved_cuids_;
   std::mutex cuids_mutex_;
 };
 
