@@ -76,6 +76,11 @@ class HotspotManager {
 
   std::string GenerateSstFileName(uint64_t cuid);
 
+  void DebugDump(const std::string& label) {
+    std::string dump_file = "/home/wam/HWKV/rocksdb-delta/build/a_test_db/a_mgr.log"; 
+    index_table_.DumpToFile(dump_file, label);
+}
+
  private:
   Options db_options_;
   std::string data_dir_;

@@ -5,6 +5,8 @@
 #include <mutex>
 #include <shared_mutex>
 #include <optional>
+#include <fstream>
+#include <iostream>
 #include "rocksdb/rocksdb_namespace.h"
 #include "delta/hot_data_buffer.h"
 
@@ -62,7 +64,9 @@ class HotIndexTable {
 
   // 用于清理cuid的 Obsolete Deltas
   void RemoveObsoleteDeltasForCUIDs(const std::unordered_set<uint64_t>& cuids, 
-                                    const std::vector<uint64_t>& input_files);                                   
+                                    const std::vector<uint64_t>& input_files);    
+                                    
+  void DumpToFile(const std::string& filename, const std::string& phase_label);
 
  private:
   mutable std::shared_mutex mutex_;

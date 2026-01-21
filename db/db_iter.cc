@@ -540,6 +540,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                       // 将上个 cuid 的 Scan-as-Compaction 结果提交
                       if (delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
                           hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+                          
                       }
                       delta_ctx_.last_cuid = cuid;
                       delta_ctx_.visited_units_for_cuid.clear();

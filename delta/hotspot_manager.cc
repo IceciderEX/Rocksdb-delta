@@ -296,6 +296,7 @@ void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
     
     // fprintf(stdout, "[HotspotManager] Finalized CUID %lu. Snapshot has %zu segments (incl tail).\n", 
     //         cuid, final_segments.size());
+    DebugDump("AFTER_SCAN_FINALIZE_CUID_" + std::to_string(cuid));
 }
 
 // ----------------- L0Compaction --------------------
@@ -327,7 +328,7 @@ void HotspotManager::CleanUpMetadataAfterCompaction(const std::unordered_set<uin
     // 步骤d：热点索引表的处理
     index_table_.RemoveObsoleteDeltasForCUIDs(involved_cuids, input_files);
 
-    // 步骤c：已删除cuid的处理
+    // 步骤c：已删除cuid hotdata文件的处理
     for (uint64_t cuid : involved_cuids) {
         delete_table_.UntrackFiles(cuid, input_files);
     }

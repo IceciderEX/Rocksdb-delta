@@ -81,9 +81,9 @@ void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {
     table_[cuid].deltas.push_back(delta);
   }
   
-  if (lifecycle_manager_) {
-    lifecycle_manager_->Ref(delta.file_number);
-  }
+  // if (lifecycle_manager_) {
+  //   lifecycle_manager_->Ref(delta.file_number);
+  // }
 }
 
 bool HotIndexTable::GetEntry(uint64_t cuid, HotIndexEntry* entry) const {
@@ -116,7 +116,7 @@ void HotIndexTable::MarkDeltasAsObsolete(uint64_t cuid) {
 
 // d)	若遇到热点CUid，检查其热点索引表，若发现Deltas列表中对应的该段数据已被标记为 Obsolete，
 // 则直接跳过该段数据，并删除对应的Deltas记录。
-// deprecated：不能在 compaction 时直接清理
+// Deprecated：不能在 compaction 时直接清理
 bool HotIndexTable::CheckAndRemoveObsoleteDeltas(uint64_t cuid, const std::vector<uint64_t>& input_files) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto it = table_.find(cuid);
@@ -137,10 +137,6 @@ bool HotIndexTable::CheckAndRemoveObsoleteDeltas(uint64_t cuid, const std::vecto
     }
     if (is_input_file) {
         found_obsolete = true;    
-        // 减少 SST 引用计数
-        if (lifecycle_manager_) {
-            lifecycle_manager_->Unref(d_it->file_number);
-        }
         d_it = entry.obsolete_deltas.erase(d_it);
     } else {
         ++d_it;
@@ -171,6 +167,8 @@ bool HotIndexTable::IsDeltaObsolete(uint64_t cuid, const std::vector<uint64_t>& 
 void HotIndexTable::RemoveObsoleteDeltasForCUIDs(const std::unordered_set<uint64_t>& cuids, 
                                                  const std::vector<uint64_t>& input_files) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
+
+  std::unordered_set<uint64_t> input_files_set(input_files.begin(), input_files.end());
   
   for (uint64_t cuid : cuids) {
     auto entry_it = table_.find(cuid);
@@ -182,17 +180,7 @@ void HotIndexTable::RemoveObsoleteDeltasForCUIDs(const std::unordered_set<uint64
     // 移除 matched 文件
     for (auto it = entry.obsolete_deltas.begin(); it != entry.obsolete_deltas.end(); ) {
       bool is_input = false;
-      for (uint64_t fid : input_files) {
-        if (it->file_number == fid) {
-          is_input = true;
-          break;
-        }
-      }
-
-      if (is_input) {
-        if (lifecycle_manager_) {
-          lifecycle_manager_->Unref(it->file_number);
-        }
+      if (input_files_set.count(it->file_number)) { 
         it = entry.obsolete_deltas.erase(it);
       } else {
         ++it;
@@ -220,9 +208,6 @@ void HotIndexTable::UpdateDeltaIndex(uint64_t cuid,
     }
 
     if (is_input) {
-      if (lifecycle_manager_) {
-        lifecycle_manager_->Unref(it->file_number);
-      }
       it = entry.deltas.erase(it);
     } else {
       ++it;
@@ -239,20 +224,14 @@ void HotIndexTable::UpdateDeltaIndex(uint64_t cuid,
       }
     }
     if (is_input) {
-      if (lifecycle_manager_) {
-        lifecycle_manager_->Unref(it->file_number);
-      }
       it = entry.obsolete_deltas.erase(it);
     } else {
       ++it;
     }
   }
 
-  // new delta
+  // 加入 new delta index
   entry.deltas.push_back(new_delta);
-  if (lifecycle_manager_) {
-    lifecycle_manager_->Ref(new_delta.file_number);
-  }
 }
 
 void HotIndexTable::RemoveCUID(uint64_t cuid) {
@@ -267,10 +246,6 @@ void HotIndexTable::RemoveCUID(uint64_t cuid) {
                                  it->second.snapshot_segments.begin(), 
                                  it->second.snapshot_segments.end());
       }
-      // Delta 片段
-      segments_to_unref.insert(segments_to_unref.end(), 
-                               it->second.deltas.begin(), 
-                               it->second.deltas.end());
       table_.erase(it);
     }
   }
@@ -281,6 +256,66 @@ void HotIndexTable::RemoveCUID(uint64_t cuid) {
       lifecycle_manager_->Unref(seg.file_number);
     }
   }
+}
+
+void HotIndexTable::DumpToFile(const std::string& filename, const std::string& phase_label) {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  
+  // 使用追加模式打开文件
+  std::ofstream outfile;
+  outfile.open(filename, std::ios_base::app); 
+
+  if (!outfile.is_open()) {
+      std::cerr << "Error: Unable to open dump file: " << filename << std::endl;
+      return;
+  }
+
+  outfile << "========================================" << std::endl;
+  outfile << "DUMP PHASE: " << phase_label << std::endl;
+  outfile << "Total Tracked CUIDs: " << table_.size() << std::endl;
+
+  for (const auto& kv : table_) {
+    uint64_t cuid = kv.first;
+    const HotIndexEntry& entry = kv.second;
+
+    outfile << "CUID: " << cuid << std::endl;
+    
+    // 1. Snapshot 信息
+    if (entry.snapshot_segments.empty()) {
+      outfile << "  [Snapshot]: None" << std::endl;
+    } else {
+      outfile << "  [Snapshot]: " << entry.snapshot_segments.size() << " segments" << std::endl;
+      for (const auto& seg : entry.snapshot_segments) {
+        outfile << "    -> FileID: " << (int64_t)seg.file_number 
+                << " | Off: " << seg.offset 
+                << " | Len: " << seg.length;
+        if (seg.file_number == (uint64_t)-1) outfile << " (Mem)";
+        outfile << std::endl;
+      }
+    }
+
+    // 2. Deltas 信息
+    if (entry.deltas.empty()) {
+      outfile << "  [Deltas]: None" << std::endl;
+    } else {
+      outfile << "  [Deltas]: " << entry.deltas.size() << " segments" << std::endl;
+      for (const auto& seg : entry.deltas) {
+        outfile << "    -> FileID: " << seg.file_number 
+                << " | Off: " << seg.offset 
+                << " | Len: " << seg.length << std::endl;
+      }
+    }
+
+    // 3. Obsolete Deltas 信息
+    if (!entry.obsolete_deltas.empty()) {
+       outfile << "  [Obsolete]: " << entry.obsolete_deltas.size() << " pending cleanup" << std::endl;
+       for (const auto& seg : entry.obsolete_deltas) {
+          outfile << "    -> FileID: " << seg.file_number << " (Obs)" << std::endl;
+       }
+    }
+  }
+  outfile << "----------------------------------------" << std::endl << std::endl;
+  outfile.close();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

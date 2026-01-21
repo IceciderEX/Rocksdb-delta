@@ -1079,6 +1079,20 @@ Status CompactionJob::Install(bool* compaction_released) {
 
   if (status.ok()) {
     status = InstallCompactionResults(compaction_released);
+    // for delta，成功之后再修改metadata
+    if (status.ok() && hotspot_manager_) {
+        if (!compaction_involved_cuids_.empty()) {
+            hotspot_manager_->CleanUpMetadataAfterCompaction(
+                compaction_involved_cuids_, 
+                input_file_numbers_
+            );
+            compaction_involved_cuids_.clear();
+        }
+
+        if (hotspot_manager_) {
+            hotspot_manager_->DebugDump("AFTER_L0_COMPACTION");
+        }
+    }
   }
   if (!versions_->io_status().ok()) {
     io_status_ = versions_->io_status();
@@ -1902,6 +1916,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       }
   }
 
+  // 修改open_file_func, close_file_func，把文件信息记录下来
   auto [open_file_func, close_file_func] =
       CreateFileHandlers(sub_compact, boundaries, delta_ctx);
 
@@ -2536,17 +2551,6 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
 }
 
 void CompactionJob::CleanupCompaction() {
-  // for delta
-  if (hotspot_manager_ && compact_ && compact_->compaction) {
-      if (!compaction_involved_cuids_.empty()) {
-          hotspot_manager_->CleanUpMetadataAfterCompaction(
-              compaction_involved_cuids_, 
-              input_file_numbers_
-          );
-      }
-      compaction_involved_cuids_.clear();
-  }
-
   for (SubcompactionState& sub_compact : compact_->sub_compact_states) {
     sub_compact.Cleanup(table_cache_.get());
   }
