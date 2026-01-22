@@ -524,39 +524,39 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
             if (hotspot_manager_) {
               uint64_t cuid = hotspot_manager_->ExtractCUID(saved_key_.GetUserKey());
               if (cuid != 0) {
-                  // 如果 CUID 已被删除，跳过
-                  if (hotspot_manager_->IsCuidDeleted(cuid)) {
-                    valid_ = false;
-                    ResetValueAndColumns(); // 这个函数用于清理 value_
-                    // RecordTick(statistics_, DELTA_LOGICAL_DELETE_SKIPPED);
-                    iter_.Next();
-                    continue;
-                  }
+                // 如果 CUID 已被删除，跳过
+                if (hotspot_manager_->IsCuidDeleted(cuid)) {
+                  valid_ = false;
+                  ResetValueAndColumns(); // 这个函数用于清理 value_
+                  // RecordTick(statistics_, DELTA_LOGICAL_DELETE_SKIPPED);
+                  iter_.Next();
+                  continue;
+                }
 
-                  uint64_t phys_id = GetCurrentPhysUnitId(iter_.iter());
-              
-                  // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
-                  if (delta_ctx_.last_cuid != cuid) {
-                      // 将上个 cuid 的 Scan-as-Compaction 结果提交
-                      if (delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
-                          hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
-                          
-                      }
-                      delta_ctx_.last_cuid = cuid;
-                      delta_ctx_.visited_units_for_cuid.clear();
-                      // delta_ctx_.is_counting_mode = hotspot_manager_->GetDeleteTable().TryRegister(cuid);
-                      // 对这个 cuid 进行一次访问计数，用于判断是否为热点
-                      delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(cuid);
+                uint64_t phys_id = GetCurrentPhysUnitId(iter_.iter());
+            
+                // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
+                if (delta_ctx_.last_cuid != cuid) {
+                    // 将上个 cuid 的 Scan-as-Compaction 结果提交
+                    if (delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
+                        hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+                        
+                    }
+                    delta_ctx_.last_cuid = cuid;
+                    delta_ctx_.visited_units_for_cuid.clear();
+                    // delta_ctx_.is_counting_mode = hotspot_manager_->GetDeleteTable().TryRegister(cuid);
+                    // 对这个 cuid 进行一次访问计数，用于判断是否为热点
+                    delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(cuid);
 
-                      if (delta_ctx_.is_current_hot) {
-                        // 是否触发 Scan-as-Compaction
-                        delta_ctx_.trigger_scan_as_compaction = hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
-                      } else {
-                        delta_ctx_.trigger_scan_as_compaction = false;
-                      }
-                  }
+                    if (delta_ctx_.is_current_hot) {
+                      // 是否触发 Scan-as-Compaction
+                      delta_ctx_.trigger_scan_as_compaction = hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
+                    } else {
+                      delta_ctx_.trigger_scan_as_compaction = false;
+                    }
+                }
 
-                  // 维护引用计数
+                // 维护引用计数
                 if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
                   hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
                   delta_ctx_.visited_units_for_cuid.insert(phys_id);

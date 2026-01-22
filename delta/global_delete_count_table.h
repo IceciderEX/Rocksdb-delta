@@ -46,6 +46,11 @@ class GlobalDeleteCountTable {
 
   int GetRefCount(uint64_t cuid) const;
 
+  void ApplyCompactionChange(
+    uint64_t cuid, 
+    const std::vector<uint64_t>& input_files,
+    uint64_t output_file);
+
  private:
   mutable std::shared_mutex mutex_;
   std::unordered_map<uint64_t, GDCTEntry> table_;
