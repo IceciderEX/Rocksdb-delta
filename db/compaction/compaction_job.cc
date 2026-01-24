@@ -1089,9 +1089,9 @@ Status CompactionJob::Install(bool* compaction_released) {
             compaction_involved_cuids_.clear();
         }
 
-        if (hotspot_manager_) {
-            hotspot_manager_->DebugDump("AFTER_L0_COMPACTION");
-        }
+        // if (hotspot_manager_) {
+        //     hotspot_manager_->DebugDump("AFTER_L0_COMPACTION");
+        // }
     }
   }
   if (!versions_->io_status().ok()) {

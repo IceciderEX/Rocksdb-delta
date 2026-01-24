@@ -296,7 +296,7 @@ void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
     
     // fprintf(stdout, "[HotspotManager] Finalized CUID %lu. Snapshot has %zu segments (incl tail).\n", 
     //         cuid, final_segments.size());
-    DebugDump("AFTER_SCAN_FINALIZE_CUID_" + std::to_string(cuid));
+    // DebugDump("AFTER_SCAN_FINALIZE_CUID_" + std::to_string(cuid));
 }
 
 // ----------------- L0Compaction --------------------
