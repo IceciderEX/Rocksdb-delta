@@ -12,9 +12,12 @@ namespace ROCKSDB_NAMESPACE {
 
 struct GDCTEntry {
   std::unordered_set<uint64_t> tracked_phys_ids;
+  int32_t ref_count = 0;
   bool is_deleted = false;
 
-  int GetRefCount() const { return static_cast<int>(tracked_phys_ids.size()); }
+  int GetRefCount() const { 
+    return ref_count; 
+  }
 };
 
 class GlobalDeleteCountTable {
@@ -46,10 +49,11 @@ class GlobalDeleteCountTable {
 
   int GetRefCount(uint64_t cuid) const;
 
-  void ApplyCompactionChange(
-    uint64_t cuid, 
-    const std::vector<uint64_t>& input_files,
-    uint64_t output_file);
+  void ApplyCompactionChange(uint64_t cuid, const std::vector<uint64_t>& input_files, uint64_t output_file);
+
+  void TrackPhysicalUnitOnlyCount(uint64_t cuid);
+  void ApplyCompactionChangeOnlyCount(uint64_t cuid, int32_t input_count, int32_t output_count);
+  void DecreaseRefCountOnlyCount(uint64_t cuid, int32_t count = 1);
 
  private:
   mutable std::shared_mutex mutex_;

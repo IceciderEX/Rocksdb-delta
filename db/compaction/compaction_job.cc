@@ -140,9 +140,18 @@ struct DeltaCompactionContext {
     // 考虑 FileSize不更新，length=0
     uint64_t current_cuid_logical_size = 0; 
 
+    // CUID 在哪些输入文件中出现过
+    std::unordered_set<uint64_t> current_cuid_input_sources;
+
     void FlushSegment(uint64_t current_physical_offset) {
         if (current_cuid != 0 && manager) {
-            uint64_t length = current_cuid_logical_size; 
+            uint64_t length = current_cuid_logical_size;
+            int32_t input_count = static_cast<int32_t>(current_cuid_input_sources.size());
+            // 计算 output_count (是否写入了输出文件)
+            // 如果 length > 0，说明有数据写入了新 SST，则 output_count = 1
+            // 如果 length == 0 (被完全过滤/删除)，则 output_count = 0
+            int32_t output_count = (length > 0) ? 1 : 0;
+            manager->UpdateCompactionRefCount(current_cuid, input_count, output_count);
             if (length > 0) {
                 manager->UpdateCompactionDelta(current_cuid, input_files, 
                                              current_file_number, 
@@ -150,6 +159,7 @@ struct DeltaCompactionContext {
             }
         }
         current_cuid_logical_size = 0;
+        current_cuid_input_sources.clear();
     }
 };
 
@@ -1614,6 +1624,9 @@ Status CompactionJob::ProcessKeyValue(
              delta_ctx->cuid_start_offset = current_phys_offset;
              // current_cuid_logical_size 已经在 FlushSegment 中重置为 0
         }
+        uint64_t input_file_id = c_iter->input_file_number(); 
+        delta_ctx->current_cuid_input_sources.insert(input_file_id);
+        
         delta_ctx->current_cuid_logical_size += (c_iter->key().size() + c_iter->value().size());
     }
 

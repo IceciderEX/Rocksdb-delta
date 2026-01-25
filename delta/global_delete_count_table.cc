@@ -8,9 +8,11 @@ bool GlobalDeleteCountTable::TrackPhysicalUnit(uint64_t cuid, uint64_t phys_id) 
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto& entry = table_[cuid]; // Lazy Init
   
+  // 新文件，count++
   if (entry.tracked_phys_ids.find(phys_id) == entry.tracked_phys_ids.end()) {
     entry.tracked_phys_ids.insert(phys_id);
-    return true; // 新文件，Ref++
+    entry.ref_count++;
+    return true; 
   }
   return false;
 }
@@ -20,6 +22,7 @@ void GlobalDeleteCountTable::UntrackPhysicalUnit(uint64_t cuid, uint64_t phys_id
   auto it = table_.find(cuid);
   if (it != table_.end()) {
     it->second.tracked_phys_ids.erase(phys_id);
+    it->second.ref_count--;
     // 如果计数归零且已标记删除的清理？
     // if (it->second.is_deleted && it->second.tracked_phys_ids.empty()) {
     //     table_.erase(it);
@@ -112,6 +115,51 @@ int GlobalDeleteCountTable::GetRefCount(uint64_t cuid) const {
 bool GlobalDeleteCountTable::IsTracked(uint64_t cuid) const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
   return table_.find(cuid) != table_.end();
+}
+
+void GlobalDeleteCountTable::TrackPhysicalUnitOnlyCount(uint64_t cuid) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  table_[cuid].ref_count++;
+}
+
+void GlobalDeleteCountTable::DecreaseRefCountOnlyCount(uint64_t cuid, int32_t count) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it != table_.end()) {
+    it->second.ref_count -= count;
+
+    if (it->second.ref_count <= 0 && it->second.is_deleted) {
+      table_.erase(it);
+    }
+  }
+}
+
+void GlobalDeleteCountTable::ApplyCompactionChangeOnlyCount(
+    uint64_t cuid, 
+    int32_t input_count,   // 减去
+    int32_t output_count) {// 加上 
+    
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  
+  if (it == table_.end()) {
+     // 如果是新产生的 CUID (比如新写入)，初始化
+     if (output_count > 0) {
+         table_[cuid].ref_count += output_count;
+     }
+     return;
+  }
+
+  auto& entry = it->second;
+
+  // 原子更新引用计数
+  // Ref = Ref - Inputs + Outputs
+  entry.ref_count = entry.ref_count - input_count + output_count;
+
+  // 检查清理条件
+  if (entry.ref_count <= 0 && entry.is_deleted) {
+      table_.erase(it);
+  }
 }
 
 } // namespace ROCKSDB_NAMESPACE
