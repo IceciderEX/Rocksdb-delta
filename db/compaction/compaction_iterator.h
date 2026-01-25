@@ -59,6 +59,8 @@ class SequenceIterWrapper : public InternalIterator {
   }
   Slice key() const override { return inner_iter_->key(); }
   Slice value() const override { return inner_iter_->value(); }
+  // for delta
+  uint64_t GetPhysicalId() const { return inner_iter_->GetPhysicalId(); }
 
   // Unused InternalIterator methods
   void SeekToFirst() override { assert(false); }
@@ -531,6 +533,7 @@ class CompactionIterator {
   // Stores whether the current compaction iterator output
   // is a range tombstone start key.
   bool is_range_del_{false};
+  
 
   // for delta
   std::shared_ptr<HotspotManager> hotspot_manager_;
@@ -539,7 +542,13 @@ class CompactionIterator {
   std::vector<uint64_t> input_file_numbers_;
   std::unordered_set<uint64_t>* involved_cuids_ = nullptr;
 
+public: 
+  uint64_t input_file_number() const {
+      return input_.GetPhysicalId();
+  }
+
   void CheckHotspotFilters();
+
 };
 
 inline bool CompactionIterator::DefinitelyInSnapshot(SequenceNumber seq,

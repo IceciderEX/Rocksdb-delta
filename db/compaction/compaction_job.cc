@@ -1626,7 +1626,7 @@ Status CompactionJob::ProcessKeyValue(
         }
         uint64_t input_file_id = c_iter->input_file_number(); 
         delta_ctx->current_cuid_input_sources.insert(input_file_id);
-        
+
         delta_ctx->current_cuid_logical_size += (c_iter->key().size() + c_iter->value().size());
     }
 
