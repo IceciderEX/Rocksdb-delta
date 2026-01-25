@@ -60,7 +60,7 @@ class SequenceIterWrapper : public InternalIterator {
   Slice key() const override { return inner_iter_->key(); }
   Slice value() const override { return inner_iter_->value(); }
   // for delta
-  uint64_t GetPhysicalId() const { return inner_iter_->GetPhysicalId(); }
+  uint64_t GetPhysicalId() override { return inner_iter_->GetPhysicalId(); }
 
   // Unused InternalIterator methods
   void SeekToFirst() override { assert(false); }
@@ -543,7 +543,7 @@ class CompactionIterator {
   std::unordered_set<uint64_t>* involved_cuids_ = nullptr;
 
 public: 
-  uint64_t input_file_number() const {
+  uint64_t input_file_number() {
       return input_.GetPhysicalId();
   }
 

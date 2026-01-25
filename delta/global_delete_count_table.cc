@@ -48,6 +48,29 @@ bool GlobalDeleteCountTable::TrackPhysicalUnit(uint64_t cuid, uint64_t phys_id) 
 //   }
 // }
 
+void GlobalDeleteCountTable::UntrackFiles(uint64_t cuid, const std::vector<uint64_t>& file_ids) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) return;
+
+  auto& entry = it->second;
+  auto& ids = entry.tracked_phys_ids; // 这是用于校验的 Vector
+
+  for (uint64_t fid : file_ids) {
+      // 使用二分查找在校验 Vector 中寻找文件 ID
+      auto pos = std::lower_bound(ids.begin(), ids.end(), fid);
+      if (pos != ids.end() && *pos == fid) {
+          ids.erase(pos);
+          entry.ref_count--; // 同步扣减逻辑计数
+      }
+  }
+
+  // 检查是否需要清理条目 (引用归零 且 标记删除)
+  if (entry.ref_count <= 0 && entry.is_deleted) {
+      table_.erase(it);
+  }
+}
+
 void GlobalDeleteCountTable::ApplyCompactionChange(
                              uint64_t cuid, 
                              int32_t input_count, int32_t output_count,
@@ -133,49 +156,49 @@ bool GlobalDeleteCountTable::IsTracked(uint64_t cuid) const {
   return table_.find(cuid) != table_.end();
 }
 
-void GlobalDeleteCountTable::TrackPhysicalUnitOnlyCount(uint64_t cuid) {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  table_[cuid].ref_count++;
-}
+// void GlobalDeleteCountTable::TrackPhysicalUnitOnlyCount(uint64_t cuid) {
+//   std::unique_lock<std::shared_mutex> lock(mutex_);
+//   table_[cuid].ref_count++;
+// }
 
-void GlobalDeleteCountTable::DecreaseRefCountOnlyCount(uint64_t cuid, int32_t count) {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  auto it = table_.find(cuid);
-  if (it != table_.end()) {
-    it->second.ref_count -= count;
+// void GlobalDeleteCountTable::DecreaseRefCountOnlyCount(uint64_t cuid, int32_t count) {
+//   std::unique_lock<std::shared_mutex> lock(mutex_);
+//   auto it = table_.find(cuid);
+//   if (it != table_.end()) {
+//     it->second.ref_count -= count;
 
-    if (it->second.ref_count <= 0 && it->second.is_deleted) {
-      table_.erase(it);
-    }
-  }
-}
+//     if (it->second.ref_count <= 0 && it->second.is_deleted) {
+//       table_.erase(it);
+//     }
+//   }
+// }
 
-void GlobalDeleteCountTable::ApplyCompactionChangeOnlyCount(
-    uint64_t cuid, 
-    int32_t input_count,   // 减去
-    int32_t output_count) {// 加上 
+// void GlobalDeleteCountTable::ApplyCompactionChangeOnlyCount(
+//     uint64_t cuid, 
+//     int32_t input_count,   // 减去
+//     int32_t output_count) {// 加上 
     
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  auto it = table_.find(cuid);
+//   std::unique_lock<std::shared_mutex> lock(mutex_);
+//   auto it = table_.find(cuid);
   
-  if (it == table_.end()) {
-     // 如果是新产生的 CUID (比如新写入)，初始化
-     if (output_count > 0) {
-         table_[cuid].ref_count += output_count;
-     }
-     return;
-  }
+//   if (it == table_.end()) {
+//      // 如果是新产生的 CUID (比如新写入)，初始化
+//      if (output_count > 0) {
+//          table_[cuid].ref_count += output_count;
+//      }
+//      return;
+//   }
 
-  auto& entry = it->second;
+//   auto& entry = it->second;
 
-  // 原子更新引用计数
-  // Ref = Ref - Inputs + Outputs
-  entry.ref_count = entry.ref_count - input_count + output_count;
+//   // 原子更新引用计数
+//   // Ref = Ref - Inputs + Outputs
+//   entry.ref_count = entry.ref_count - input_count + output_count;
 
-  // 检查清理条件
-  if (entry.ref_count <= 0 && entry.is_deleted) {
-      table_.erase(it);
-  }
-}
+//   // 检查清理条件
+//   if (entry.ref_count <= 0 && entry.is_deleted) {
+//       table_.erase(it);
+//   }
+// }
 
 } // namespace ROCKSDB_NAMESPACE

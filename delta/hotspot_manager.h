@@ -78,7 +78,11 @@ class HotspotManager {
 
   void UpdateCompactionRefCount(uint64_t cuid, 
                                               int32_t input_count,
-                                              int32_t output_count);
+                                              int32_t output_count,
+                                              const std::vector<uint64_t>& input_files_verified,
+                                              uint64_t output_file_verified) {
+      delete_table_.ApplyCompactionChange(cuid, input_count, output_count, input_files_verified, output_file_verified);
+  }
 
   void DebugDump(const std::string& label) {
     std::string dump_file = "/home/wam/HWKV/rocksdb-delta/build/a_test_db/a_mgr.log"; 

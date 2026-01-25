@@ -301,12 +301,12 @@ void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
 
 // ----------------- L0Compaction --------------------
 
-void HotspotManager::UpdateCompactionRefCount(uint64_t cuid, 
-                                              int32_t input_count,
-                                              int32_t output_count) {
-    // 直接调用 GDCT 的新接口
-    delete_table_.ApplyCompactionChangeOnlyCount(cuid, input_count, output_count);
-}
+// void HotspotManager::UpdateCompactionRefCount(uint64_t cuid, 
+//                                               int32_t input_count,
+//                                               int32_t output_count) {
+//     // 直接调用 GDCT 的新接口
+//     delete_table_.ApplyCompactionChangeOnlyCount(cuid, input_count, output_count);
+// }
 
 void HotspotManager::UpdateCompactionDelta(uint64_t cuid, 
                                            const std::vector<uint64_t>& input_files,

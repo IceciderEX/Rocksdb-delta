@@ -31,7 +31,7 @@ class GlobalDeleteCountTable {
   // void UntrackPhysicalUnit(uint64_t cuid, uint64_t phys_id);
 
   // void UntrackFiles(uint64_t cuid, const std::vector<uint64_t>& file_ids);
-
+  void UntrackFiles(uint64_t cuid, const std::vector<uint64_t>& file_ids);
   //  检查是否已经追踪了该 CUID
   bool IsTracked(uint64_t cuid) const;
 

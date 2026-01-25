@@ -151,7 +151,16 @@ struct DeltaCompactionContext {
             // 如果 length > 0，说明有数据写入了新 SST，则 output_count = 1
             // 如果 length == 0 (被完全过滤/删除)，则 output_count = 0
             int32_t output_count = (length > 0) ? 1 : 0;
-            manager->UpdateCompactionRefCount(current_cuid, input_count, output_count);
+
+            std::vector<uint64_t> input_files_vec(current_cuid_input_sources.begin(), 
+                                              current_cuid_input_sources.end());
+
+            std::sort(input_files_vec.begin(), input_files_vec.end());
+            uint64_t output_file_id = (length > 0) ? current_file_number : 0;
+
+            manager->UpdateCompactionRefCount(current_cuid, 
+                                          input_count, output_count, 
+                                          input_files_vec, output_file_id);
             if (length > 0) {
                 manager->UpdateCompactionDelta(current_cuid, input_files, 
                                              current_file_number, 
