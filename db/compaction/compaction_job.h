@@ -578,8 +578,8 @@ public:
   struct DeltaOutputInfo {
       uint64_t cuid;
       uint64_t file_number;
-      uint64_t offset;
-      uint64_t length;
+      std::string first_key;
+      std::string last_key;
   };
 
   // CUID -> Set of Input File IDs
