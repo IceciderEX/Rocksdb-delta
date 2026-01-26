@@ -159,6 +159,14 @@ struct DeltaCompactionContext {
             }
         }
         current_cuid_logical_size = 0;
+        cuid_start_offset = current_physical_offset;
+    }
+
+    void HandleFileSwitch(uint64_t old_file_size, uint64_t old_file_number, uint64_t new_file_number) {
+        // 当前cuid在旧文件的处理
+        FlushSegment(old_file_size, old_file_number);
+        current_file_number = new_file_number;
+        cuid_start_offset = 0;
     }
 
     // void FlushSegment(uint64_t current_physical_offset) {
@@ -1625,12 +1633,17 @@ CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
       [this, sub_compact, delta_ctx](CompactionOutputs& outputs) {
         Status s = this->OpenCompactionOutputFile(sub_compact, outputs);
         if (s.ok()) {
+          // 旧的逻辑
+          // FileMetaData* meta = outputs.GetMetaData();
+          // if (meta) {
+          //   delta_ctx->current_file_number = meta->fd.GetNumber();
+          //   // new file
+          //   delta_ctx->cuid_start_offset = 0;
+          // }
           FileMetaData* meta = outputs.GetMetaData();
-          if (meta) {
-            delta_ctx->current_file_number = meta->fd.GetNumber();
-            // new file
-            delta_ctx->cuid_start_offset = 0;
-          }
+          uint64_t final_size = meta->fd.GetFileSize();
+          uint64_t old_file_num = meta->fd.GetNumber();
+          delta_ctx->HandleFileSwitch(final_size, old_file_num, 0);
         }
         return s;
       };
@@ -1647,11 +1660,15 @@ CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
           const ParsedInternalKey& prev_iter_output_internal_key,
           const Slice& next_table_min_key, const CompactionIterator* c_iter,
           CompactionOutputs& outputs) {
+
+        uint64_t new_file_num = outputs.GetOutputs().back().meta.fd.GetNumber();
+        delta_ctx->current_file_number = new_file_num;
         
-        if (delta_ctx->current_cuid != 0) {
-          uint64_t file_size = outputs.GetBuilder() ? outputs.GetBuilder()->FileSize() : 0;
-          delta_ctx->FlushSegment(file_size);
-        }
+        // 旧的逻辑
+        // if (delta_ctx->current_cuid != 0) {
+        //   uint64_t file_size = outputs.GetBuilder() ? outputs.GetBuilder()->FileSize() : 0;
+        //   delta_ctx->FlushSegment(file_size, delta_ctx->current_file_number);
+        // }
 
         return this->FinishCompactionOutputFile(
             status, prev_iter_output_internal_key, next_table_min_key,
@@ -1703,25 +1720,16 @@ Status CompactionJob::ProcessKeyValue(
         if (cuid != delta_ctx->current_cuid) {
              CompactionOutputs& outputs = sub_compact->Current();
              uint64_t current_phys_offset = 0;
-             uint64_t current_file_num = 0;
 
              if (outputs.GetBuilder()) {
                  current_phys_offset = outputs.GetBuilder()->FileSize();
              }
-             // TODO:这里的output处理
-             if (!outputs.GetOutputs().empty()) {
-                 current_file_num = outputs.GetMetaData()->fd.GetNumber();
-             }
 
-             delta_ctx->FlushSegment(current_phys_offset);
+             delta_ctx->FlushSegment(current_phys_offset, delta_ctx->current_file_number);
              // newcuid
              delta_ctx->current_cuid = cuid;
-             delta_ctx->cuid_start_offset = current_phys_offset;
              // current_cuid_logical_size 
         }
-        // uint64_t input_file_id = c_iter->input_file_number(); 
-        // delta_ctx->current_cuid_input_sources.insert(input_file_id);
-
         delta_ctx->current_cuid_logical_size += (c_iter->key().size() + c_iter->value().size());
     }
 
