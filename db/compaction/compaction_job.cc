@@ -132,6 +132,7 @@ const char* GetCompactionProximalOutputRangeTypeString(
 struct DeltaCompactionContext {
     std::shared_ptr<HotspotManager> manager;
     std::vector<uint64_t> input_files;
+    std::vector<CompactionJob::DeltaOutputInfo>* pending_outputs;
     
     uint64_t current_cuid = 0;
     uint64_t cuid_start_offset = 0; 
@@ -143,33 +144,50 @@ struct DeltaCompactionContext {
     // CUID 在哪些输入文件中出现过
     std::unordered_set<uint64_t> current_cuid_input_sources;
 
-    void FlushSegment(uint64_t current_physical_offset) {
-        if (current_cuid != 0 && manager) {
+    void FlushSegment(uint64_t current_physical_offset, uint64_t current_output_file_num) {
+        if (current_cuid != 0 && pending_outputs) {
             uint64_t length = current_cuid_logical_size;
-            int32_t input_count = static_cast<int32_t>(current_cuid_input_sources.size());
-            // 计算 output_count (是否写入了输出文件)
-            // 如果 length > 0，说明有数据写入了新 SST，则 output_count = 1
-            // 如果 length == 0 (被完全过滤/删除)，则 output_count = 0
-            int32_t output_count = (length > 0) ? 1 : 0;
-
-            std::vector<uint64_t> input_files_vec(current_cuid_input_sources.begin(), 
-                                              current_cuid_input_sources.end());
-
-            std::sort(input_files_vec.begin(), input_files_vec.end());
-            uint64_t output_file_id = (length > 0) ? current_file_number : 0;
-
-            manager->UpdateCompactionRefCount(current_cuid, 
-                                          input_count, output_count, 
-                                          input_files_vec, output_file_id);
+            // 产生有效数据时才记录 Output
             if (length > 0) {
-                manager->UpdateCompactionDelta(current_cuid, input_files, 
-                                             current_file_number, 
-                                             cuid_start_offset, length);
+                // 仅仅记录，不调用 Manager
+                pending_outputs->push_back({
+                    current_cuid,
+                    current_output_file_num,
+                    cuid_start_offset,
+                    length
+                });
             }
         }
         current_cuid_logical_size = 0;
-        current_cuid_input_sources.clear();
     }
+
+    // void FlushSegment(uint64_t current_physical_offset) {
+    //     if (current_cuid != 0 && manager) {
+    //         uint64_t length = current_cuid_logical_size;
+    //         int32_t input_count = static_cast<int32_t>(current_cuid_input_sources.size());
+    //         // 计算 output_count (是否写入了输出文件)
+    //         // 如果 length > 0，说明有数据写入了新 SST，则 output_count = 1
+    //         // 如果 length == 0 (被完全过滤/删除)，则 output_count = 0
+    //         int32_t output_count = (length > 0) ? 1 : 0;
+
+    //         std::vector<uint64_t> input_files_vec(current_cuid_input_sources.begin(), 
+    //                                           current_cuid_input_sources.end());
+
+    //         std::sort(input_files_vec.begin(), input_files_vec.end());
+    //         uint64_t output_file_id = (length > 0) ? current_file_number : 0;
+
+    //         manager->UpdateCompactionRefCount(current_cuid, 
+    //                                       input_count, output_count, 
+    //                                       input_files_vec, output_file_id);
+    //         if (length > 0) {
+    //             manager->UpdateCompactionDelta(current_cuid, input_files, 
+    //                                          current_file_number, 
+    //                                          cuid_start_offset, length);
+    //         }
+    //     }
+    //     current_cuid_logical_size = 0;
+    //     current_cuid_input_sources.clear();
+    // }
 };
 
 CompactionJob::CompactionJob(
@@ -1100,17 +1118,65 @@ Status CompactionJob::Install(bool* compaction_released) {
     status = InstallCompactionResults(compaction_released);
     // for delta，成功之后再修改metadata
     if (status.ok() && hotspot_manager_) {
-        if (!compaction_involved_cuids_.empty()) {
-            hotspot_manager_->CleanUpMetadataAfterCompaction(
-                compaction_involved_cuids_, 
-                input_file_numbers_
-            );
-            compaction_involved_cuids_.clear();
-        }
+        // if (!compaction_involved_cuids_.empty()) {
+        //     hotspot_manager_->CleanUpMetadataAfterCompaction(
+        //         compaction_involved_cuids_, 
+        //         input_file_numbers_
+        //     );
+        //     compaction_involved_cuids_.clear();
+        // }
 
         // if (hotspot_manager_) {
         //     hotspot_manager_->DebugDump("AFTER_L0_COMPACTION");
         // }
+        if (status.ok() && hotspot_manager_) {
+          // CUID -> List<Segments>
+          std::map<uint64_t, std::vector<DeltaOutputInfo>> output_map;
+          for (const auto& out : global_outputs_) {
+              output_map[out.cuid].push_back(out);
+          }
+
+          for (auto& pair : global_cuid_inputs_) {
+              uint64_t cuid = pair.first;
+              const auto& input_set = pair.second;
+
+              // 1. 计算 Input Count & Vector
+              int32_t input_count = static_cast<int32_t>(input_set.size());
+              std::vector<uint64_t> input_files_vec(input_set.begin(), input_set.end());
+              std::sort(input_files_vec.begin(), input_files_vec.end());
+
+              // 2. 计算 Output Count & Info
+              int32_t output_count = 0;
+              uint64_t output_file_id = 0; // 用于 Verify，取第一个即可
+              
+              auto out_it = output_map.find(cuid);
+              if (out_it != output_map.end()) {
+                  output_count = static_cast<int32_t>(out_it->second.size());
+                  if (output_count > 0) {
+                      output_file_id = out_it->second[0].file_number;
+                  }
+              }
+
+              // - 被跳过/删除: Input=N, Output=0 -> Ref-=N
+              // - 正常存活: Input=N, Output=M -> Ref = Ref - N + M
+              hotspot_manager_->UpdateCompactionRefCount(
+                  cuid, input_count, output_count, 
+                  input_files_vec, output_file_id
+              );
+
+              if (output_count > 0) {
+                  for (const auto& seg : out_it->second) {
+                      hotspot_manager_->UpdateCompactionDelta(
+                          cuid, input_files_vec, 
+                          seg.file_number, seg.offset, seg.length
+                      );
+                  }
+              }
+          }
+          
+          global_cuid_inputs_.clear();
+          global_outputs_.clear();
+        }
     }
   }
   if (!versions_->io_status().ok()) {
@@ -1611,30 +1677,50 @@ Status CompactionJob::ProcessKeyValue(
   TEST_SYNC_POINT_CALLBACK(
       "CompactionJob::ProcessKeyValueCompaction()::Processing",
       static_cast<void*>(const_cast<Compaction*>(sub_compact->compaction)));
+  
+  // for delta
+
+
+  // this subcompaction: Input Files (CUID -> Set<FileID>)
+  std::map<uint64_t, std::unordered_set<uint64_t>> local_inputs;
+  // this subcompaction: Output Segments
+  std::vector<DeltaOutputInfo> local_outputs;
+
+  c_iter->SetInputMap(&local_inputs);
+  if (delta_ctx) {
+      delta_ctx->pending_outputs = &local_outputs;
+  }  
 
   while (status.ok() && !cfd->IsDropped() && c_iter->Valid() &&
          c_iter->status().ok()) {
     assert(!end.has_value() ||
            cfd->user_comparator()->Compare(c_iter->user_key(), *end) < 0);
-
+    
+    // cuid change(如果数据有效)
     if (delta_ctx && delta_ctx->manager) {
         uint64_t cuid = delta_ctx->manager->ExtractCUID(c_iter->key());
         
         if (cuid != delta_ctx->current_cuid) {
              CompactionOutputs& outputs = sub_compact->Current();
              uint64_t current_phys_offset = 0;
+             uint64_t current_file_num = 0;
+
              if (outputs.GetBuilder()) {
                  current_phys_offset = outputs.GetBuilder()->FileSize();
+             }
+             // TODO:这里的output处理
+             if (!outputs.GetOutputs().empty()) {
+                 current_file_num = outputs.GetMetaData()->fd.GetNumber();
              }
 
              delta_ctx->FlushSegment(current_phys_offset);
              // newcuid
              delta_ctx->current_cuid = cuid;
              delta_ctx->cuid_start_offset = current_phys_offset;
-             // current_cuid_logical_size 已经在 FlushSegment 中重置为 0
+             // current_cuid_logical_size 
         }
-        uint64_t input_file_id = c_iter->input_file_number(); 
-        delta_ctx->current_cuid_input_sources.insert(input_file_id);
+        // uint64_t input_file_id = c_iter->input_file_number(); 
+        // delta_ctx->current_cuid_input_sources.insert(input_file_id);
 
         delta_ctx->current_cuid_logical_size += (c_iter->key().size() + c_iter->value().size());
     }
@@ -1710,10 +1796,25 @@ Status CompactionJob::ProcessKeyValue(
   if (status.ok() && delta_ctx && delta_ctx->manager && delta_ctx->current_cuid != 0) {
       CompactionOutputs& outputs = sub_compact->Current();
       uint64_t end_offset = 0;
+      uint64_t current_file_num = 0;
+
       if (outputs.GetBuilder()) {
           end_offset = outputs.GetBuilder()->FileSize();
       }
-      delta_ctx->FlushSegment(end_offset);
+      // TODO:这里的output处理
+      if (!outputs.GetOutputs().empty()) {
+          current_file_num = outputs.GetMetaData()->fd.GetNumber();
+      }
+      delta_ctx->FlushSegment(end_offset, current_file_num);
+  }
+  
+  if (hotspot_manager_) {
+      // 多个 subcompaction 的保护
+      std::lock_guard<std::mutex> lock(delta_mutex_);
+      for (auto& pair : local_inputs) {
+          global_cuid_inputs_[pair.first].insert(pair.second.begin(), pair.second.end());
+      }
+      global_outputs_.insert(global_outputs_.end(), local_outputs.begin(), local_outputs.end());
   }
 
   return status;

@@ -541,10 +541,15 @@ class CompactionIterator {
   bool skip_current_cuid_ = false; // 缓存当前cuid是否需要被跳过
   std::vector<uint64_t> input_file_numbers_;
   std::unordered_set<uint64_t>* involved_cuids_ = nullptr;
+  std::map<uint64_t, std::unordered_set<uint64_t>>* input_map_ = nullptr;
 
 public: 
   uint64_t input_file_number() {
       return input_.GetPhysicalId();
+  }
+
+  void SetInputMap(std::map<uint64_t, std::unordered_set<uint64_t>>* map) {
+      input_map_ = map;
   }
 
   void CheckHotspotFilters();

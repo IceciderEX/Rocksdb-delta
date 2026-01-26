@@ -572,6 +572,23 @@ class CompactionJob {
   std::vector<uint64_t> input_file_numbers_;
   std::unordered_set<uint64_t> compaction_involved_cuids_;
   std::mutex cuids_mutex_;
+
+public:
+  // 暂存 Output Segment 信息
+  struct DeltaOutputInfo {
+      uint64_t cuid;
+      uint64_t file_number;
+      uint64_t offset;
+      uint64_t length;
+  };
+
+  // CUID -> Set of Input File IDs
+  // 记录了每个 CUID 在哪些输入文件中出现过（包括被跳过的）
+  std::map<uint64_t, std::unordered_set<uint64_t>> global_cuid_inputs_;
+
+  // 所有的 Output Segments
+  std::vector<DeltaOutputInfo> global_outputs_;
+  std::mutex delta_mutex_;
 };
 
 // CompactionServiceInput is used the pass compaction information between two
