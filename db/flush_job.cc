@@ -1087,13 +1087,11 @@ Status FlushJob::WriteLevel0Table() {
 
         for (auto& kv : output_segments) {
             uint64_t cuid = kv.first;
+            const DataSegment& seg = kv.second;
             
             // 当 CUID 已经是热点时，才记录索引
-            if (db_options_.hotspot_manager->IsHot(cuid)) {
-                DataSegment& segment = kv.second;
-                segment.file_number = file_number; // 补全文件号
-                
-                db_options_.hotspot_manager->GetIndexTable().AddDelta(cuid, segment);
+            if (seg.Valid() && db_options_.hotspot_manager->IsHot(cuid)) {
+                db_options_.hotspot_manager->GetIndexTable().AddDelta(cuid, seg);
                 registered_count++;
             }
         }

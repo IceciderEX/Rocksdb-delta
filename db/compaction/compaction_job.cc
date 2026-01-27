@@ -1138,7 +1138,6 @@ Status CompactionJob::Install(bool* compaction_released) {
                           seg.file_number, 
                           seg.first_key, 
                           seg.last_key,  
-                          seg.entry_count 
                       );
                   }
               } else { // 被删除或者过滤的cuid的处理？

@@ -165,7 +165,7 @@ Status HotspotManager::FlushBlockToSharedSST(
     while (i < entries.size() && entries[i].cuid == current_cuid) {
       const auto& current_key = entries[i].key;
       // 去重(在delta表中按理说不存在，因为是append-only key)
-      if (!is_first_entry_in_segment && current_key == last_written_key) {
+      if (!is_first_entry_in_segment && current_key == last_written_key_in_segment) {
           i++;
           continue; 
       }
