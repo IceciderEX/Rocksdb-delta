@@ -580,6 +580,7 @@ public:
       uint64_t file_number;
       std::string first_key;
       std::string last_key;
+      uint64_t entry_count = 0;
   };
 
   // CUID -> Set of Input File IDs

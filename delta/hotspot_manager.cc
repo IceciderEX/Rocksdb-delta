@@ -130,11 +130,9 @@ Status HotspotManager::FlushBlockToSharedSST(
     
   if (!block || block->entries.empty()) return Status::OK();
 
-  // 1. 排序 (按 CUID 聚簇 + Key 排序)
+  // keysort
   block->Sort();
 
-  // 2. 准备 Writer
-  // 确认一下 VersionSet？【不会进入】
   EnvOptions env_options;
   SstFileWriter sst_writer(env_options, db_options_);
   
@@ -154,10 +152,10 @@ Status HotspotManager::FlushBlockToSharedSST(
   size_t i = 0;
   while (i < entries.size()) {
     uint64_t current_cuid = entries[i].cuid;
-    uint64_t start_offset = sst_writer.FileSize(); // 记录起始偏移
-    std::string first_key = entries[i].key;        // 记录 First Key
+    std::string segment_first_key = entries[i].key; // 记录 First Key
+    std::string segment_last_key;
 
-    std::string last_written_key;
+    std::string last_written_key_in_segment;
     bool is_first_entry_in_segment = true;
 
     uint64_t logical_size = 0; 
@@ -166,6 +164,7 @@ Status HotspotManager::FlushBlockToSharedSST(
     // 当前 CUID 的所有 Entry
     while (i < entries.size() && entries[i].cuid == current_cuid) {
       const auto& current_key = entries[i].key;
+      // 去重(在delta表中按理说不存在，因为是append-only key)
       if (!is_first_entry_in_segment && current_key == last_written_key) {
           i++;
           continue; 
@@ -173,25 +172,18 @@ Status HotspotManager::FlushBlockToSharedSST(
       s = sst_writer.Put(entries[i].key, entries[i].value);
       if (!s.ok()) return s;
 
-      logical_size += current_key.size() + entries[i].value.size();
-      last_written_key = current_key;
-
-      logical_size += current_key.size() + entries[i].value.size();
+      last_written_key_in_segment = current_key;  
+      segment_last_key = current_key;            // 实时更新 Segment Last Key
       written_count++;
       is_first_entry_in_segment = false;
       i++;
     }
-    
-    uint64_t end_offset = sst_writer.FileSize();
-    uint64_t physical_length = end_offset - start_offset;
 
     if (written_count > 0) {
       DataSegment segment;
       segment.file_number = file_number;
-      segment.offset = start_offset;
-      
-      segment.length = (physical_length > 0) ? physical_length : logical_size;
-      segment.first_key = first_key; 
+      segment.first_key = segment_first_key;
+      segment.last_key = segment_last_key;
 
       (*output_segments)[current_cuid] = segment;
     }
@@ -281,17 +273,14 @@ void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
         return; 
     }
 
-    // tail segment
+    // tail segment, PromoteSnapshot()填充具体值
     DataSegment tail_segment;
     tail_segment.file_number = static_cast<uint64_t>(-1);
-    tail_segment.offset = 0; 
-    tail_segment.length = 0; 
     
     final_segments.push_back(tail_segment);
 
     // 更新这个 cuid 的 Snapshot
     index_table_.UpdateSnapshot(cuid, final_segments);
-
     index_table_.MarkDeltasAsObsolete(cuid);
     
     // fprintf(stdout, "[HotspotManager] Finalized CUID %lu. Snapshot has %zu segments (incl tail).\n", 
@@ -301,26 +290,18 @@ void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
 
 // ----------------- L0Compaction --------------------
 
-// void HotspotManager::UpdateCompactionRefCount(uint64_t cuid, 
-//                                               int32_t input_count,
-//                                               int32_t output_count) {
-//     // 直接调用 GDCT 的新接口
-//     delete_table_.ApplyCompactionChangeOnlyCount(cuid, input_count, output_count);
-// }
-
 void HotspotManager::UpdateCompactionDelta(uint64_t cuid, 
                                            const std::vector<uint64_t>& input_files,
                                            uint64_t output_file_number,
-                                           uint64_t offset,
-                                           uint64_t length) {
-    if (length == 0) return;
+                                           const std::string& first_key,
+                                           const std::string& last_key) {
+    if (first_key.empty()) return;
     
     DataSegment seg;
     seg.file_number = output_file_number;
-    seg.offset = offset;
-    seg.length = length;
-    // seg.first_key = ?; // TODO: 怎么提取？
-
+    seg.first_key = first_key;
+    seg.last_key = last_key;
+    
     index_table_.UpdateDeltaIndex(cuid, input_files, seg);
 }
 

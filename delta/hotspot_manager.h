@@ -60,12 +60,13 @@ class HotspotManager {
   bool InterceptDelete(const Slice& key);
 
   uint64_t ExtractCUID(const Slice& key);
-
+  
+  // compaction 结束之后更新delta表
   void UpdateCompactionDelta(uint64_t cuid, 
-                                           const std::vector<uint64_t>& input_files,
-                                           uint64_t output_file_number,
-                                           uint64_t offset,
-                                           uint64_t length);
+                             const std::vector<uint64_t>& input_files,
+                             uint64_t output_file_number,
+                             const std::string& first_key, 
+                             const std::string& last_key); 
   
   // CompactionIterator 使用 否应该跳过
   bool ShouldSkipObsoleteDelta(uint64_t cuid, const std::vector<uint64_t>& input_files);

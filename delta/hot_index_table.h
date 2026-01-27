@@ -14,11 +14,10 @@ namespace ROCKSDB_NAMESPACE {
 
 struct DataSegment {
   uint64_t file_number;
-  uint64_t offset;
-  uint64_t length;
   std::string first_key;
+  std::string last_key;
   
-  bool Valid() const { return length > 0; }
+  bool Valid() const { return !first_key.empty(); }
 };
 
 struct HotIndexEntry {

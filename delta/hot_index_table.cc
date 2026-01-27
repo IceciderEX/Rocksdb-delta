@@ -57,11 +57,13 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid, const DataSegment& new_segmen
   auto& entry = it->second;
   bool found_mem_segment = false;
 
-  // 遍历 Snapshot 片段，寻找 file_number 为 -1 的片段
+  // 遍历 Snapshot 片段，寻找 file_number 为 -1 的片段，进行一个promote
   for (auto& seg : entry.snapshot_segments) {
     if (seg.file_number == static_cast<uint64_t>(-1)) {
-      // 找到了内存片段，原地更新为真实文件信息 (Offset/Length/FileNum)
-      seg = new_segment; 
+      seg.file_number = new_segment.file_number;
+      seg.first_key = new_segment.first_key;
+      seg.last_key = new_segment.last_key;
+
       found_mem_segment = true;
       break; 
     }
@@ -287,8 +289,8 @@ void HotIndexTable::DumpToFile(const std::string& filename, const std::string& p
       outfile << "  [Snapshot]: " << entry.snapshot_segments.size() << " segments" << std::endl;
       for (const auto& seg : entry.snapshot_segments) {
         outfile << "    -> FileID: " << (int64_t)seg.file_number 
-                << " | Off: " << seg.offset 
-                << " | Len: " << seg.length;
+                << " | FirstKey: " << seg.first_key 
+                << " | LastKey: " << seg.last_key;
         if (seg.file_number == (uint64_t)-1) outfile << " (Mem)";
         outfile << std::endl;
       }
@@ -301,8 +303,8 @@ void HotIndexTable::DumpToFile(const std::string& filename, const std::string& p
       outfile << "  [Deltas]: " << entry.deltas.size() << " segments" << std::endl;
       for (const auto& seg : entry.deltas) {
         outfile << "    -> FileID: " << seg.file_number 
-                << " | Off: " << seg.offset 
-                << " | Len: " << seg.length << std::endl;
+                << " | FirstKey: " << seg.first_key 
+                << " | LastKey: " << seg.last_key << std::endl;
       }
     }
 
