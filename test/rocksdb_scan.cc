@@ -19,7 +19,8 @@
 
 using namespace ROCKSDB_NAMESPACE;
 
-const std::string kDBPath = "/home/wam/HWKV/rocksdb-delta/db_tmp";
+const std::string kDBPath = "/home/wam/Rocksdb-delta/db_tmp";
+// const std::string kDBPath = "/home/wam/HWKV/rocksdb-delta/db_tmp";
 
 // ==========================================
 // 1. 辅助工具: Key 生成与校验

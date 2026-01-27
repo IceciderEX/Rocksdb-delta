@@ -1137,7 +1137,7 @@ Status CompactionJob::Install(bool* compaction_released) {
                           cuid, input_files_vec, 
                           seg.file_number, 
                           seg.first_key, 
-                          seg.last_key,  
+                          seg.last_key 
                       );
                   }
               } else { // 被删除或者过滤的cuid的处理？
@@ -1642,7 +1642,9 @@ Status CompactionJob::ProcessKeyValue(
     CompactionIterator* c_iter, const CompactionFileOpenFunc& open_file_func,
     const CompactionFileCloseFunc& close_file_func, uint64_t& prev_cpu_micros,
     // for delta
-    std::shared_ptr<DeltaCompactionContext> delta_ctx) {
+    std::shared_ptr<DeltaCompactionContext> delta_ctx,
+    std::map<uint64_t, std::unordered_set<uint64_t>>& local_inputs,
+    std::vector<CompactionJob::DeltaOutputInfo>& local_outputs) {
   Status status;
   const uint64_t kRecordStatsEvery = 1000;
   [[maybe_unused]] const std::optional<const Slice> end = sub_compact->end;
@@ -1655,18 +1657,6 @@ Status CompactionJob::ProcessKeyValue(
       static_cast<void*>(const_cast<Compaction*>(sub_compact->compaction)));
   
   // for delta
-
-
-  // this subcompaction: Input Files (CUID -> Set<FileID>)
-  std::map<uint64_t, std::unordered_set<uint64_t>> local_inputs;
-  // this subcompaction: Output Segments
-  std::vector<DeltaOutputInfo> local_outputs;
-
-  c_iter->SetInputMap(&local_inputs);
-  if (delta_ctx) {
-      delta_ctx->pending_outputs = &local_outputs;
-  }  
-
   while (status.ok() && !cfd->IsDropped() && c_iter->Valid() &&
          c_iter->status().ok()) {
     assert(!end.has_value() ||
@@ -1978,6 +1968,19 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       CreateCompactionIterator(sub_compact, cfd, input_iter, compaction_filter,
                                merge, blob_resources, write_options, &local_involved_cuids);
   assert(c_iter);
+
+  // for delta
+  // 用于记录这个subcompaction的input/output files
+  std::map<uint64_t, std::unordered_set<uint64_t>> local_inputs;
+  std::vector<DeltaOutputInfo> local_outputs;
+
+  auto delta_ctx = std::make_shared<DeltaCompactionContext>();
+  delta_ctx->manager = hotspot_manager_;
+  delta_ctx->pending_outputs = &local_outputs;
+
+  c_iter->SetInputMap(&local_inputs);
+
+
   c_iter->SeekToFirst();
 
   TEST_SYNC_POINT("CompactionJob::Run():Inprogress");
@@ -2003,7 +2006,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       CreateFileHandlers(sub_compact, boundaries, delta_ctx);
 
   status = ProcessKeyValue(sub_compact, cfd, c_iter.get(), open_file_func,
-                           close_file_func, prev_cpu_micros, delta_ctx);
+                           close_file_func, prev_cpu_micros, delta_ctx, local_inputs, local_outputs);
 
   status = FinalizeProcessKeyValueStatus(cfd, input_iter, c_iter.get(), status);
 

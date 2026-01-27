@@ -406,7 +406,9 @@ class CompactionJob {
                          const CompactionFileCloseFunc& close_file_func,
                          uint64_t& prev_cpu_micros,
                          // for delta
-                         std::shared_ptr<DeltaCompactionContext> delta_ctx = nullptr);
+                         std::shared_ptr<DeltaCompactionContext> delta_ctx,
+                         std::map<uint64_t, std::unordered_set<uint64_t>>& local_inputs, 
+                         std::vector<CompactionJob::DeltaOutputInfo>& local_outputs);
   void UpdateSubcompactionJobStatsIncrementally(
       CompactionIterator* c_iter, CompactionJobStats* compaction_job_stats,
       uint64_t cur_cpu_micros, uint64_t& prev_cpu_micros);

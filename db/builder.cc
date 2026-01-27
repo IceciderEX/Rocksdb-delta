@@ -266,12 +266,13 @@ Status BuildTable(
         
         if (cuid != current_cuid) {
           // end last Segment
-          if (current_cuid != 0) {
-            DataSegment& seg = (*output_segments)[current_cuid];
+          if (cuid != 0) {
+            DataSegment& seg = (*output_segments)[cuid];
             seg.file_number = meta->fd.GetNumber();
             seg.first_key = key_after_flush.ToString(); // 记录 First Key
             seg.last_key = seg.first_key;               // 初始化 Last Key
           } 
+          current_cuid = cuid;
         } else {
           // same CUID，更新 Last Key
           if (current_cuid != 0) {
