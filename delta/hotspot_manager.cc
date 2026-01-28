@@ -43,7 +43,7 @@ uint64_t HotspotManager::ExtractCUID(const Slice& key) {
   return cuid;
 }
 
-bool HotspotManager::RegisterScan(uint64_t cuid) {
+bool HotspotManager::RegisterScan(uint64_t cuid, bool is_full_scan) {
     if (cuid == 0) return false;
     
     bool is_hot = frequency_table_.RecordAndCheckHot(cuid);
@@ -55,6 +55,10 @@ bool HotspotManager::RegisterScan(uint64_t cuid) {
                 pending_snapshots_[cuid] = std::vector<DataSegment>();
             }
         }
+    }
+
+    if (is_full_scan) {
+        delete_table_.ResetTracking(cuid);
     }
     return is_hot;
 }

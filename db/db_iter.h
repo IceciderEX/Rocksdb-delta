@@ -553,5 +553,6 @@ class DBIter final : public Iterator {
   } delta_ctx_;
 
   std::shared_ptr<HotspotManager> hotspot_manager_;
+  const ReadOptions read_options_;
 };
 }  // namespace ROCKSDB_NAMESPACE

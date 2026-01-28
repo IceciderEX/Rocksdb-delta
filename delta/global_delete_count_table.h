@@ -28,10 +28,9 @@ class GlobalDeleteCountTable {
   // 增加引用计数 (当 Scan 发现一个新的 SST/Memtable 包含该 CUID 时调用)
   bool TrackPhysicalUnit(uint64_t cuid, uint64_t phys_id);
 
-  // void UntrackPhysicalUnit(uint64_t cuid, uint64_t phys_id);
-
-  // void UntrackFiles(uint64_t cuid, const std::vector<uint64_t>& file_ids);
   void UntrackFiles(uint64_t cuid, const std::vector<uint64_t>& file_ids);
+  // full scan 时重置引用计数
+  void ResetTracking(uint64_t cuid);
   //  检查是否已经追踪了该 CUID
   bool IsTracked(uint64_t cuid) const;
 

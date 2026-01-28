@@ -147,7 +147,7 @@ int main() {
     
     std::cout << "Pre-heating CUID_MOV to ensure Deltas are tracked during Flush..." << std::endl;
     for(int k=0; k<5; k++) {
-        hotspot_mgr->RegisterScan(CUID_MOV);
+        PerformScan(db, CUID_MOV);
     }
     // 写入 3 个 SST 文件，包含所有 CUID 的数据
     for (int i = 0; i < 3; ++i) {

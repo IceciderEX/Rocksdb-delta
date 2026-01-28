@@ -8,7 +8,7 @@ bool GlobalDeleteCountTable::TrackPhysicalUnit(uint64_t cuid, uint64_t phys_id) 
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto& entry = table_[cuid]; // Lazy Init
   
-  // 新文件，count++
+  // count++
   entry.ref_count++;
   auto it = std::lower_bound(entry.tracked_phys_ids.begin(), 
                              entry.tracked_phys_ids.end(), 
@@ -17,6 +17,13 @@ bool GlobalDeleteCountTable::TrackPhysicalUnit(uint64_t cuid, uint64_t phys_id) 
     entry.tracked_phys_ids.insert(it, phys_id);
   }
   return false;
+}
+
+void GlobalDeleteCountTable::ResetTracking(uint64_t cuid) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto& entry = table_[cuid];
+    entry.ref_count = 0;
+    entry.tracked_phys_ids.clear();
 }
 
 // void GlobalDeleteCountTable::UntrackPhysicalUnit(uint64_t cuid, uint64_t phys_id) {

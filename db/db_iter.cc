@@ -88,7 +88,8 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       allow_unprepared_value_(read_options.allow_unprepared_value),
       is_blob_(false),
       arena_mode_(arena_mode),
-      hotspot_manager_(hotspot_manager) {
+      hotspot_manager_(hotspot_manager),
+      read_options_(read_options) {
   RecordTick(statistics_, NO_ITERATOR_CREATED);
   if (pin_thru_lifetime_) {
     pinned_iters_mgr_.StartPinning();
@@ -532,8 +533,6 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   iter_.Next();
                   continue;
                 }
-
-                uint64_t phys_id = GetCurrentPhysUnitId(iter_.iter());
             
                 // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
                 if (delta_ctx_.last_cuid != cuid) {
@@ -546,7 +545,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                     delta_ctx_.visited_units_for_cuid.clear();
                     // delta_ctx_.is_counting_mode = hotspot_manager_->GetDeleteTable().TryRegister(cuid);
                     // 对这个 cuid 进行一次访问计数，用于判断是否为热点
-                    delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(cuid);
+                    delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(cuid, read_options_.delta_full_scan);
 
                     if (delta_ctx_.is_current_hot) {
                       // 是否触发 Scan-as-Compaction

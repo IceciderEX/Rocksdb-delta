@@ -31,7 +31,7 @@ class HotspotManager {
   //   void OnUserScan(const Slice& key, const Slice& value);
   
   // 返回 true 表示该 CUID 是热点
-  bool RegisterScan(uint64_t cuid);
+  bool RegisterScan(uint64_t cuid, bool is_full_scan);
 
   // 收集数据 (只有 RegisterScan 返回 true 时才调用此函数)
   bool BufferHotData(uint64_t cuid, const Slice& key, const Slice& value);
