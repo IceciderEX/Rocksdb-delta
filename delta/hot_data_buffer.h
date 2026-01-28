@@ -10,6 +10,7 @@
 #include "rocksdb/status.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
+#include "table/internal_iterator.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -56,6 +57,9 @@ class HotDataBuffer {
   // std::vector<HotEntry> ExtractAndReset();
 
   size_t GetTotalBufferedSize() const { return total_buffered_size_; }
+
+  // for reading
+  InternalIterator* NewIterator(uint64_t cuid);
 
  private:
   // flush threshold

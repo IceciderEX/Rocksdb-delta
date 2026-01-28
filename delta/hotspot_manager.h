@@ -5,6 +5,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
+#include "table/internal_iterator.h"
 #include "delta/hot_data_buffer.h"
 #include "delta/hot_index_table.h"
 #include "rocksdb/rocksdb_namespace.h"
@@ -84,6 +85,12 @@ class HotspotManager {
                                               uint64_t output_file_verified) {
       delete_table_.ApplyCompactionChange(cuid, input_count, output_count, input_files_verified, output_file_verified);
   }
+
+  bool GetHotIndexEntry(uint64_t cuid, HotIndexEntry* out_entry) {
+      return index_table_.GetEntry(cuid, out_entry);
+  }
+
+  InternalIterator* NewBufferIterator(uint64_t cuid);
 
   void DebugDump(const std::string& label) {
     std::string dump_file = "/home/wam/HWKV/rocksdb-delta/build/a_test_db/a_mgr.log"; 

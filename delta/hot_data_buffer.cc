@@ -105,4 +105,110 @@ void HotSstLifecycleManager::Unref(uint64_t file_number) {
   }
 }
 
+// --------------------- HotDataBuffer Iterator --------------------- //  
+
+class HotDataBufferIterator : public InternalIterator {
+ public:
+  explicit HotDataBufferIterator(std::vector<HotEntry>&& entries)
+      : entries_(std::move(entries)), idx_(0) {
+      if (entries_.empty()) {
+          idx_ = 0; 
+      }
+  }
+
+  bool Valid() const override {
+    return idx_ < entries_.size();
+  }
+
+  void SeekToFirst() override {
+    idx_ = 0;
+  }
+
+  void SeekToLast() override {
+    if (entries_.empty()) {
+      idx_ = 0;
+    } else {
+      idx_ = entries_.size() - 1;
+    }
+  }
+
+  void Seek(const Slice& target) override {
+    // 假设 HotEntry.key 存储的是 InternalKey 的 String 形式
+    // 这里使用简单的字符串比较。严格来说应该传入 InternalKeyComparator，
+    // 但考虑到 Buffer 数据量较小且作为 L0 补充，字符串序通常足够兼容
+    auto it = std::lower_bound(entries_.begin(), entries_.end(), target,
+                               [](const HotEntry& entry, const Slice& val) {
+                                 return entry.key < val.ToString();
+                               });
+    idx_ = std::distance(entries_.begin(), it);
+  }
+
+  void SeekForPrev(const Slice& target) override {
+      Seek(target);
+      if (!Valid()) {
+          SeekToLast();
+      }
+      while(Valid() && entries_[idx_].key > target.ToString()) {
+          Prev();
+      }
+  }
+
+  void Next() override {
+    if (idx_ < entries_.size()) {
+      idx_++;
+    }
+  }
+
+  void Prev() override {
+    if (idx_ > 0) {
+      idx_--;
+    } else {
+      // RocksDB 语义：Prev 越界后变为 Invalid
+      idx_ = entries_.size();
+    }
+  }
+
+  Slice key() const override {
+    assert(Valid());
+    return entries_[idx_].key;
+  }
+
+  Slice value() const override {
+    assert(Valid());
+    return entries_[idx_].value;
+  }
+
+  Status status() const override {
+    return Status::OK();
+  }
+
+ private:
+  std::vector<HotEntry> entries_;
+  size_t idx_;
+};
+
+InternalIterator* HotDataBuffer::NewIterator(uint64_t cuid) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  
+  std::vector<HotEntry> filtered_entries;
+  
+  // Active block 中查找
+  if (active_block_) {
+      for (const auto& entry : active_block_->entries) {
+          if (entry.cuid == cuid) {
+              filtered_entries.push_back(entry);
+          }
+      }
+  }
+
+  // TODO: 如果有 Immutable Queue，也需要在这里收集数据
+
+  // sort
+  std::sort(filtered_entries.begin(), filtered_entries.end(), 
+            [](const HotEntry& a, const HotEntry& b) {
+                return a.key < b.key; 
+            });
+  return new HotDataBufferIterator(std::move(filtered_entries));
+}
+
 }  // namespace ROCKSDB_NAMESPACE

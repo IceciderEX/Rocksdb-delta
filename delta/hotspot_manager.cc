@@ -330,4 +330,9 @@ bool HotspotManager::IsHot(uint64_t cuid) {
   return frequency_table_.IsHot(cuid);
 }
 
+// --------------------- HotspotManager Iterator --------------------- //  
+InternalIterator* HotspotManager::NewBufferIterator(uint64_t cuid) {
+    return buffer_.NewIterator(cuid);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
