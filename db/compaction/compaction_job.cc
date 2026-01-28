@@ -1990,7 +1990,6 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   
   // for delta
   std::shared_ptr<HotspotManager> hotspot_manager = hotspot_manager_;
-  auto delta_ctx = std::make_shared<DeltaCompactionContext>();
   if (hotspot_manager) {
       delta_ctx->manager = hotspot_manager;
       // gather Compaction Inputs

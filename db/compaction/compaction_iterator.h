@@ -538,6 +538,7 @@ class CompactionIterator {
   // for delta
   std::shared_ptr<HotspotManager> hotspot_manager_;
   uint64_t current_cuid_ = 0;   // 正在处理的 cuid
+  uint64_t current_file_number_ = 0; // 正在处理的 file number
   bool skip_current_cuid_ = false; // 缓存当前cuid是否需要被跳过
   std::vector<uint64_t> input_file_numbers_;
   std::unordered_set<uint64_t>* involved_cuids_ = nullptr;

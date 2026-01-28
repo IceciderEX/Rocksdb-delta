@@ -144,6 +144,16 @@ struct DeltaCompactionContext;
 
 class CompactionJob {
  public:
+  // for delta
+  // 暂存 Output Segment 信息
+  struct DeltaOutputInfo {
+      uint64_t cuid;
+      uint64_t file_number;
+      std::string first_key;
+      std::string last_key;
+      uint64_t entry_count = 0;
+  };
+
   CompactionJob(int job_id, Compaction* compaction,
                 const ImmutableDBOptions& db_options,
                 const MutableDBOptions& mutable_db_options,
@@ -576,14 +586,6 @@ class CompactionJob {
   std::mutex cuids_mutex_;
 
 public:
-  // 暂存 Output Segment 信息
-  struct DeltaOutputInfo {
-      uint64_t cuid;
-      uint64_t file_number;
-      std::string first_key;
-      std::string last_key;
-      uint64_t entry_count = 0;
-  };
 
   // CUID -> Set of Input File IDs
   // 记录了每个 CUID 在哪些输入文件中出现过（包括被跳过的）

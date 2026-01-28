@@ -2273,6 +2273,9 @@ struct ReadOptions {
 
   // *** END per-request settings for internal team use only ***
 
+  // for delta
+  bool delta_full_scan = false;
+
   ReadOptions() {}
   ReadOptions(bool _verify_checksums, bool _fill_cache);
   explicit ReadOptions(Env::IOActivity _io_activity);

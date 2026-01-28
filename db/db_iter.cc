@@ -557,10 +557,13 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                 }
 
                 // 维护引用计数
-                if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
-                  hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
-                  delta_ctx_.visited_units_for_cuid.insert(phys_id);
-                  // // 记录该 Delta 片段在原始 LSM 中的位置？delta 列表
+                if (read_options_.delta_full_scan) {
+                    uint64_t phys_id = GetCurrentPhysUnitId(iter_.iter()); // 需要确保能获取到底层 FileID
+                    if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
+                        // 仅在 Full Scan 时更新
+                        hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
+                        delta_ctx_.visited_units_for_cuid.insert(phys_id);
+                    }
                 }
 
                 // 将 scan数据送入热点 Buffer

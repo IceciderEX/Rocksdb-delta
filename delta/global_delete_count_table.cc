@@ -95,8 +95,6 @@ void GlobalDeleteCountTable::ApplyCompactionChange(
   entry.ref_count = entry.ref_count - input_count + output_count;
 
   // 2.1 移除参与 Compaction 的旧文件
-  // Set.erase 如果元素不存在会直接忽略，这正好符合我们的需求
-  // (因为某些 input file 可能本身就不包含该 CUID)
   for (uint64_t fid : input_files) {
       auto pos = std::lower_bound(entry.tracked_phys_ids.begin(), 
                                   entry.tracked_phys_ids.end(), fid);

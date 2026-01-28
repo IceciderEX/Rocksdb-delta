@@ -71,6 +71,7 @@ std::string GenerateUpperBoundKey(uint64_t cuid) {
 
 int PerformScan(DB* db, uint64_t cuid) {
     ReadOptions ro;
+    ro.delta_full_scan = true;
     
     // Upper Bound，防止 Iterator 读到下一个 CUID 的数据
     std::string upper_bound_str = GenerateUpperBoundKey(cuid);
