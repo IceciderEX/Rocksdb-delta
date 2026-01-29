@@ -4,8 +4,9 @@
 #include <memory>
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
-#include "db/version_edit.h"       // for FileMetaData
-#include "options/cf_options.h"    // for MutableCFOptions
+#include "db/version_edit.h"
+#include "db/version_set.h"
+#include "options/cf_options.h"  
 #include "table/internal_iterator.h"
 #include "db/table_cache.h"
 #include "delta/hot_index_table.h"
@@ -51,11 +52,13 @@ class HotDeltaIterator : public InternalIterator {
 class HotSnapshotIterator : public InternalIterator {
  public:
   HotSnapshotIterator(const std::vector<DataSegment>& segments,
+                      uint64_t cuid,
                       HotspotManager* hotspot_manager,
                       TableCache* table_cache,
                       const ReadOptions& read_options,
                       const FileOptions& file_options,
-                      const InternalKeyComparator& icmp);
+                      const InternalKeyComparator& icmp,
+                      const MutableCFOptions& mutable_cf_options);
 
   ~HotSnapshotIterator() override;
 
@@ -80,6 +83,7 @@ class HotSnapshotIterator : public InternalIterator {
   
   // 所有现在的snapshot segments
   std::vector<DataSegment> segments_;
+  const uint64_t cuid_;
   HotspotManager* hotspot_manager_;
   TableCache* table_cache_;
   ReadOptions read_options_;
@@ -96,6 +100,56 @@ class HotSnapshotIterator : public InternalIterator {
   Slice current_upper_bound_;
   
   Status status_;
+};
+
+class DeltaSwitchingIterator : public InternalIterator {
+ public:
+  DeltaSwitchingIterator(Version* version,
+                         HotspotManager* hotspot_manager,
+                         const ReadOptions& read_options,
+                         const FileOptions& file_options,
+                         const InternalKeyComparator& icmp,
+                         const MutableCFOptions& mutable_cf_options);
+
+  ~DeltaSwitchingIterator() override;
+
+  bool Valid() const override;
+  void SeekToFirst() override;
+  void SeekToLast() override;
+  void Seek(const Slice& target) override;
+  void SeekForPrev(const Slice& target) override;
+  void Next() override;
+  void Prev() override;
+  Slice key() const override;
+  Slice value() const override;
+  Status status() const override;
+  bool PrepareValue() override;
+
+ private:
+  // 初始化冷数据迭代器 (Standard RocksDB Path)
+  void InitColdIter();
+  
+  // 初始化热点数据迭代器 (Hot Optimized Path)
+  void InitHotIter(uint64_t cuid);
+
+  void CheckAndSwitch(const Slice* target);
+
+  Version* version_;
+  HotspotManager* hotspot_manager_;
+  ReadOptions read_options_;
+  FileOptions file_options_;
+  const InternalKeyComparator& icmp_;
+  MutableCFOptions mutable_cf_options_;
+
+  InternalIterator* current_iter_;
+
+  // cold_iter_ 复用
+  InternalIterator* cold_iter_; 
+  // hot_iter_ 切换 CUID 时需要重建
+  InternalIterator* hot_iter_;
+  
+  uint64_t current_hot_cuid_;
+  bool is_hot_mode_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

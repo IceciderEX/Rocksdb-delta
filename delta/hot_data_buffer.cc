@@ -191,6 +191,16 @@ InternalIterator* HotDataBuffer::NewIterator(uint64_t cuid) {
   std::lock_guard<std::mutex> lock(mutex_);
   
   std::vector<HotEntry> filtered_entries;
+
+  // Immutable Queue
+  for (const auto& block : immutable_queue_) {
+      // 遍历队列中的每个 Block
+      for (const auto& entry : block->entries) {
+          if (entry.cuid == cuid) {
+              filtered_entries.push_back(entry);
+          }
+      }
+  }
   
   // Active block 中查找
   if (active_block_) {
@@ -200,8 +210,6 @@ InternalIterator* HotDataBuffer::NewIterator(uint64_t cuid) {
           }
       }
   }
-
-  // TODO: 如果有 Immutable Queue，也需要在这里收集数据
 
   // sort
   std::sort(filtered_entries.begin(), filtered_entries.end(), 

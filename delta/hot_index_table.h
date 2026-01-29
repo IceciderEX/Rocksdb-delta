@@ -64,6 +64,12 @@ class HotIndexTable {
   // 用于清理cuid的 Obsolete Deltas
   void RemoveObsoleteDeltasForCUIDs(const std::unordered_set<uint64_t>& cuids, 
                                     const std::vector<uint64_t>& input_files);    
+  
+  // replace涉及的 Snapshot 或 Delta 段
+  void ReplaceOverlappingSegments(uint64_t cuid, 
+                                  const DataSegment& new_segment,
+                                  const std::vector<uint64_t>& obsolete_delta_files);
+  
                                     
   void DumpToFile(const std::string& filename, const std::string& phase_label);
 

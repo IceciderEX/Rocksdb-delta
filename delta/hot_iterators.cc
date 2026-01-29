@@ -84,17 +84,21 @@ Status HotDeltaIterator::status() const { return merging_iter_->status(); }
 // ====================== HotSnapshotIterator ============================
 
 HotSnapshotIterator::HotSnapshotIterator(const std::vector<DataSegment>& segments,
+                                         uint64_t cuid,
                                          HotspotManager* hotspot_manager,
                                          TableCache* table_cache,
                                          const ReadOptions& read_options,
                                          const FileOptions& file_options,
-                                         const InternalKeyComparator& icmp)
+                                         const InternalKeyComparator& icmp,
+                                         const MutableCFOptions& mutable_cf_options)
     : segments_(segments),
+      cuid_(cuid),
       hotspot_manager_(hotspot_manager),
       table_cache_(table_cache),
       read_options_(read_options),
       file_options_(file_options),
       icmp_(icmp),
+      mutable_cf_options_(mutable_cf_options),
       current_segment_index_(-1),
       status_(Status::OK()) {
 }
@@ -115,7 +119,7 @@ void HotSnapshotIterator::InitIterForSegment(size_t index) {
 
   if (seg.file_number == static_cast<uint64_t>(-1)) {
     // Case A: 内存 Buffer fileid -1
-    InternalIterator* mem_iter = hotspot_manager_->NewBufferIterator(); 
+    InternalIterator* mem_iter = hotspot_manager_->NewBufferIterator(cuid_); 
     current_iter_.reset(mem_iter);
   } else {
     // Case B: 物理 SST
@@ -256,6 +260,156 @@ void HotSnapshotIterator::SeekForPrev(const Slice& target) {
     while(Valid() && icmp_.Compare(key(), target) > 0) {
         Prev();
     }
+}
+
+// ===================================================================
+// DeltaSwitchingIterator Implementation
+// ===================================================================
+
+DeltaSwitchingIterator::DeltaSwitchingIterator(
+    Version* version,
+    HotspotManager* hotspot_manager,
+    const ReadOptions& read_options,
+    const FileOptions& file_options,
+    const InternalKeyComparator& icmp,
+    const MutableCFOptions& mutable_cf_options)
+    : version_(version),
+      hotspot_manager_(hotspot_manager),
+      read_options_(read_options),
+      file_options_(file_options),
+      icmp_(icmp),
+      mutable_cf_options_(mutable_cf_options),
+      current_iter_(nullptr),
+      cold_iter_(nullptr),
+      hot_iter_(nullptr),
+      current_hot_cuid_(0),
+      is_hot_mode_(false) {
+  if (version_) {
+    version_->Ref();
+  }
+}
+
+DeltaSwitchingIterator::~DeltaSwitchingIterator() {
+  if (cold_iter_) delete cold_iter_;
+  if (hot_iter_) delete hot_iter_;
+  if (version_) version_->Unref();
+}
+
+void DeltaSwitchingIterator::InitColdIter() {
+  if (cold_iter_) return;
+
+  // L0~Ln 所有文件的 MergingIterator
+  // Arena=nullptr, skip_filters=false
+  MergeIteratorBuilder builder(&icmp_, nullptr);
+  version_->AddIterators(read_options_, file_options_, &builder, /*allow_unprepared_value*/ false);
+  // get MergingIterator
+  cold_iter_ = builder.Finish();
+  
+  if (!cold_iter_) {
+     cold_iter_ = NewEmptyInternalIterator<Slice>();
+  }
+}
+
+void DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
+  if (hot_iter_ && current_hot_cuid_ == cuid) return;
+
+  if (hot_iter_) {
+    delete hot_iter_;
+    hot_iter_ = nullptr;
+  }
+
+  // 1. 获取元数据
+  HotIndexEntry entry;
+  if (!hotspot_manager_->GetHotIndexEntry(cuid, &entry)) {
+    // hot 但是没有index
+    hot_iter_ = NewEmptyInternalIterator<Slice>();
+    return;
+  }
+
+  // snapshot and delta
+  InternalIterator* snapshot_iter = new HotSnapshotIterator(
+      entry.snapshot_segments,
+      cuid,
+      hotspot_manager_, 
+      version_->cfd()->table_cache(),
+      read_options_, file_options_, icmp_, mutable_cf_options_);
+
+  InternalIterator* delta_iter = new HotDeltaIterator(
+      entry.deltas, 
+      version_->cfd()->table_cache(),
+      read_options_, file_options_, icmp_, mutable_cf_options_,
+      false);
+
+  std::vector<InternalIterator*> children = {delta_iter, snapshot_iter};
+  hot_iter_ = NewMergingIterator(&icmp_, children.data(), 2);
+  current_hot_cuid_ = cuid;
+}
+
+void DeltaSwitchingIterator::Seek(const Slice& target) {
+  uint64_t cuid = hotspot_manager_->ExtractCUID(target);
+
+  bool use_hot = false;
+  // hot cuid
+  if (cuid != 0 && hotspot_manager_->IsHot(cuid)) {
+     use_hot = true;
+  }
+
+  if (use_hot) {
+    InitHotIter(cuid);
+    current_iter_ = hot_iter_;
+    is_hot_mode_ = true;
+  } else {
+    InitColdIter();
+    current_iter_ = cold_iter_;
+    is_hot_mode_ = false;
+  }
+
+  if (current_iter_) {
+    current_iter_->Seek(target);
+  }
+}
+
+// 全表扫描或未知方向，强制回退到 Cold Mode
+void DeltaSwitchingIterator::SeekToFirst() {
+  InitColdIter();
+  current_iter_ = cold_iter_;
+  is_hot_mode_ = false;
+  if (current_iter_) current_iter_->SeekToFirst();
+}
+
+void DeltaSwitchingIterator::SeekToLast() {
+  InitColdIter();
+  current_iter_ = cold_iter_;
+  is_hot_mode_ = false;
+  if (current_iter_) current_iter_->SeekToLast();
+}
+
+bool DeltaSwitchingIterator::Valid() const { 
+    return current_iter_ && current_iter_->Valid(); 
+}
+void DeltaSwitchingIterator::Next() { 
+    if (current_iter_) current_iter_->Next(); 
+    // TODO: 如果在 HotMode 下 Next() 耗尽?
+}
+void DeltaSwitchingIterator::Prev() { 
+    if (current_iter_) current_iter_->Prev(); 
+}
+void DeltaSwitchingIterator::SeekForPrev(const Slice& target) {
+    // 逻辑同 Seek
+    Seek(target);
+    if (!Valid()) SeekToLast();
+    while (Valid() && icmp_.Compare(key(), target) > 0) Prev();
+}
+
+Slice DeltaSwitchingIterator::key() const { return current_iter_->key(); }
+Slice DeltaSwitchingIterator::value() const { return current_iter_->value(); }
+Status DeltaSwitchingIterator::status() const { 
+    if (current_iter_) return current_iter_->status();
+    return Status::OK();
+}
+bool DeltaSwitchingIterator::PrepareValue() {
+    if (current_iter_) return current_iter_->PrepareValue();
+    return false;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

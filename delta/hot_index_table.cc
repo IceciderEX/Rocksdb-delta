@@ -13,16 +13,6 @@ void HotIndexTable::UpdateSnapshot(uint64_t cuid, const std::vector<DataSegment>
                                entry.snapshot_segments.begin(), 
                                entry.snapshot_segments.end());
     }
-    
-    // TODO(delta)：进一步确认
-    // // Old Deltas -> new Snapshot? 也需要 ref?
-    // if (!entry.deltas.empty()) {
-    //   segments_to_unref.insert(segments_to_unref.end(), 
-    //                            entry.deltas.begin(), 
-    //                            entry.deltas.end());
-    //   entry.deltas.clear(); 
-    // }
-
     entry.snapshot_segments = new_segments;
   } 
 
@@ -259,6 +249,67 @@ void HotIndexTable::RemoveCUID(uint64_t cuid) {
     }
   }
 }
+
+void HotIndexTable::ReplaceOverlappingSegments(uint64_t cuid, 
+                                               const DataSegment& new_segment,
+                                               const std::vector<uint64_t>& obsolete_delta_files) {
+  std::vector<DataSegment> segments_to_unref;
+  
+  {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto& entry = table_[cuid];
+    auto& snapshots = entry.snapshot_segments;
+
+    // 判定与new snapshot相关的snapshot -> !(End < New.Start || Start > New.End)
+    for (auto it = snapshots.begin(); it != snapshots.end(); ) {
+      bool is_left = (it->last_key < new_segment.first_key);
+      bool is_right = (it->first_key > new_segment.last_key);
+      
+      if (!is_left && !is_right) {
+        segments_to_unref.push_back(*it);
+        it = snapshots.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    // insert new_segment
+    auto insert_pos = std::upper_bound(snapshots.begin(), snapshots.end(), new_segment,
+        [](const DataSegment& a, const DataSegment& b) {
+            return a.first_key < b.first_key;
+        });
+    snapshots.insert(insert_pos, new_segment);
+
+
+    if (!obsolete_delta_files.empty()) {
+      auto& deltas = entry.deltas;
+      
+      // 遍历 obsolete_delta_files
+      for (uint64_t file_num : obsolete_delta_files) {
+        // 在 entry.deltas 中找到并移除，同时移入 obsolete_deltas
+        for (auto it = deltas.begin(); it != deltas.end(); ) {
+          if (it->file_number == file_num) {
+            // 记录到 Obsolete (L0 Compaction再清除)
+            entry.obsolete_deltas.push_back(*it);
+            it = deltas.erase(it);
+            // 注意：一个 file_number 在 deltas 中可能出现多次吗？
+          } else {
+            ++it;
+          }
+        }
+      }
+    }
+  } // Unlock
+
+  if (lifecycle_manager_) {
+    lifecycle_manager_->Ref(new_segment.file_number);
+    for (const auto& seg : segments_to_unref) {
+      lifecycle_manager_->Unref(seg.file_number);
+    }
+  }
+}
+
+
 
 void HotIndexTable::DumpToFile(const std::string& filename, const std::string& phase_label) {
   std::shared_lock<std::shared_mutex> lock(mutex_);
