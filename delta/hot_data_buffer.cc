@@ -109,8 +109,8 @@ void HotSstLifecycleManager::Unref(uint64_t file_number) {
 
 class HotDataBufferIterator : public InternalIterator {
  public:
-  explicit HotDataBufferIterator(std::vector<HotEntry>&& entries)
-      : entries_(std::move(entries)), idx_(0) {
+  explicit HotDataBufferIterator(std::vector<HotEntry>&& entries, const InternalKeyComparator* icmp)
+      : entries_(std::move(entries)), idx_(0), icmp_(icmp) {
       if (entries_.empty()) {
           idx_ = 0; 
       }
@@ -133,12 +133,15 @@ class HotDataBufferIterator : public InternalIterator {
   }
 
   void Seek(const Slice& target) override {
-    // 假设 HotEntry.key 存储的是 InternalKey 的 String 形式
-    // 这里使用简单的字符串比较。严格来说应该传入 InternalKeyComparator，
-    // 但考虑到 Buffer 数据量较小且作为 L0 补充，字符串序通常足够兼容
     auto it = std::lower_bound(entries_.begin(), entries_.end(), target,
-                               [](const HotEntry& entry, const Slice& val) {
-                                 return entry.key < val.ToString();
+                               [this](const HotEntry& entry, const Slice& val) {
+                                 if (this->icmp_) {
+                                     // icmp->Compare(a, b) < 0 意味着 a < b
+                                     // 注意：Slice(entry.key) 构造开销极小
+                                     return this->icmp_->Compare(entry.key, val) < 0;
+                                 } else {
+                                     return entry.key < val.ToString();
+                                 }
                                });
     idx_ = std::distance(entries_.begin(), it);
   }
@@ -148,8 +151,19 @@ class HotDataBufferIterator : public InternalIterator {
       if (!Valid()) {
           SeekToLast();
       }
-      while(Valid() && entries_[idx_].key > target.ToString()) {
-          Prev();
+      while(Valid()) {
+          bool is_greater = false;
+          if (icmp_) {
+              is_greater = icmp_->Compare(entries_[idx_].key, target) > 0;
+          } else {
+              is_greater = entries_[idx_].key > target.ToString();
+          }
+          
+          if (is_greater) {
+              Prev();
+          } else {
+              break;
+          }
       }
   }
 
@@ -185,9 +199,44 @@ class HotDataBufferIterator : public InternalIterator {
  private:
   std::vector<HotEntry> entries_;
   size_t idx_;
+  const InternalKeyComparator* icmp_;
 };
 
-InternalIterator* HotDataBuffer::NewIterator(uint64_t cuid) {
+bool HotDataBuffer::GetBoundaryKeys(uint64_t cuid, std::string* min_key, std::string* max_key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  bool found = false;
+
+  auto merge_bounds_from_block = [&](const HotDataBlock* block) {
+      if (!block) return;
+
+      auto it = block->bounds.find(cuid);
+      if (it != block->bounds.end()) {
+          const std::string& blk_min = it->second.first;
+          const std::string& blk_max = it->second.second;
+
+          if (!found) {
+              *min_key = blk_min;
+              *max_key = blk_max;
+              found = true;
+          } else {
+              if (blk_min < *min_key) *min_key = blk_min;
+              if (blk_max > *max_key) *max_key = blk_max;
+          }
+      }
+  };
+
+  // 1. 检查 Immutable Queue 
+  for (const auto& block : immutable_queue_) {
+      merge_bounds_from_block(block.get());
+  }
+
+  // 2. 检查 Active Block
+  merge_bounds_from_block(active_block_.get());
+
+  return found;
+}
+
+InternalIterator* HotDataBuffer::NewIterator(uint64_t cuid, const InternalKeyComparator* icmp) {
   std::lock_guard<std::mutex> lock(mutex_);
   
   std::vector<HotEntry> filtered_entries;
@@ -212,11 +261,19 @@ InternalIterator* HotDataBuffer::NewIterator(uint64_t cuid) {
   }
 
   // sort
-  std::sort(filtered_entries.begin(), filtered_entries.end(), 
-            [](const HotEntry& a, const HotEntry& b) {
-                return a.key < b.key; 
-            });
-  return new HotDataBufferIterator(std::move(filtered_entries));
+  if (icmp != nullptr) {
+      std::sort(filtered_entries.begin(), filtered_entries.end(), 
+        [icmp](const HotEntry& a, const HotEntry& b) {
+            return icmp->Compare(Slice(a.key), Slice(b.key)) < 0;
+        });
+  } else {
+      fprintf(stderr, "[HotDataBuffer] NewIterator: icmp is nullptr, using fallback sort\n");
+      // std::sort(filtered_entries.begin(), filtered_entries.end(), 
+      //     [](const HotEntry& a, const HotEntry& b) {
+      //         return a.key < b.key; 
+      //     });
+  }
+  return new HotDataBufferIterator(std::move(filtered_entries), icmp);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

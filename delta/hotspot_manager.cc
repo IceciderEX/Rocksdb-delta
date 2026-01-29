@@ -278,10 +278,20 @@ void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
     }
 
     // tail segment, PromoteSnapshot()填充具体值
-    DataSegment tail_segment;
-    tail_segment.file_number = static_cast<uint64_t>(-1);
-    
-    final_segments.push_back(tail_segment);
+    std::string min_key, max_key;
+    if (buffer_.GetBoundaryKeys(cuid, &min_key, &max_key)) {
+        DataSegment tail_segment;
+        tail_segment.file_number = static_cast<uint64_t>(-1); // 标记为内存段
+        tail_segment.first_key = min_key;                     // [关键修复] 填充 First Key
+        tail_segment.last_key = max_key;                      // [关键修复] 填充 Last Key
+        
+        final_segments.push_back(tail_segment);
+    } else {
+        fprintf(stderr, "[HotspotManager] GetBoundaryKeys failed for CUID %lu. Has buffered data: %d\n",
+                cuid, has_buffered_data ? 1 : 0);
+    }
+
+    if (final_segments.empty()) return;
 
     // 更新这个 cuid 的 Snapshot
     index_table_.UpdateSnapshot(cuid, final_segments);
@@ -331,8 +341,8 @@ bool HotspotManager::IsHot(uint64_t cuid) {
 }
 
 // --------------------- HotspotManager Iterator --------------------- //  
-InternalIterator* HotspotManager::NewBufferIterator(uint64_t cuid) {
-    return buffer_.NewIterator(cuid);
+InternalIterator* HotspotManager::NewBufferIterator(uint64_t cuid, const InternalKeyComparator* icmp) {
+    return buffer_.NewIterator(cuid, icmp);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

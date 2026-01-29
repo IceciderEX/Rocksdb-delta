@@ -567,8 +567,8 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
 
                 // 将 scan数据送入热点 Buffer
                 if (delta_ctx_.trigger_scan_as_compaction) {
-                  // 尝试追加到共享 Buffer
-                  bool buffer_full = hotspot_manager_->BufferHotData(cuid, saved_key_.GetUserKey(), value());
+                  InternalKey temp_internal_key(saved_key_.GetUserKey(), ikey_.sequence, ikey_.type);
+                  bool buffer_full = hotspot_manager_->BufferHotData(cuid, temp_internal_key.Encode(), value());
                   if (buffer_full) {
                       hotspot_manager_->TriggerBufferFlush();
                   }

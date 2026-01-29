@@ -90,7 +90,7 @@ class HotspotManager {
       return index_table_.GetEntry(cuid, out_entry);
   }
 
-  InternalIterator* NewBufferIterator(uint64_t cuid);
+  InternalIterator* NewBufferIterator(uint64_t cuid, const InternalKeyComparator* icmp);
 
   void DebugDump(const std::string& label) {
     std::string dump_file = "/home/wam/HWKV/rocksdb-delta/build/a_test_db/a_mgr.log"; 

@@ -141,8 +141,6 @@ int main() {
     const uint64_t CUID_HOT = 2002;  // 测试 Scan-as-Compaction
     const uint64_t CUID_MOV = 3003;  // 测试 Compaction 索引更新
 
-    
-
     std::cout << "\n>>> PHASE 1: Data Ingestion (Write & Flush) <<<\n";
     
     std::cout << "Pre-heating CUID_MOV to ensure Deltas are tracked during Flush..." << std::endl;
@@ -188,13 +186,11 @@ int main() {
     // 测试场景 2: Scan-as-Compaction (Hotspot Promotion)
     // =================================================================
     std::cout << "\n>>> PHASE 3: Scan-as-Compaction Test (CUID_HOT) <<<\n";
-    
     // 3.1 预热：频繁 Scan 触发热点判定
     std::cout << "Triggering frequent scans on CUID_HOT..." << std::endl;
     for (int i = 0; i < 6; ++i) {
         int r = PerformScan(db, CUID_HOT);
         Check(r == 150, "Scan data consistency");
-        // 模拟间隔，让频率表生效
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
@@ -226,13 +222,6 @@ int main() {
     // =================================================================
     std::cout << "\n>>> PHASE 4: Mixed Compaction Test (CUID_MOV) <<<\n";
 
-    // for (int i = 0; i < 8; ++i) {
-    //     int r = PerformScan(db, CUID_MOV);
-    //     Check(r == 150, "Scan data consistency");
-    //     // 模拟间隔，让频率表生效
-    //     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    // }
-    
     // 检查 CUID_MOV 当前状态：应该是分散在 Delta Index 中
     HotIndexEntry mov_entry_before;
     if (hotspot_mgr->GetIndexTable().GetEntry(CUID_MOV, &mov_entry_before)) {

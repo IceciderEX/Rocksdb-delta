@@ -119,7 +119,7 @@ void HotSnapshotIterator::InitIterForSegment(size_t index) {
 
   if (seg.file_number == static_cast<uint64_t>(-1)) {
     // Case A: 内存 Buffer fileid -1
-    InternalIterator* mem_iter = hotspot_manager_->NewBufferIterator(cuid_); 
+    InternalIterator* mem_iter = hotspot_manager_->NewBufferIterator(cuid_, &icmp_); 
     current_iter_.reset(mem_iter);
   } else {
     // Case B: 物理 SST
@@ -166,6 +166,10 @@ void HotSnapshotIterator::Seek(const Slice& target) {
   // EndKey >= Target 的 Segment
   auto it = std::lower_bound(segments_.begin(), segments_.end(), target,
       [&](const DataSegment& seg, const Slice& val) {
+        if (seg.last_key.empty()) {
+            fprintf(stderr, "Warning: Empty last_key in segment. This should not happen.\n");
+            return false; 
+        }
         // 比较 seg.last_key < val
         return icmp_.user_comparator()->Compare(ExtractUserKey(seg.last_key), ExtractUserKey(val)) < 0;
       });
@@ -295,8 +299,12 @@ DeltaSwitchingIterator::~DeltaSwitchingIterator() {
       delete hot_iter_;
   }
   // rocksdb 会在 arena 中分配内存，不需要手动删除
-  if (cold_iter_ && !arena_) {
-      delete cold_iter_;
+  if (cold_iter_) {
+      if (arena_) {
+        cold_iter_->~InternalIterator();
+      } else {
+        delete cold_iter_;
+      }
   }
   if (version_) version_->Unref();
 }
@@ -394,8 +402,7 @@ bool DeltaSwitchingIterator::Valid() const {
     return current_iter_ && current_iter_->Valid(); 
 }
 void DeltaSwitchingIterator::Next() { 
-    if (current_iter_) current_iter_->Next(); 
-    // TODO: 如果在 HotMode 下 Next() 耗尽?
+    if (current_iter_) current_iter_->Next();
 }
 void DeltaSwitchingIterator::Prev() { 
     if (current_iter_) current_iter_->Prev(); 

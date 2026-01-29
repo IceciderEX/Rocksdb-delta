@@ -30,13 +30,30 @@ struct HotEntry {
 struct HotDataBlock {
   std::vector<HotEntry> entries;
   size_t current_size_bytes = 0;
+  std::unordered_map<uint64_t, std::pair<std::string, std::string>> bounds;
   
   void Add(uint64_t c, const Slice& k, const Slice& v) {
-    entries.push_back({c, k.ToString(), v.ToString()});
-    current_size_bytes += (k.size() + v.size());
+    std::string k_str = k.ToString();
+    std::string v_str = v.ToString();
+    entries.push_back({c, k_str, v_str});
+    current_size_bytes += (k_str.size() + v_str.size());
+
+    auto it = bounds.find(c);
+    if (it == bounds.end()) {
+        bounds[c] = {k_str, k_str};
+    } else {
+        if (k_str < it->second.first) it->second.first = k_str;
+        if (k_str > it->second.second) it->second.second = k_str;
+    }
   }
   
   void Sort(); // 按 CUID, Key 排序
+
+  void Clear() {
+    entries.clear();
+    current_size_bytes = 0;
+    bounds.clear();
+  }
 };
 
 
@@ -58,8 +75,10 @@ class HotDataBuffer {
 
   size_t GetTotalBufferedSize() const { return total_buffered_size_; }
 
+  bool GetBoundaryKeys(uint64_t cuid, std::string* min_key, std::string* max_key);
+
   // for reading
-  InternalIterator* NewIterator(uint64_t cuid);
+  InternalIterator* NewIterator(uint64_t cuid, const InternalKeyComparator* icmp);
 
  private:
   // flush threshold

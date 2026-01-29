@@ -2099,10 +2099,6 @@ static void CleanupGetMergeOperandsState(void* arg1, void* /*arg2*/) {
 
 }  // namespace
 
-static void DeleteDeltaSwitchingIterator(void* arg1, void* /*arg2*/) {
-  delete static_cast<DeltaSwitchingIterator*>(arg1);
-}
-
 InternalIterator* DBImpl::NewInternalIterator(
     const ReadOptions& read_options, ColumnFamilyData* cfd,
     SuperVersion* super_version, Arena* arena, SequenceNumber sequence,
@@ -2175,10 +2171,6 @@ InternalIterator* DBImpl::NewInternalIterator(
     }
     internal_iter = merge_iter_builder.Finish(
         read_options.ignore_range_deletions ? nullptr : db_iter);
-    // for delta
-    if (switching_iter_ptr) {
-        internal_iter->RegisterCleanup(DeleteDeltaSwitchingIterator, switching_iter_ptr, nullptr);
-    }
 
     SuperVersionHandle* cleanup = new SuperVersionHandle(
         this, &mutex_, super_version,
