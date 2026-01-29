@@ -116,6 +116,8 @@
 #include "util/string_util.h"
 #include "util/udt_util.h"
 #include "utilities/trace/replayer_impl.h"
+// for delta
+#include "delta/hot_iterators.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -2097,11 +2099,16 @@ static void CleanupGetMergeOperandsState(void* arg1, void* /*arg2*/) {
 
 }  // namespace
 
+static void DeleteDeltaSwitchingIterator(void* arg1, void* /*arg2*/) {
+  delete static_cast<DeltaSwitchingIterator*>(arg1);
+}
+
 InternalIterator* DBImpl::NewInternalIterator(
     const ReadOptions& read_options, ColumnFamilyData* cfd,
     SuperVersion* super_version, Arena* arena, SequenceNumber sequence,
     bool allow_unprepared_value, ArenaWrappedDBIter* db_iter) {
   InternalIterator* internal_iter;
+  DeltaSwitchingIterator* switching_iter_ptr = nullptr;
   assert(arena != nullptr);
   auto prefix_extractor =
       super_version->mutable_cf_options.prefix_extractor.get();
@@ -2147,12 +2154,32 @@ InternalIterator* DBImpl::NewInternalIterator(
   if (s.ok()) {
     // Collect iterators for files in L0 - Ln
     if (read_options.read_tier != kMemtableTier) {
-      super_version->current->AddIterators(read_options, file_options_,
-                                           &merge_iter_builder,
-                                           allow_unprepared_value);
+      // for delta
+      if (hotspot_manager_) {
+          // TODO: Arena?
+          switching_iter_ptr = new DeltaSwitchingIterator(
+              super_version->current,    
+              hotspot_manager_.get(),      
+              read_options,
+              file_options_,     
+              cfd->internal_comparator(),
+              super_version->mutable_cf_options,
+              arena
+          );
+          merge_iter_builder.AddIterator(switching_iter_ptr);
+      } else {
+        super_version->current->AddIterators(read_options, file_options_,
+                                             &merge_iter_builder,
+                                             allow_unprepared_value);
+      }
     }
     internal_iter = merge_iter_builder.Finish(
         read_options.ignore_range_deletions ? nullptr : db_iter);
+    // for delta
+    if (switching_iter_ptr) {
+        internal_iter->RegisterCleanup(DeleteDeltaSwitchingIterator, switching_iter_ptr, nullptr);
+    }
+
     SuperVersionHandle* cleanup = new SuperVersionHandle(
         this, &mutex_, super_version,
         read_options.background_purge_on_iterator_cleanup ||

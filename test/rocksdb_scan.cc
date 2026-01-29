@@ -146,6 +146,10 @@ int main() {
     std::cout << "\n>>> PHASE 1: Data Ingestion (Write & Flush) <<<\n";
     
     std::cout << "Pre-heating CUID_MOV to ensure Deltas are tracked during Flush..." << std::endl;
+    for (int i = 10; i < 13; ++i) {
+        WriteBatchAndFlush(db, {CUID_MOV}, i * 1000, 50);
+        std::cout << "Generated SST #" << i + 1 << std::endl;
+    }
     for(int k=0; k<5; k++) {
         PerformScan(db, CUID_MOV);
     }

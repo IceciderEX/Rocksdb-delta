@@ -124,8 +124,7 @@ void HotSnapshotIterator::InitIterForSegment(size_t index) {
   } else {
     // Case B: 物理 SST
     FileDescriptor fd(seg.file_number, 0, 0);
-    FileMetaData meta;
-    meta.fd = fd;
+    FileMetaData meta = MakeFileMetaFromSegment(seg);
     
     ReadOptions ro = read_options_;
     current_lower_bound_ = Slice(seg.first_key);
@@ -272,13 +271,15 @@ DeltaSwitchingIterator::DeltaSwitchingIterator(
     const ReadOptions& read_options,
     const FileOptions& file_options,
     const InternalKeyComparator& icmp,
-    const MutableCFOptions& mutable_cf_options)
+    const MutableCFOptions& mutable_cf_options,
+    Arena* arena)
     : version_(version),
       hotspot_manager_(hotspot_manager),
       read_options_(read_options),
       file_options_(file_options),
       icmp_(icmp),
       mutable_cf_options_(mutable_cf_options),
+      arena_(arena),
       current_iter_(nullptr),
       cold_iter_(nullptr),
       hot_iter_(nullptr),
@@ -290,8 +291,13 @@ DeltaSwitchingIterator::DeltaSwitchingIterator(
 }
 
 DeltaSwitchingIterator::~DeltaSwitchingIterator() {
-  if (cold_iter_) delete cold_iter_;
-  if (hot_iter_) delete hot_iter_;
+  if (hot_iter_) {
+      delete hot_iter_;
+  }
+  // rocksdb 会在 arena 中分配内存，不需要手动删除
+  if (cold_iter_ && !arena_) {
+      delete cold_iter_;
+  }
   if (version_) version_->Unref();
 }
 
@@ -300,13 +306,13 @@ void DeltaSwitchingIterator::InitColdIter() {
 
   // L0~Ln 所有文件的 MergingIterator
   // Arena=nullptr, skip_filters=false
-  MergeIteratorBuilder builder(&icmp_, nullptr);
-  version_->AddIterators(read_options_, file_options_, &builder, /*allow_unprepared_value*/ false);
+  MergeIteratorBuilder builder(&icmp_, arena_);
+  version_->AddIterators(read_options_, file_options_, &builder, /*allow_unprepared*/ false);
   // get MergingIterator
   cold_iter_ = builder.Finish();
   
   if (!cold_iter_) {
-     cold_iter_ = NewEmptyInternalIterator<Slice>();
+     cold_iter_ = NewEmptyInternalIterator<Slice>(arena_);
   }
 }
 
@@ -322,7 +328,7 @@ void DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
   HotIndexEntry entry;
   if (!hotspot_manager_->GetHotIndexEntry(cuid, &entry)) {
     // hot 但是没有index
-    hot_iter_ = NewEmptyInternalIterator<Slice>();
+    hot_iter_ = NewEmptyInternalIterator<Slice>(arena_);
     return;
   }
 

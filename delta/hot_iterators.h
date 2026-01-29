@@ -109,7 +109,8 @@ class DeltaSwitchingIterator : public InternalIterator {
                          const ReadOptions& read_options,
                          const FileOptions& file_options,
                          const InternalKeyComparator& icmp,
-                         const MutableCFOptions& mutable_cf_options);
+                         const MutableCFOptions& mutable_cf_options,
+                         Arena* arena);
 
   ~DeltaSwitchingIterator() override;
 
@@ -140,6 +141,7 @@ class DeltaSwitchingIterator : public InternalIterator {
   FileOptions file_options_;
   const InternalKeyComparator& icmp_;
   MutableCFOptions mutable_cf_options_;
+  Arena* arena_;
 
   InternalIterator* current_iter_;
 

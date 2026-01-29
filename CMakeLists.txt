@@ -778,6 +778,7 @@ set(SOURCES
         delta/hotspot_manager.cc
         delta/global_delete_count_table.cc
         delta/scan_frequency_table.cc
+        delta/hot_iterators.cc
         env/composite_env.cc
         env/env.cc
         env/env_chroot.cc
