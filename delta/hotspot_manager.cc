@@ -43,12 +43,22 @@ uint64_t HotspotManager::ExtractCUID(const Slice& key) {
   return cuid;
 }
 
-bool HotspotManager::RegisterScan(uint64_t cuid, bool is_full_scan) {
-    if (cuid == 0) return false;
+bool HotspotManager::RegisterScan(uint64_t cuid, bool is_full_scan, bool* became_hot) {
+    if (cuid == 0) {
+        if (became_hot) *became_hot = false;
+        return false;
+    }
     
-    bool is_hot = frequency_table_.RecordAndCheckHot(cuid);
-    if (is_hot) {
-        // 初始化 pending 列表
+    bool first_time_hot = false;
+    bool is_hot = frequency_table_.RecordAndCheckHot(cuid, &first_time_hot);
+    
+    // 返回是否首次成为热点
+    if (became_hot) {
+        *became_hot = first_time_hot;
+    }
+    
+    if (is_hot && !first_time_hot) {
+        // 已经是热点（非首次），初始化 pending 列表
         if (ShouldTriggerScanAsCompaction(cuid)) {
             std::lock_guard<std::mutex> lock(pending_mutex_);
             if (pending_snapshots_.find(cuid) == pending_snapshots_.end()) {
@@ -343,6 +353,29 @@ bool HotspotManager::IsHot(uint64_t cuid) {
 // --------------------- HotspotManager Iterator --------------------- //  
 InternalIterator* HotspotManager::NewBufferIterator(uint64_t cuid, const InternalKeyComparator* icmp) {
     return buffer_.NewIterator(cuid, icmp);
+}
+
+// --------------------- Pending Init CUID Queue --------------------- //
+void HotspotManager::EnqueueForInitScan(uint64_t cuid) {
+    std::lock_guard<std::mutex> lock(pending_init_mutex_);
+    // 避免重复添加
+    for (uint64_t c : pending_init_cuids_) {
+        if (c == cuid) return;
+    }
+    pending_init_cuids_.push_back(cuid);
+    fprintf(stdout, "[HotspotManager] Enqueued CUID %lu for initial full scan\n", cuid);
+}
+
+std::vector<uint64_t> HotspotManager::PopPendingInitCuids() {
+    std::lock_guard<std::mutex> lock(pending_init_mutex_);
+    std::vector<uint64_t> result = std::move(pending_init_cuids_);
+    pending_init_cuids_.clear();
+    return result;
+}
+
+bool HotspotManager::HasPendingInitCuids() const {
+    std::lock_guard<std::mutex> lock(pending_init_mutex_);
+    return !pending_init_cuids_.empty();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

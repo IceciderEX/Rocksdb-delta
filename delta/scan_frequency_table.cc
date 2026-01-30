@@ -31,8 +31,13 @@ bool ScanFrequencyTable::IsHot(uint64_t cuid) const {
   return false;
 }
 
-bool ScanFrequencyTable::RecordAndCheckHot(uint64_t cuid) {
+bool ScanFrequencyTable::RecordAndCheckHot(uint64_t cuid, bool* became_hot) {
   std::lock_guard<std::mutex> lock(mutex_);
+  
+  // 初始化输出参数
+  if (became_hot) {
+    *became_hot = false;
+  }
   
   CheckAndRotateWindow();
 
@@ -48,8 +53,10 @@ bool ScanFrequencyTable::RecordAndCheckHot(uint64_t cuid) {
   entry.count++;
   if (entry.count >= threshold_) {
     entry.is_hot = true;
-    // is_hot 标记保留，直到被外部逻辑(如Compaction)清除或窗口重置
-    // TODO
+    // 首次成为热点
+    if (became_hot) {
+      *became_hot = true;
+    }
   }
 
   return entry.is_hot;

@@ -166,6 +166,14 @@ class DBIter final : public Iterator {
     if (hotspot_manager_ && delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
         hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
     }
+    
+    // for delta: 在 scan 结束时处理待初始化的热点 CUID
+    if (cfh_ && hotspot_manager_ && hotspot_manager_->HasPendingInitCuids()) {
+      auto db_impl = static_cast<DBImpl*>(cfh_->db());
+      if (db_impl) {
+        db_impl->ProcessPendingHotCuids();
+      }
+    }
   }
 
   void SetIter(InternalIterator* iter) {

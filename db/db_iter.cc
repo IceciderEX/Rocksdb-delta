@@ -543,12 +543,17 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                     }
                     delta_ctx_.last_cuid = cuid;
                     delta_ctx_.visited_units_for_cuid.clear();
-                    // delta_ctx_.is_counting_mode = hotspot_manager_->GetDeleteTable().TryRegister(cuid);
+                    
                     // 对这个 cuid 进行一次访问计数，用于判断是否为热点
-                    delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(cuid, read_options_.delta_full_scan);
+                    bool became_hot = false;
+                    delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(cuid, read_options_.delta_full_scan, &became_hot);
 
-                    if (delta_ctx_.is_current_hot) {
-                      // 是否触发 Scan-as-Compaction
+                    // 如果首次成为热点，加入待初始化队列（由后台线程处理）
+                    if (became_hot) {
+                      hotspot_manager_->EnqueueForInitScan(cuid);
+                      delta_ctx_.trigger_scan_as_compaction = false;
+                    } else if (delta_ctx_.is_current_hot && read_options_.delta_full_scan) {
+                      // 只有全量扫描且已经是热点（非首次）才触发 Scan-as-Compaction
                       delta_ctx_.trigger_scan_as_compaction = hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
                     } else {
                       delta_ctx_.trigger_scan_as_compaction = false;

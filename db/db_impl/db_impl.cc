@@ -6956,5 +6956,76 @@ void DBImpl::TrackOrUntrackFiles(
     action(file_path, /*size=*/std::nullopt);
   }
 }
+// for delta
+// 处理待初始化的热点 CUID
+// 对首次成为热点的 CUID 执行全量扫描以建立完整 snapshot
+void DBImpl::ProcessPendingHotCuids() {
+  if (!hotspot_manager_) {
+    return;
+  }
+  
+  // 获取待处理的 CUID 列表
+  std::vector<uint64_t> pending_cuids = hotspot_manager_->PopPendingInitCuids();
+  if (pending_cuids.empty()) {
+    return;
+  }
+  
+  fprintf(stdout, "[DBImpl] Processing %zu pending hot CUIDs for initial scan\n", 
+          pending_cuids.size());
+  
+  for (uint64_t cuid : pending_cuids) {
+    // 构造该 CUID 的 key 范围进行全量扫描
+    // Key 格式参考 test/rocksdb_scan.cc: 40 bytes, CUID at offset 16 in Big Endian
+    
+    // 构造 start_key: CUID 的起始
+    std::string start_key(40, '\0');
+    unsigned char* p = reinterpret_cast<unsigned char*>(&start_key[16]);
+    for (int i = 0; i < 8; ++i) {
+      p[i] = (cuid >> (56 - 8 * i)) & 0xFF;  // Big Endian
+    }
+    
+    // 构造 upper_bound_key: CUID + 1 的起始
+    uint64_t cuid_plus_one = cuid + 1;
+    std::string upper_bound_key(40, '\0');
+    unsigned char* q = reinterpret_cast<unsigned char*>(&upper_bound_key[16]);
+    for (int i = 0; i < 8; ++i) {
+      q[i] = (cuid_plus_one >> (56 - 8 * i)) & 0xFF;  // Big Endian
+    }
+    
+    // 创建 ReadOptions 并设置为全量扫描
+    ReadOptions read_opts;
+    read_opts.delta_full_scan = true;
+    
+    // 设置 upper bound 防止读到下一个 CUID 的数据
+    Slice upper_bound_slice(upper_bound_key);
+    read_opts.iterate_upper_bound = &upper_bound_slice;
+    
+    // 获取默认 column family handle
+    ColumnFamilyHandle* cfh = DefaultColumnFamily();
+    if (!cfh) {
+      fprintf(stderr, "[DBImpl] No default column family for init scan\n");
+      continue;
+    }
+    
+    // 创建迭代器并执行扫描
+    std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
+    
+    Slice start_slice(start_key);
+    
+    size_t count = 0;
+    for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
+      count++;
+      // 迭代过程中会自动通过 DBIter 触发 Scan-as-Compaction 逻辑
+    }
+    
+    if (!iter->status().ok()) {
+      fprintf(stderr, "[DBImpl] Init scan error for CUID %lu: %s\n", 
+              cuid, iter->status().ToString().c_str());
+    } else {
+      fprintf(stdout, "[DBImpl] Completed init scan for CUID %lu, %zu entries\n", 
+              cuid, count);
+    }
+  }
+}
 
 }  // namespace ROCKSDB_NAMESPACE

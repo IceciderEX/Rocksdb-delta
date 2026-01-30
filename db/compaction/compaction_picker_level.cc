@@ -546,8 +546,7 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
   FileMetaData* oldest_file = l0_files.back();
   uint64_t creation_time = oldest_file->file_creation_time;
   uint64_t now_sec = ioptions_.env->NowMicros() / 1000000;
-  // oldest_file->fd.table_reader_creation_time 是 Unix 时间戳
-  // 如果该字段未开启统计(0)，可能需要 fallback，这里假设已开启
+
   if (creation_time > 0 && creation_time != kUnknownFileCreationTime) {
       if (now_sec > creation_time + kL0TriggerAge) {
           trigger_by_time = true;

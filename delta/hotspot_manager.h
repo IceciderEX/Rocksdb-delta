@@ -32,7 +32,8 @@ class HotspotManager {
   //   void OnUserScan(const Slice& key, const Slice& value);
   
   // 返回 true 表示该 CUID 是热点
-  bool RegisterScan(uint64_t cuid, bool is_full_scan);
+  // became_hot: 如果不为 nullptr，返回是否为首次成为热点
+  bool RegisterScan(uint64_t cuid, bool is_full_scan, bool* became_hot = nullptr);
 
   // 收集数据 (只有 RegisterScan 返回 true 时才调用此函数)
   bool BufferHotData(uint64_t cuid, const Slice& key, const Slice& value);
@@ -92,10 +93,19 @@ class HotspotManager {
 
   InternalIterator* NewBufferIterator(uint64_t cuid, const InternalKeyComparator* icmp);
 
+  // 将 CUID 加入待初始化队列 (首次成为热点时调用)
+  void EnqueueForInitScan(uint64_t cuid);
+  
+  // 获取并清空待初始化队列 (由 DBImpl 后台线程调用)
+  std::vector<uint64_t> PopPendingInitCuids();
+  
+  // 检查是否有待处理的初始化任务
+  bool HasPendingInitCuids() const;
+
   void DebugDump(const std::string& label) {
     std::string dump_file = "/home/wam/HWKV/rocksdb-delta/build/a_test_db/a_mgr.log"; 
     index_table_.DumpToFile(dump_file, label);
-}
+  }
 
  private:
   Options db_options_;
@@ -113,7 +123,11 @@ class HotspotManager {
   std::unordered_map<uint64_t, std::vector<DataSegment>> pending_snapshots_;
   std::mutex pending_mutex_;
   std::unordered_set<uint64_t> active_buffered_cuids_;
-  std::mutex buffered_cuids_mutex_; // 保护上述集合
+  std::mutex buffered_cuids_mutex_;
+  
+  // 待初始化全量扫描的 CUID 队列
+  std::vector<uint64_t> pending_init_cuids_;
+  mutable std::mutex pending_init_mutex_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

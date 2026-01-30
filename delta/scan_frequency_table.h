@@ -17,7 +17,9 @@ class ScanFrequencyTable {
  public:
   ScanFrequencyTable(int threshold = 4, int window_sec = 600);
 
-  bool RecordAndCheckHot(uint64_t cuid);
+  // 返回值：当前是否为热点
+  // became_hot：如果不为 nullptr，返回是否为首次成为热点
+  bool RecordAndCheckHot(uint64_t cuid, bool* became_hot = nullptr);
 
   void RemoveCUID(uint64_t cuid);
 

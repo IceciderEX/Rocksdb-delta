@@ -2475,6 +2475,11 @@ class DBImpl : public DB {
   static void BGWorkPurge(void* arg);
   static void UnscheduleCompactionCallback(void* arg);
   static void UnscheduleFlushCallback(void* arg);
+  
+  // for delta
+  // 处理待初始化的热点 CUID (执行全量扫描以建立 snapshot)
+  void ProcessPendingHotCuids();
+  
   void BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                 Env::Priority thread_pri);
   void BackgroundCallFlush(Env::Priority thread_pri);
