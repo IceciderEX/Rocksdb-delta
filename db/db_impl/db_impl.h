@@ -47,9 +47,9 @@
 #include "db/wal_manager.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
-#include "delta/hotspot_manager.h"
 #include "delta/hot_data_buffer.h"
 #include "delta/hot_index_table.h"
+#include "delta/hotspot_manager.h"
 #include "logging/event_logger.h"
 #include "memtable/wbwi_memtable.h"
 #include "monitoring/instrumented_mutex.h"
@@ -726,7 +726,7 @@ class DBImpl : public DB {
                                       ReadCallback* read_callback,
                                       bool expose_blob_index = false,
                                       bool allow_refresh = true,
-                                      std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
+      std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
 
   virtual SequenceNumber GetLastPublishedSequence() const {
     if (last_seq_same_as_publish_seq_) {
@@ -2475,11 +2475,13 @@ class DBImpl : public DB {
   static void BGWorkPurge(void* arg);
   static void UnscheduleCompactionCallback(void* arg);
   static void UnscheduleFlushCallback(void* arg);
-  
+
   // for delta
   // 处理待初始化的热点 CUID (执行全量扫描以建立 snapshot)
   void ProcessPendingHotCuids();
-  
+  // 处理 Partial Merge 任务 (后台归并)
+  void ProcessPendingPartialMerge();
+
   void BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                 Env::Priority thread_pri);
   void BackgroundCallFlush(Env::Priority thread_pri);
@@ -3205,7 +3207,7 @@ class DBImpl : public DB {
   // The number of LockWAL called without matching UnlockWAL call.
   // See also lock_wal_write_token_
   uint32_t lock_wal_count_ = 0;
-  
+
   // for delta
   std::shared_ptr<HotspotManager> hotspot_manager_;
   public: std::shared_ptr<HotspotManager> GetHotspotManager() { return hotspot_manager_; }

@@ -12,6 +12,7 @@
 #include <string>
 
 #include "db/db_impl/db_impl.h"
+#include "delta/hotspot_manager.h"
 #include "memory/arena.h"
 #include "options/cf_options.h"
 #include "rocksdb/db.h"
@@ -19,7 +20,6 @@
 #include "rocksdb/wide_columns.h"
 #include "table/iterator_wrapper.h"
 #include "util/autovector.h"
-#include "delta/hotspot_manager.h"
 
 namespace ROCKSDB_NAMESPACE {
 class Version;
@@ -65,25 +65,23 @@ class DBIter final : public Iterator {
   // according to options mutable_cf_options.memtable_op_scan_flush_trigger
   // and mutable_cf_options.memtable_avg_op_scan_flush_trigger.
   // @param arena_mode If true, the DBIter will be allocated from the arena.
-  static DBIter* NewIter(Env* env, const ReadOptions& read_options,
-                         const ImmutableOptions& ioptions,
-                         const MutableCFOptions& mutable_cf_options,
-                         const Comparator* user_key_comparator,
-                         InternalIterator* internal_iter,
-                         const Version* version, const SequenceNumber& sequence,
-                         ReadCallback* read_callback,
-                         ReadOnlyMemTable* active_mem,
-                         ColumnFamilyHandleImpl* cfh = nullptr,
-                         bool expose_blob_index = false,
-                         Arena* arena = nullptr,
-                         // for delta
-                         std::shared_ptr<HotspotManager> hotspot_manager = nullptr) {
+  static DBIter* NewIter(
+      Env* env, const ReadOptions& read_options,
+      const ImmutableOptions& ioptions,
+      const MutableCFOptions& mutable_cf_options,
+      const Comparator* user_key_comparator, InternalIterator* internal_iter,
+      const Version* version, const SequenceNumber& sequence,
+      ReadCallback* read_callback, ReadOnlyMemTable* active_mem,
+      ColumnFamilyHandleImpl* cfh = nullptr, bool expose_blob_index = false,
+      Arena* arena = nullptr,
+      // for delta
+      std::shared_ptr<HotspotManager> hotspot_manager = nullptr) {
     void* mem = arena ? arena->AllocateAligned(sizeof(DBIter))
                       : operator new(sizeof(DBIter));
-    DBIter* db_iter = new (mem)
-        DBIter(env, read_options, ioptions, mutable_cf_options,
-               user_key_comparator, internal_iter, version, sequence, arena,
-               read_callback, cfh, expose_blob_index, active_mem, hotspot_manager);
+    DBIter* db_iter = new (mem) DBIter(
+        env, read_options, ioptions, mutable_cf_options, user_key_comparator,
+        internal_iter, version, sequence, arena, read_callback, cfh,
+        expose_blob_index, active_mem, hotspot_manager);
     return db_iter;
   }
 
@@ -163,10 +161,11 @@ class DBIter final : public Iterator {
     iter_.DeleteIter(arena_mode_);
     ThreadStatusUtil::SetThreadOperation(cur_op_type);
 
-    if (hotspot_manager_ && delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
-        hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+    if (hotspot_manager_ && delta_ctx_.last_cuid != 0 &&
+        delta_ctx_.trigger_scan_as_compaction) {
+      hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
     }
-    
+
     // for delta: 在 scan 结束时处理待初始化的热点 CUID
     if (cfh_ && hotspot_manager_ && hotspot_manager_->HasPendingInitCuids()) {
       auto db_impl = static_cast<DBImpl*>(cfh_->db());
@@ -542,21 +541,27 @@ class DBIter final : public Iterator {
   bool allow_unprepared_value_;
   bool is_blob_;
   bool arena_mode_;
-  
+
   // for delta
   struct DeltaScanContext {
     uint64_t last_cuid = 0;
     // 记录当前 CUID 已经统计过的物理单元 ID
     std::unordered_set<uint64_t> visited_units_for_cuid;
     // bool is_counting_mode = false; // [NOTUSE] 标记本次 Scan 是否负责计数?
-    bool is_current_hot = false; 
+    bool is_current_hot = false;
     bool trigger_scan_as_compaction = false;
+
+    // 当前 Scan 的 key 范围
+    std::string scan_first_key;
+    std::string scan_last_key;
 
     void Reset() {
       last_cuid = 0;
       visited_units_for_cuid.clear();
       is_current_hot = false;
       trigger_scan_as_compaction = false;
+      scan_first_key.clear();
+      scan_last_key.clear();
     }
   } delta_ctx_;
 

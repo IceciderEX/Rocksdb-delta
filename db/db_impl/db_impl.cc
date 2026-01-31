@@ -281,15 +281,15 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   }
   // for delta
   std::string hotspot_dir = dbname_ + "/hotspot_data";
-  ColumnFamilyOptions default_cf_opts; 
+  ColumnFamilyOptions default_cf_opts;
   Options hotspot_opts(initial_db_options_, default_cf_opts);
-  
+
   hotspot_manager_ = std::make_shared<HotspotManager>(hotspot_opts, hotspot_dir);
   immutable_db_options_.hotspot_manager = hotspot_manager_;
   //immutable_db_options_.hotspot_manager = hotspot_manager_;
 
-  ROCKS_LOG_INFO(immutable_db_options_.info_log, 
-               "HotspotManager initialized at DBImpl%s", hotspot_dir.c_str());
+  ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                 "HotspotManager initialized at DBImpl%s", hotspot_dir.c_str());
 }
 
 Status DBImpl::Resume() {
@@ -2152,17 +2152,12 @@ InternalIterator* DBImpl::NewInternalIterator(
     if (read_options.read_tier != kMemtableTier) {
       // for delta
       if (hotspot_manager_) {
-          // TODO: Arena?
-          switching_iter_ptr = new DeltaSwitchingIterator(
-              super_version->current,    
-              hotspot_manager_.get(),      
-              read_options,
-              file_options_,     
-              cfd->internal_comparator(),
-              super_version->mutable_cf_options,
-              arena
-          );
-          merge_iter_builder.AddIterator(switching_iter_ptr);
+        // TODO: Arena?
+        switching_iter_ptr = new DeltaSwitchingIterator(
+            super_version->current, hotspot_manager_.get(), read_options,
+            file_options_, cfd->internal_comparator(),
+            super_version->mutable_cf_options, arena);
+        merge_iter_builder.AddIterator(switching_iter_ptr);
       } else {
         super_version->current->AddIterators(read_options, file_options_,
                                              &merge_iter_builder,
@@ -3948,10 +3943,9 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                              (read_options.snapshot != nullptr)
                                  ? read_options.snapshot->GetSequenceNumber()
                                  : kMaxSequenceNumber,
-                             nullptr /* read_callback */, 
-                             /*expose_blob_index=*/ false,  
-                             /*allow_refresh=*/ true,
-                             hotspot_manager_);
+                             nullptr /* read_callback */,
+                             /*expose_blob_index=*/false,
+                             /*allow_refresh=*/true, hotspot_manager_);
   }
   return result;
 }
@@ -3959,7 +3953,8 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
 ArenaWrappedDBIter* DBImpl::NewIteratorImpl(
     const ReadOptions& read_options, ColumnFamilyHandleImpl* cfh,
     SuperVersion* sv, SequenceNumber snapshot, ReadCallback* read_callback,
-    bool expose_blob_index, bool allow_refresh, std::shared_ptr<HotspotManager> hotspot_manager) {
+    bool expose_blob_index, bool allow_refresh,
+    std::shared_ptr<HotspotManager> hotspot_manager) {
   TEST_SYNC_POINT("DBImpl::NewIterator:1");
   TEST_SYNC_POINT("DBImpl::NewIterator:2");
 
@@ -6963,27 +6958,29 @@ void DBImpl::ProcessPendingHotCuids() {
   if (!hotspot_manager_) {
     return;
   }
-  
+
   // 获取待处理的 CUID 列表
   std::vector<uint64_t> pending_cuids = hotspot_manager_->PopPendingInitCuids();
   if (pending_cuids.empty()) {
     return;
   }
-  
-  fprintf(stdout, "[DBImpl] Processing %zu pending hot CUIDs for initial scan\n", 
+
+  fprintf(stdout,
+          "[DBImpl] Processing %zu pending hot CUIDs for initial scan\n",
           pending_cuids.size());
-  
+
   for (uint64_t cuid : pending_cuids) {
     // 构造该 CUID 的 key 范围进行全量扫描
-    // Key 格式参考 test/rocksdb_scan.cc: 40 bytes, CUID at offset 16 in Big Endian
-    
+    // Key 格式参考 test/rocksdb_scan.cc: 40 bytes, CUID at offset 16 in Big
+    // Endian
+
     // 构造 start_key: CUID 的起始
     std::string start_key(40, '\0');
     unsigned char* p = reinterpret_cast<unsigned char*>(&start_key[16]);
     for (int i = 0; i < 8; ++i) {
       p[i] = (cuid >> (56 - 8 * i)) & 0xFF;  // Big Endian
     }
-    
+
     // 构造 upper_bound_key: CUID + 1 的起始
     uint64_t cuid_plus_one = cuid + 1;
     std::string upper_bound_key(40, '\0');
@@ -6991,41 +6988,216 @@ void DBImpl::ProcessPendingHotCuids() {
     for (int i = 0; i < 8; ++i) {
       q[i] = (cuid_plus_one >> (56 - 8 * i)) & 0xFF;  // Big Endian
     }
-    
+
     // 创建 ReadOptions 并设置为全量扫描
     ReadOptions read_opts;
     read_opts.delta_full_scan = true;
-    
+
     // 设置 upper bound 防止读到下一个 CUID 的数据
     Slice upper_bound_slice(upper_bound_key);
     read_opts.iterate_upper_bound = &upper_bound_slice;
-    
+
     // 获取默认 column family handle
     ColumnFamilyHandle* cfh = DefaultColumnFamily();
     if (!cfh) {
       fprintf(stderr, "[DBImpl] No default column family for init scan\n");
       continue;
     }
-    
+
     // 创建迭代器并执行扫描
     std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
-    
+
     Slice start_slice(start_key);
-    
+
     size_t count = 0;
     for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
       count++;
       // 迭代过程中会自动通过 DBIter 触发 Scan-as-Compaction 逻辑
     }
-    
+
     if (!iter->status().ok()) {
-      fprintf(stderr, "[DBImpl] Init scan error for CUID %lu: %s\n", 
-              cuid, iter->status().ToString().c_str());
+      fprintf(stderr, "[DBImpl] Init scan error for CUID %lu: %s\n", cuid,
+              iter->status().ToString().c_str());
     } else {
-      fprintf(stdout, "[DBImpl] Completed init scan for CUID %lu, %zu entries\n", 
-              cuid, count);
+      fprintf(stdout,
+              "[DBImpl] Completed init scan for CUID %lu, %zu entries\n", cuid,
+              count);
     }
   }
+}
+
+// 处理 Partial Merge 任务
+void DBImpl::ProcessPendingPartialMerge() {
+  if (!hotspot_manager_) {
+    return;
+  }
+  PartialMergePendingTask task;
+  if (!hotspot_manager_->PopPendingPartialMerge(&task)) {
+    return;
+  }
+
+  fprintf(stdout, "[DBImpl] Processing PartialMerge for CUID %lu\n", task.cuid);
+
+  // 获取重叠的 segments
+  std::vector<DataSegment> overlapping_snaps, overlapping_deltas;
+  hotspot_manager_->GetIndexTable().GetOverlappingSegments(
+      task.cuid, task.scan_first_key, task.scan_last_key, &overlapping_snaps,
+      &overlapping_deltas);
+
+  // 如果没有重叠数据，使用 FullReplace 逻辑
+  if (overlapping_snaps.empty() && overlapping_deltas.empty()) {
+    hotspot_manager_->FinalizeScanAsCompaction(task.cuid);
+    return;
+  }
+
+  ColumnFamilyHandle* cfh = DefaultColumnFamily();
+  if (!cfh) {
+    fprintf(stderr, "[DBImpl] No default column family for partial merge\n");
+    return;
+  }
+
+  auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(cfh)->cfd();
+  SuperVersion* sv = GetAndRefSuperVersion(cfd);
+  if (!sv) {
+    fprintf(stderr, "[DBImpl] Failed to get SuperVersion for partial merge\n");
+    return;
+  }
+
+  const auto& icmp = cfd->internal_comparator();
+  ReadOptions read_opts;
+  FileOptions file_opts;
+  MutableCFOptions mutable_cf_opts = *cfd->GetLatestMutableCFOptions();
+
+  // 创建迭代器
+  std::vector<InternalIterator*> children;
+
+  // 1. Snapshot Iterator
+  if (!overlapping_snaps.empty()) {
+    InternalIterator* snap_iter = new HotSnapshotIterator(
+        overlapping_snaps, task.cuid, hotspot_manager_.get(),
+        cfd->table_cache(), read_opts, file_opts, icmp, mutable_cf_opts);
+    children.push_back(snap_iter);
+  }
+
+  // 2. Delta Iterator
+  if (!overlapping_deltas.empty()) {
+    InternalIterator* delta_iter =
+        new HotDeltaIterator(overlapping_deltas, cfd->table_cache(), read_opts,
+                             file_opts, icmp, mutable_cf_opts, false);
+    children.push_back(delta_iter);
+  }
+
+  // 3. Buffer Iterator (新扫描数据)
+  InternalIterator* buffer_iter =
+      hotspot_manager_->NewBufferIterator(task.cuid, &icmp);
+  if (buffer_iter) {
+    children.push_back(buffer_iter);
+  }
+
+  if (children.empty()) {
+    ReturnAndCleanupSuperVersion(cfd, sv);
+    return;
+  }
+
+  // 创建 MergingIterator
+  InternalIterator* merging_iter = NewMergingIterator(
+      &icmp, children.data(), static_cast<int>(children.size()));
+
+  // 写入新 SST
+  EnvOptions env_options;
+  auto db_opts = immutable_db_options_;
+  Options opts(BuildDBOptions(db_opts, mutable_db_options_),
+               cfd->GetLatestCFOptions());
+  SstFileWriter sst_writer(env_options, opts);
+
+  auto now = std::chrono::system_clock::now();
+  uint64_t file_number = std::chrono::duration_cast<std::chrono::microseconds>(
+                             now.time_since_epoch())
+                             .count();
+  std::string data_dir = hotspot_manager_->GetDataDir();
+  std::string file_path =
+      data_dir + "/hot_merged_" + std::to_string(file_number) + ".sst";
+
+  Status s = sst_writer.Open(file_path);
+  if (!s.ok()) {
+    fprintf(stderr, "[DBImpl] Failed to open SST for merge: %s\n",
+            s.ToString().c_str());
+    delete merging_iter;
+    ReturnAndCleanupSuperVersion(cfd, sv);
+    return;
+  }
+
+  // 遍历归并并写入，去重
+  std::string last_user_key;
+  std::string segment_first_key, segment_last_key;
+  size_t written_count = 0;
+
+  for (merging_iter->SeekToFirst(); merging_iter->Valid();
+       merging_iter->Next()) {
+    Slice key = merging_iter->key();
+    Slice value = merging_iter->value();
+    Slice user_key = ExtractUserKey(key);
+
+    // 去重：相同 user_key 只保留第一个（最新版本）
+    if (user_key.ToString() == last_user_key) {
+      continue;
+    }
+    last_user_key = user_key.ToString();
+
+    s = sst_writer.Put(key, value);
+    if (!s.ok()) {
+      fprintf(stderr, "[DBImpl] Failed to write to merged SST: %s\n",
+              s.ToString().c_str());
+      break;
+    }
+
+    if (segment_first_key.empty()) {
+      segment_first_key = key.ToString();
+    }
+    segment_last_key = key.ToString();
+    written_count++;
+  }
+
+  delete merging_iter;
+  ReturnAndCleanupSuperVersion(cfd, sv);
+
+  if (written_count == 0) {
+    sst_writer.Finish();
+    return;
+  }
+
+  ExternalSstFileInfo file_info;
+  s = sst_writer.Finish(&file_info);
+  if (!s.ok()) {
+    fprintf(stderr, "[DBImpl] Failed to finish merged SST: %s\n",
+            s.ToString().c_str());
+    return;
+  }
+
+  // 构造新的 DataSegment
+  DataSegment new_segment;
+  new_segment.file_number = file_number;
+  new_segment.first_key = segment_first_key;
+  new_segment.last_key = segment_last_key;
+
+  // 收集需要清理的旧文件
+  std::vector<uint64_t> obsolete_files;
+  for (const auto& seg : overlapping_snaps) {
+    obsolete_files.push_back(seg.file_number);
+  }
+  for (const auto& seg : overlapping_deltas) {
+    obsolete_files.push_back(seg.file_number);
+  }
+
+  // 更新 HotIndexTable
+  hotspot_manager_->GetLifecycleManager()->RegisterFile(file_number, file_path);
+  hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
+      task.cuid, new_segment, obsolete_files);
+
+  fprintf(stdout,
+          "[DBImpl] PartialMerge completed for CUID %lu: merged %zu entries "
+          "into %s\n",
+          task.cuid, written_count, file_path.c_str());
 }
 
 }  // namespace ROCKSDB_NAMESPACE
