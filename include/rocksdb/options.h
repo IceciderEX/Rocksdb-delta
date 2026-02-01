@@ -2275,6 +2275,8 @@ struct ReadOptions {
 
   // for delta
   bool delta_full_scan = false;
+  // 跳过热点路径，直接读取冷数据
+  bool skip_hot_path = false;
 
   ReadOptions() {}
   ReadOptions(bool _verify_checksums, bool _fill_cache);

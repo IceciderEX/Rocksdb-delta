@@ -726,7 +726,7 @@ class DBImpl : public DB {
                                       ReadCallback* read_callback,
                                       bool expose_blob_index = false,
                                       bool allow_refresh = true,
-      std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
+                                      std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
 
   virtual SequenceNumber GetLastPublishedSequence() const {
     if (last_seq_same_as_publish_seq_) {
@@ -2476,12 +2476,6 @@ class DBImpl : public DB {
   static void UnscheduleCompactionCallback(void* arg);
   static void UnscheduleFlushCallback(void* arg);
 
-  // for delta
-  // 处理待初始化的热点 CUID (执行全量扫描以建立 snapshot)
-  void ProcessPendingHotCuids();
-  // 处理 Partial Merge 任务 (后台归并)
-  void ProcessPendingPartialMerge();
-
   void BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                 Env::Priority thread_pri);
   void BackgroundCallFlush(Env::Priority thread_pri);
@@ -3211,6 +3205,9 @@ class DBImpl : public DB {
   // for delta
   std::shared_ptr<HotspotManager> hotspot_manager_;
   public: std::shared_ptr<HotspotManager> GetHotspotManager() { return hotspot_manager_; }
+
+  void ProcessPendingHotCuids();
+  void ProcessPendingPartialMerge();
 };
 
 class GetWithTimestampReadCallback : public ReadCallback {

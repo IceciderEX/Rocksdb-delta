@@ -364,7 +364,7 @@ void DeltaSwitchingIterator::Seek(const Slice& target) {
 
   bool use_hot = false;
   // hot cuid
-  if (cuid != 0 && hotspot_manager_->IsHot(cuid)) {
+  if (!read_options_.skip_hot_path && cuid != 0 && hotspot_manager_->IsHot(cuid)) {
      use_hot = true;
   }
 

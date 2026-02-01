@@ -65,10 +65,6 @@ class HotspotManager {
 
   void TriggerBufferFlush();
 
-  HotIndexTable& GetIndexTable() { return index_table_; }
-
-  GlobalDeleteCountTable& GetDeleteTable() { return delete_table_; }
-
   bool ShouldTriggerScanAsCompaction(uint64_t cuid);
 
   // 根据扫描类型和涉及的 delta 数量，确定 Scan-as-Compaction 策略
@@ -135,11 +131,14 @@ class HotspotManager {
                                       const InternalKeyComparator* icmp);
 
   // Getters for db_impl access
-  HotIndexTable& GetIndexTable() { return index_table_; }
   const std::string& GetDataDir() const { return data_dir_; }
   std::shared_ptr<HotSstLifecycleManager> GetLifecycleManager() {
     return lifecycle_manager_;
   }
+
+  HotIndexTable& GetIndexTable() { return index_table_; }
+
+  GlobalDeleteCountTable& GetDeleteTable() { return delete_table_; }
 
   // 将 CUID 加入待初始化队列 (首次成为热点时调用)
   void EnqueueForInitScan(uint64_t cuid);

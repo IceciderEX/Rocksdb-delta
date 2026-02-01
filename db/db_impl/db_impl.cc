@@ -6970,11 +6970,7 @@ void DBImpl::ProcessPendingHotCuids() {
           pending_cuids.size());
 
   for (uint64_t cuid : pending_cuids) {
-    // 构造该 CUID 的 key 范围进行全量扫描
-    // Key 格式参考 test/rocksdb_scan.cc: 40 bytes, CUID at offset 16 in Big
-    // Endian
-
-    // 构造 start_key: CUID 的起始
+    // 构造 start_key
     std::string start_key(40, '\0');
     unsigned char* p = reinterpret_cast<unsigned char*>(&start_key[16]);
     for (int i = 0; i < 8; ++i) {
@@ -6989,30 +6985,41 @@ void DBImpl::ProcessPendingHotCuids() {
       q[i] = (cuid_plus_one >> (56 - 8 * i)) & 0xFF;  // Big Endian
     }
 
-    // 创建 ReadOptions 并设置为全量扫描
     ReadOptions read_opts;
     read_opts.delta_full_scan = true;
-
-    // 设置 upper bound 防止读到下一个 CUID 的数据
+    read_opts.skip_hot_path = true;
     Slice upper_bound_slice(upper_bound_key);
     read_opts.iterate_upper_bound = &upper_bound_slice;
-
-    // 获取默认 column family handle
     ColumnFamilyHandle* cfh = DefaultColumnFamily();
     if (!cfh) {
       fprintf(stderr, "[DBImpl] No default column family for init scan\n");
       continue;
     }
 
-    // 创建迭代器并执行扫描
     std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
-
     Slice start_slice(start_key);
-
     size_t count = 0;
+
+    fprintf(stdout, "[DBImpl] Init scan for CUID %lu, start_key hex: ", cuid);
+    for (int i = 0; i < 40; ++i) {
+        fprintf(stdout, "%02x", (unsigned char)start_key[i]);
+    }
+    fprintf(stdout, "\n");
+    // 检查 Seek 后的状态
+    iter->Seek(start_slice);
+    fprintf(stdout, "[DBImpl] After Seek: Valid=%d, status=%s\n", 
+            iter->Valid() ? 1 : 0, iter->status().ToString().c_str());
+    if (iter->Valid()) {
+        Slice k = iter->key();
+        fprintf(stdout, "[DBImpl] First key found, size=%zu, hex: ", k.size());
+        for (size_t i = 0; i < std::min(k.size(), (size_t)40); ++i) {
+            fprintf(stdout, "%02x", (unsigned char)k.data()[i]);
+        }
+        fprintf(stdout, "\n");
+    }
+    
     for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
       count++;
-      // 迭代过程中会自动通过 DBIter 触发 Scan-as-Compaction 逻辑
     }
 
     if (!iter->status().ok()) {
@@ -7066,7 +7073,7 @@ void DBImpl::ProcessPendingPartialMerge() {
   const auto& icmp = cfd->internal_comparator();
   ReadOptions read_opts;
   FileOptions file_opts;
-  MutableCFOptions mutable_cf_opts = *cfd->GetLatestMutableCFOptions();
+  MutableCFOptions mutable_cf_opts = cfd->GetLatestMutableCFOptions();
 
   // 创建迭代器
   std::vector<InternalIterator*> children;
