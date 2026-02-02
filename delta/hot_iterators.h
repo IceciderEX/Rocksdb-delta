@@ -96,8 +96,10 @@ class HotSnapshotIterator : public InternalIterator {
   
   // 当前 Iterator 对应的 Segment 索引
   int current_segment_index_;
-  Slice current_lower_bound_;
-  Slice current_upper_bound_;
+  std::string current_lower_bound_str_;
+  std::string current_upper_bound_str_;
+  Slice current_lower_bound_slice_;
+  Slice current_upper_bound_slice_;
   
   Status status_;
 };

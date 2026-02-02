@@ -127,31 +127,20 @@ void HotSnapshotIterator::InitIterForSegment(size_t index) {
     FileMetaData meta = MakeFileMetaFromSegment(seg);
     
     ReadOptions ro = read_options_;
-    current_lower_bound_ = Slice(seg.first_key);
-    current_upper_bound_ = Slice(seg.last_key);
-    ro.iterate_lower_bound = &current_lower_bound_; 
-    ro.iterate_upper_bound = &current_upper_bound_;
+    current_lower_bound_str_ = seg.first_key;
+    current_upper_bound_str_ = seg.last_key;
+    current_lower_bound_slice_ = Slice(current_lower_bound_str_);
+    current_upper_bound_slice_ = Slice(current_upper_bound_str_);
+    ro.iterate_lower_bound = &current_lower_bound_slice_;
+    ro.iterate_upper_bound = &current_upper_bound_slice_;
 
     InternalIterator* iter = table_cache_->NewIterator(
-        ro,
-        file_options_,
-        icmp_,
-        meta,
-        nullptr,
-        mutable_cf_options_,
-        nullptr,
-        nullptr,
-        TableReaderCaller::kUserIterator,
-        nullptr,
-        false,
-        1, // L1+
-        0,
-        nullptr,
-        nullptr,
-        false, // allow_unprepared_value
-        nullptr,
-        nullptr
-    );
+        ro, file_options_, icmp_, meta, nullptr, mutable_cf_options_, nullptr,
+        nullptr, TableReaderCaller::kUserIterator, nullptr, false,
+        1,  // L1+
+        0, nullptr, nullptr,
+        false,  // allow_unprepared_value
+        nullptr, nullptr);
     
     current_iter_.reset(iter);
   }

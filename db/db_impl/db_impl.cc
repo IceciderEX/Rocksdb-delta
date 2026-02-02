@@ -6999,24 +6999,6 @@ void DBImpl::ProcessPendingHotCuids() {
     std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
     Slice start_slice(start_key);
     size_t count = 0;
-
-    fprintf(stdout, "[DBImpl] Init scan for CUID %lu, start_key hex: ", cuid);
-    for (int i = 0; i < 40; ++i) {
-        fprintf(stdout, "%02x", (unsigned char)start_key[i]);
-    }
-    fprintf(stdout, "\n");
-    // 检查 Seek 后的状态
-    iter->Seek(start_slice);
-    fprintf(stdout, "[DBImpl] After Seek: Valid=%d, status=%s\n", 
-            iter->Valid() ? 1 : 0, iter->status().ToString().c_str());
-    if (iter->Valid()) {
-        Slice k = iter->key();
-        fprintf(stdout, "[DBImpl] First key found, size=%zu, hex: ", k.size());
-        for (size_t i = 0; i < std::min(k.size(), (size_t)40); ++i) {
-            fprintf(stdout, "%02x", (unsigned char)k.data()[i]);
-        }
-        fprintf(stdout, "\n");
-    }
     
     for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
       count++;

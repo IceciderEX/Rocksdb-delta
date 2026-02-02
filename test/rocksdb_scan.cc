@@ -29,7 +29,7 @@
 
 using namespace ROCKSDB_NAMESPACE;
 
-const std::string kDBPath = "/home/wam/Rocksdb-delta/db_partial_merge_test";
+const std::string kDBPath = "/home/wam/HWKV/Rocksdb-delta/db_tmp";
 
 // ==========================================
 // 辅助工具函数
