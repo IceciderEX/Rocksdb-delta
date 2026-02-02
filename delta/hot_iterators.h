@@ -45,7 +45,10 @@ class HotDeltaIterator : public InternalIterator {
   InternalIterator* merging_iter_;
   std::vector<DataSegment> deltas_;
   // [seg0_lower, seg0_upper, seg1_lower, seg1_upper, ...]
+  std::vector<std::string> bounds_storage_;
   std::vector<Slice> bounds_slices_;
+  // all ReadOptions (BlockBasedTableIterator
+  std::vector<ReadOptions> read_options_storage_;
 };
 
 
@@ -90,6 +93,7 @@ class HotSnapshotIterator : public InternalIterator {
   FileOptions file_options_;
   const InternalKeyComparator& icmp_;
   const MutableCFOptions mutable_cf_options_;
+  ReadOptions current_read_options_;
 
   // 当前正在使用的 Iterator (指向某个 SST 或 内存 Buffer)
   std::unique_ptr<InternalIterator> current_iter_;

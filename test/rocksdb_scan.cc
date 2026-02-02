@@ -44,9 +44,11 @@ std::string GenerateKey(uint64_t cuid, int row_id) {
     p[i] = (cuid >> (56 - 8 * i)) & 0xFF;
   }
 
-  std::string row_str = std::to_string(row_id);
-  size_t copy_len = std::min(row_str.size(), key.size() - 24);
-  std::memcpy(&key[24], row_str.data(), copy_len);
+  // 使用固定10位宽度格式，确保字典序=数字序
+  // "123" -> "0000000123"
+  char row_buf[16];
+  snprintf(row_buf, sizeof(row_buf), "%010d", row_id);
+  std::memcpy(&key[24], row_buf, 10);
 
   return key;
 }
@@ -284,8 +286,70 @@ int main() {
   std::cout << "Final total rows: " << total_rows << std::endl;
   Check(total_rows == expected, "Final data integrity check");
 
+  // =================================================================
+  // 测试 6: L0 Compaction 索引更新
+  // =================================================================
+  std::cout << "\n>>> TEST 6: L0 Compaction Index Update <<<\n";
+
+  // 记录 Compaction 前的 Delta 状态
+  hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
+  size_t deltas_before = entry.deltas.size();
+  std::vector<uint64_t> file_numbers_before;
+  for (const auto& d : entry.deltas) {
+    file_numbers_before.push_back(d.file_number);
+  }
+  std::cout << "Before Compaction: " << deltas_before << " deltas" << std::endl;
+  std::cout << "Delta file numbers: ";
+  for (uint64_t fn : file_numbers_before) {
+    std::cout << fn << " ";
+  }
+  std::cout << std::endl;
+
+  // 触发 L0 Compaction
+  std::cout << "Triggering L0 Compaction via CompactRange()..." << std::endl;
+  s = db->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  Check(s.ok(), "CompactRange");
+
+  // 检查 Compaction 后的状态
+  hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
+  size_t deltas_after = entry.deltas.size();
+  std::cout << "After Compaction: " << deltas_after << " deltas" << std::endl;
+
+  // 验证 Delta 被合并 (数量应该减少或文件号变化)
+  if (deltas_after < deltas_before) {
+    std::cout << "[PASS] Deltas merged: " << deltas_before << " -> "
+              << deltas_after << std::endl;
+  } else if (deltas_after == 1 && !entry.deltas.empty()) {
+    // 检查文件号是否变化
+    bool file_changed = (entry.deltas[0].file_number != file_numbers_before[0]);
+    std::cout << "New delta file number: " << entry.deltas[0].file_number
+              << std::endl;
+    Check(file_changed || deltas_before == 1,
+          "Delta file number should change after compaction");
+  } else {
+    std::cout << "[INFO] Compaction may not have affected deltas (num_levels=1 "
+                 "config)"
+              << std::endl;
+  }
+
+  // =================================================================
+  // 测试 7: Compaction 后数据完整性
+  // =================================================================
+  std::cout << "\n>>> TEST 7: Post-Compaction Data Integrity <<<\n";
+
+  // 全量扫描验证数据未丢失
+  total_rows = PerformFullScan(db, CUID_PARTIAL);
+  std::cout << "Post-compaction total rows: " << total_rows << std::endl;
+  Check(total_rows == expected, "Data integrity after L0 Compaction");
+
+  // 部分扫描验证热点路径仍正常工作
+  int rows_100_150 = PerformPartialScan(db, CUID_PARTIAL, 100, 149);
+  std::cout << "Partial scan [100, 149]: " << rows_100_150 << " rows"
+            << std::endl;
+  Check(rows_100_150 == 50, "Partial scan [100, 149] should find 50 rows");
+
   std::cout << "\n========================================" << std::endl;
-  std::cout << "All Partial Merge Tests PASSED!" << std::endl;
+  std::cout << "All Tests PASSED!" << std::endl;
   std::cout << "========================================" << std::endl;
 
   delete db;

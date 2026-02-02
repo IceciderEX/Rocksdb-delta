@@ -23,35 +23,47 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
                                    const InternalKeyComparator& icmp,
                                    const MutableCFOptions& mutable_cf_options,
                                    bool allow_unprepared_value)
-    : deltas_(deltas) { // Copy deltas
-  
+    : merging_iter_(nullptr), deltas_(deltas) { // Copy deltas
+  if (deltas_.empty()) {
+    merging_iter_ = NewEmptyInternalIterator<Slice>(nullptr);
+    return;
+  }
+
+  bounds_storage_.reserve(deltas_.size() * 2);
+  bounds_slices_.reserve(deltas_.size() * 2);
+  read_options_storage_.reserve(deltas_.size());
+
   std::vector<InternalIterator*> children;
   children.reserve(deltas_.size());
-  bounds_slices_.reserve(deltas_.size() * 2);
 
+  // slices for bounds
   for (const auto& delta : deltas_) {
-    // Bounds
-    bounds_slices_.emplace_back(delta.first_key);
-    const Slice* lower_ptr = &bounds_slices_.back();
-    bounds_slices_.emplace_back(delta.last_key);
-    const Slice* upper_ptr = &bounds_slices_.back();
-    // ReadOptions
-    ReadOptions ro = read_options;
-    ro.iterate_lower_bound = lower_ptr;
-    ro.iterate_upper_bound = upper_ptr;
+    bounds_storage_.push_back(delta.first_key);
+    bounds_storage_.push_back(delta.last_key);
+  }
+  for (size_t i = 0; i < bounds_storage_.size(); ++i) {
+    bounds_slices_.emplace_back(bounds_storage_[i]);
+  }
 
-    FileDescriptor fd(delta.file_number, 0, 0); // PathId=0, Size=0(unknown)
+  for (size_t i = 0; i < deltas_.size(); ++i) {
+    const auto& delta = deltas_[i];
+    // ReadOptions 
+    read_options_storage_.emplace_back(read_options);
+    ReadOptions& ro = read_options_storage_.back();
+    ro.iterate_lower_bound = &bounds_slices_[i * 2];
+    ro.iterate_upper_bound = &bounds_slices_[i * 2 + 1];
+
+    FileDescriptor fd(delta.file_number, 0, 0);  // PathId=0, Size=0(unknown)
     FileMetaData meta;
     meta.fd = fd;
-    
+
     InternalIterator* iter = table_cache->NewIterator(
-        ro, file_options, icmp, // InternalKeyComparator
-        meta, // FileMetaData
+        ro, file_options, icmp,  // InternalKeyComparator
+        meta,                    // FileMetaData
         nullptr, mutable_cf_options, nullptr, nullptr,
-        TableReaderCaller::kUserIterator, nullptr, false, 
-        0, // L0
-        0, nullptr, nullptr, allow_unprepared_value, nullptr, nullptr               
-    );
+        TableReaderCaller::kUserIterator, nullptr, false,
+        0,  // L0
+        0, nullptr, nullptr, allow_unprepared_value, nullptr, nullptr);
 
     if (iter) {
       children.push_back(iter);
@@ -60,6 +72,7 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
 
   merging_iter_ = NewMergingIterator(&icmp, children.data(), 
                                      static_cast<int>(children.size()));
+
 }
 
 HotDeltaIterator::~HotDeltaIterator() {
@@ -72,7 +85,9 @@ HotDeltaIterator::~HotDeltaIterator() {
 bool HotDeltaIterator::Valid() const { return merging_iter_->Valid(); }
 void HotDeltaIterator::SeekToFirst() { merging_iter_->SeekToFirst(); }
 void HotDeltaIterator::SeekToLast() { merging_iter_->SeekToLast(); }
-void HotDeltaIterator::Seek(const Slice& target) { merging_iter_->Seek(target); }
+void HotDeltaIterator::Seek(const Slice& target) { 
+  merging_iter_->Seek(target); 
+}
 void HotDeltaIterator::SeekForPrev(const Slice& target) { merging_iter_->SeekForPrev(target); }
 void HotDeltaIterator::Next() { merging_iter_->Next(); }
 void HotDeltaIterator::Prev() { merging_iter_->Prev(); }
@@ -126,16 +141,16 @@ void HotSnapshotIterator::InitIterForSegment(size_t index) {
     FileDescriptor fd(seg.file_number, 0, 0);
     FileMetaData meta = MakeFileMetaFromSegment(seg);
     
-    ReadOptions ro = read_options_;
+    current_read_options_ = read_options_;
     current_lower_bound_str_ = seg.first_key;
     current_upper_bound_str_ = seg.last_key;
     current_lower_bound_slice_ = Slice(current_lower_bound_str_);
     current_upper_bound_slice_ = Slice(current_upper_bound_str_);
-    ro.iterate_lower_bound = &current_lower_bound_slice_;
-    ro.iterate_upper_bound = &current_upper_bound_slice_;
+    current_read_options_.iterate_lower_bound = &current_lower_bound_slice_;
+    current_read_options_.iterate_upper_bound = &current_upper_bound_slice_;
 
     InternalIterator* iter = table_cache_->NewIterator(
-        ro, file_options_, icmp_, meta, nullptr, mutable_cf_options_, nullptr,
+        current_read_options_, file_options_, icmp_, meta, nullptr, mutable_cf_options_, nullptr,
         nullptr, TableReaderCaller::kUserIterator, nullptr, false,
         1,  // L1+
         0, nullptr, nullptr,
@@ -367,6 +382,7 @@ void DeltaSwitchingIterator::Seek(const Slice& target) {
     is_hot_mode_ = false;
   }
 
+  // fprintf(stderr, "[DEBUG] current_iter_=%p, about to call current_iter_->Seek()\n", (void*)current_iter_);
   if (current_iter_) {
     current_iter_->Seek(target);
   }
