@@ -128,6 +128,30 @@ void GlobalDeleteCountTable::ApplyCompactionChange(
   }
 }
 
+void GlobalDeleteCountTable::ApplyFlushChange(uint64_t cuid,
+                                              uint64_t output_file) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) return;
+
+  auto& entry = it->second;
+  auto pos = std::lower_bound(entry.tracked_phys_ids.begin(),
+                              entry.tracked_phys_ids.end(), 0);
+  if (pos != entry.tracked_phys_ids.end() && *pos == 0) {
+    // 移除占位的 Memtable ID
+    entry.tracked_phys_ids.erase(pos);
+    // 添加实际生成的 SST ID
+    auto out_pos = std::lower_bound(entry.tracked_phys_ids.begin(),
+                                    entry.tracked_phys_ids.end(), output_file);
+    if (out_pos == entry.tracked_phys_ids.end() || *out_pos != output_file) {
+      entry.tracked_phys_ids.insert(out_pos, output_file);
+      // ref_count 不修改
+    } else {
+      entry.ref_count--;
+    }
+  }
+}
+
 bool GlobalDeleteCountTable::MarkDeleted(uint64_t cuid) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto it = table_.find(cuid);

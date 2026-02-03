@@ -163,6 +163,7 @@ int main() {
   options.disable_auto_compactions = true;
   options.num_levels = 1;
   options.level0_file_num_compaction_trigger = 20;
+  options.level_compaction_dynamic_level_bytes = false;
 
   DB* db = nullptr;
   s = DB::Open(options, kDBPath, &db);

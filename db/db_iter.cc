@@ -538,10 +538,8 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                 // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
                 if (delta_ctx_.last_cuid != cuid) {
                   // 将上个 cuid 的 Scan-as-Compaction 结果提交
-                  if (delta_ctx_.last_cuid != 0 &&
-                      delta_ctx_.trigger_scan_as_compaction) {
-                    hotspot_manager_->FinalizeScanAsCompaction(
-                        delta_ctx_.last_cuid);
+                  if (delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
+                    hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
                   }
                   delta_ctx_.last_cuid = cuid;
                   delta_ctx_.visited_units_for_cuid.clear();
@@ -555,12 +553,10 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   if (became_hot) {
                     hotspot_manager_->EnqueueForInitScan(cuid);
                     delta_ctx_.trigger_scan_as_compaction = false;
-                  } else if (delta_ctx_.is_current_hot &&
-                             read_options_.delta_full_scan) {
+                  } else if (delta_ctx_.is_current_hot && read_options_.delta_full_scan) {
                     // 只有全量扫描且已经是热点（非首次）才触发
                     // Scan-as-Compaction
-                    delta_ctx_.trigger_scan_as_compaction =
-                        hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
+                    delta_ctx_.trigger_scan_as_compaction = hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
                   } else {
                     delta_ctx_.trigger_scan_as_compaction = false;
                   }
@@ -568,13 +564,10 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
 
                 // 维护引用计数
                 if (read_options_.delta_full_scan) {
-                  uint64_t phys_id = GetCurrentPhysUnitId(
-                      iter_.iter());  // 需要确保能获取到底层 FileID
-                  if (delta_ctx_.visited_units_for_cuid.find(phys_id) ==
-                      delta_ctx_.visited_units_for_cuid.end()) {
+                  uint64_t phys_id = GetCurrentPhysUnitId(iter_.iter());
+                  if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
                     // 仅在 Full Scan 时更新
-                    hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(
-                        cuid, phys_id);
+                    hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
                     delta_ctx_.visited_units_for_cuid.insert(phys_id);
                   }
                 }

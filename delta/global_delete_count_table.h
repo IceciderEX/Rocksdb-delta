@@ -53,6 +53,8 @@ class GlobalDeleteCountTable {
                              const std::vector<uint64_t>& input_files,
                              uint64_t output_file);
   
+  void ApplyFlushChange(uint64_t cuid, uint64_t output_file);
+  
   void DecreaseRefCount(uint64_t cuid, uint64_t phys_id, int32_t count = 1);
 
  private:

@@ -75,6 +75,10 @@ class LevelCompactionBuilder {
 
   void SetupInitialFilesDelta();
 
+  void AcceptStartLevelInputs() {
+    compaction_inputs_.push_back(start_level_inputs_);
+  }
+
   // Pick and return a compaction.
   Compaction* PickCompaction();
 
@@ -526,9 +530,9 @@ void LevelCompactionBuilder::SetupInitialFilesDelta() {
 // 选取最老的 N 个文件进行 L0->L0 合并
 bool LevelCompactionBuilder::PickMixedL0Compaction() {
   // 策略阈值
-  const int kL0TriggerCount = 10;      // 触发阈值：SST 数量 >= 20
+  const int kL0TriggerCount = 3;      // 触发阈值：SST 数量 >= 20
   const uint64_t kL0TriggerAge = 3600; // 时间阈值：最老文件超过1h
-  const size_t kFilesToPick = 10;      // 每次合并选取的文件数
+  const size_t kFilesToPick = 3;      // 每次合并选取的最大文件数
 
   // 2. 获取 L0 文件列表
   // TODO: 检查 seqno 排列顺序
@@ -1079,5 +1083,32 @@ Compaction* LevelCompactionPicker::PickCompaction(
                                  mutable_cf_options, ioptions_,
                                  mutable_db_options);
   return builder.PickCompaction();
+}
+
+Compaction* LevelCompactionPicker::PickCompactionForCompactRange(
+    const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+    const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
+    int input_level, int output_level,
+    const CompactRangeOptions& compact_range_options, const InternalKey* begin,
+    const InternalKey* end, InternalKey** compaction_end, bool* manual_conflict,
+    uint64_t max_file_num_to_ignore, const std::string& trim_ts) {
+  if (input_level == 0) {
+    LogBuffer log_buffer(INFO_LEVEL, ioptions_.info_log.get());
+    LevelCompactionBuilder builder(cf_name, vstorage, this, &log_buffer,
+                                   mutable_cf_options, ioptions_,
+                                   mutable_db_options);
+    if (builder.PickMixedL0Compaction()) {
+      builder.AcceptStartLevelInputs();
+      Compaction* c = builder.GetCompaction();
+      log_buffer.FlushBufferToLog();
+      *compaction_end = nullptr;
+      return c;
+    }
+  }
+
+  return CompactionPicker::PickCompactionForCompactRange(
+      cf_name, mutable_cf_options, mutable_db_options, vstorage, input_level,
+      output_level, compact_range_options, begin, end, compaction_end,
+      manual_conflict, max_file_num_to_ignore, trim_ts);
 }
 }  // namespace ROCKSDB_NAMESPACE

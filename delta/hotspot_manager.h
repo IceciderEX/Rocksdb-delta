@@ -123,6 +123,10 @@ class HotspotManager {
                                         output_file_verified);
   }
 
+  void UpdateFlushRefCount(uint64_t cuid, uint64_t output_file) {
+    delete_table_.ApplyFlushChange(cuid, output_file);
+  }
+
   bool GetHotIndexEntry(uint64_t cuid, HotIndexEntry* out_entry) {
     return index_table_.GetEntry(cuid, out_entry);
   }
