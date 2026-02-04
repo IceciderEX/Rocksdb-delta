@@ -29,7 +29,7 @@
 
 using namespace ROCKSDB_NAMESPACE;
 
-const std::string kDBPath = "/home/wam/HWKV/Rocksdb-delta/db_tmp";
+const std::string kDBPath = "/home/wam/Rocksdb-delta/db_tmp";
 
 // ==========================================
 // 辅助工具函数
@@ -233,22 +233,6 @@ int main() {
   int partial_rows = PerformPartialScan(db, CUID_PARTIAL, 100, 200);
   std::cout << "Partial scan found: " << partial_rows << " rows" << std::endl;
 
-  // 检查是否有 pending partial merge 任务
-  bool has_pending = hotspot_mgr->HasPendingPartialMerge();
-  std::cout << "Has pending partial merge: " << (has_pending ? "YES" : "NO")
-            << std::endl;
-
-  // 如果有待处理任务，手动执行
-  if (has_pending) {
-    std::cout << "Executing ProcessPendingPartialMerge()..." << std::endl;
-    db_impl->ProcessPendingPartialMerge();
-
-    // 验证执行后状态
-    hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
-    std::cout << "After merge - Snapshot segments: "
-              << entry.snapshot_segments.size() << std::endl;
-    std::cout << "After merge - Deltas: " << entry.deltas.size() << std::endl;
-  }
 
   // =================================================================
   // 测试 4: 验证数据完整性
@@ -275,11 +259,6 @@ int main() {
     int rows = PerformPartialScan(db, CUID_PARTIAL, start, end);
     std::cout << "Partial scan [" << start << ", " << end << "]: " << rows
               << " rows" << std::endl;
-  }
-
-  // 处理所有 pending 任务
-  while (hotspot_mgr->HasPendingPartialMerge()) {
-    db_impl->ProcessPendingPartialMerge();
   }
 
   // 最终数据验证

@@ -161,16 +161,40 @@ class DBIter final : public Iterator {
     iter_.DeleteIter(arena_mode_);
     ThreadStatusUtil::SetThreadOperation(cur_op_type);
 
-    if (hotspot_manager_ && delta_ctx_.last_cuid != 0 &&
+    // if (hotspot_manager_ && delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
+    //   hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+    // }
+
+    if (hotspot_manager_ && delta_ctx_.last_cuid != 0 && 
         delta_ctx_.trigger_scan_as_compaction) {
-      hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+      auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
+          delta_ctx_.last_cuid, read_options_.delta_full_scan,
+          delta_ctx_.scan_first_key, delta_ctx_.scan_last_key);
+
+      hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
+          delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
+          delta_ctx_.scan_last_key);
     }
 
-    // for delta: 在 scan 结束时处理待初始化的热点 CUID
-    if (cfh_ && hotspot_manager_ && hotspot_manager_->HasPendingInitCuids()) {
+    // for delta: 异步补全元数据 (当热路径 Full Scan 结束时入队)
+    if (hotspot_manager_ && read_options_.delta_full_scan &&
+        delta_ctx_.is_current_hot) {
+      hotspot_manager_->EnqueueMetadataScan(delta_ctx_.last_cuid);
+    }
+
+    // for delta: 在 scan 结束时处理待执行的后台 tasks
+    if (cfh_ && hotspot_manager_) {
       auto db_impl = static_cast<DBImpl*>(cfh_->db());
       if (db_impl) {
-        db_impl->ProcessPendingHotCuids();
+        if (hotspot_manager_->HasPendingInitCuids()) {
+          db_impl->ProcessPendingHotCuids();
+        }
+        if (hotspot_manager_->HasPendingMetadataScans()) {
+          db_impl->ProcessPendingMetadataScans();
+        }
+        if (hotspot_manager_->HasPendingPartialMerge()) {
+          db_impl->ProcessPendingPartialMerge();
+        }
       }
     }
   }

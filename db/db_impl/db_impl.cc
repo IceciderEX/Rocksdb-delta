@@ -7015,6 +7015,67 @@ void DBImpl::ProcessPendingHotCuids() {
   }
 }
 
+void DBImpl::ProcessPendingMetadataScans() {
+  if (!hotspot_manager_) {
+    return;
+  }
+
+  std::vector<uint64_t> pending_cuids =
+      hotspot_manager_->PopPendingMetadataScans();
+  if (pending_cuids.empty()) {
+    return;
+  }
+
+  fprintf(
+      stdout,
+      "[DBImpl] Processing %zu pending CUIDs for background metadata scan\n",
+      pending_cuids.size());
+
+  for (uint64_t cuid : pending_cuids) {
+    // 构造扫描范围
+    std::string start_key(40, '\0');
+    unsigned char* p = reinterpret_cast<unsigned char*>(&start_key[16]);
+    for (int i = 0; i < 8; ++i) {
+      p[i] = (cuid >> (56 - 8 * i)) & 0xFF;  // Big Endian
+    }
+
+    uint64_t cuid_plus_one = cuid + 1;
+    std::string upper_bound_key(40, '\0');
+    unsigned char* q = reinterpret_cast<unsigned char*>(&upper_bound_key[16]);
+    for (int i = 0; i < 8; ++i) {
+      q[i] = (cuid_plus_one >> (56 - 8 * i)) & 0xFF;  // Big Endian
+    }
+
+    ReadOptions read_opts;
+    read_opts.delta_full_scan = true;
+    read_opts.skip_hot_path = true;  // 强制走 Cold Path
+    Slice upper_bound_slice(upper_bound_key);
+    read_opts.iterate_upper_bound = &upper_bound_slice;
+    ColumnFamilyHandle* cfh = DefaultColumnFamily();
+    if (!cfh) {
+      continue;
+    }
+
+    std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
+    Slice start_slice(start_key);
+    size_t count = 0;
+
+    for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
+      count++;
+    }
+
+    if (!iter->status().ok()) {
+      fprintf(stderr, "[DBImpl] Metadata scan error for CUID %lu: %s\n", cuid,
+              iter->status().ToString().c_str());
+    } else {
+      fprintf(stdout,
+              "[DBImpl] Completed background metadata scan for CUID %lu, %zu "
+              "entries tracked\n",
+              cuid, count);
+    }
+  }
+}
+
 // 处理 Partial Merge 任务
 void DBImpl::ProcessPendingPartialMerge() {
   if (!hotspot_manager_) {

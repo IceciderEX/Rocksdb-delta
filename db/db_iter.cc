@@ -539,10 +539,27 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                 if (delta_ctx_.last_cuid != cuid) {
                   // 将上个 cuid 的 Scan-as-Compaction 结果提交
                   if (delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
-                    hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+                      // hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+                      // 将上个 cuid 的 Scan-as-Compaction 结果提交
+                      auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
+                              delta_ctx_.last_cuid, read_options_.delta_full_scan,
+                              delta_ctx_.scan_first_key,
+                              delta_ctx_.scan_last_key);
+
+                      hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
+                          delta_ctx_.last_cuid, strategy,
+                          delta_ctx_.scan_first_key, delta_ctx_.scan_last_key);
                   }
+
+                  // fullscan 需要进行一次coldpath，更新GDCT
+                  if (read_options_.delta_full_scan && delta_ctx_.is_current_hot && delta_ctx_.last_cuid != 0) {
+                    hotspot_manager_->EnqueueMetadataScan(delta_ctx_.last_cuid);
+                  }
+
                   delta_ctx_.last_cuid = cuid;
                   delta_ctx_.visited_units_for_cuid.clear();
+                  delta_ctx_.scan_first_key.clear();
+                  delta_ctx_.scan_last_key.clear();
 
                   // 对这个 cuid 进行一次访问计数，用于判断是否为热点
                   bool became_hot = false;
@@ -575,9 +592,9 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
 
                 // 将 scan数据送入热点 Buffer
                 if (delta_ctx_.trigger_scan_as_compaction) {
-                  InternalKey temp_internal_key(saved_key_.GetUserKey(),
-                                                ikey_.sequence, ikey_.type);
+                  InternalKey temp_internal_key(saved_key_.GetUserKey(), ikey_.sequence, ikey_.type);
                   std::string key_str = temp_internal_key.Encode().ToString();
+                  // std::string ukey_str = saved_key_.GetUserKey().ToString();
 
                   // 记录 scan 的 key 范围
                   if (delta_ctx_.scan_first_key.empty()) {

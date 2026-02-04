@@ -327,7 +327,7 @@ ScanAsCompactionStrategy HotspotManager::EvaluateScanAsCompactionStrategy(
   // 全版本 Scan 使用 FullReplace 策略
   if (is_full_scan) {
     if (out_involved_delta_count) {
-      *out_involved_delta_count = 0;  // 全版本不需要统计
+      *out_involved_delta_count = 0;
     }
     return ScanAsCompactionStrategy::kFullReplace;
   }
@@ -436,6 +436,31 @@ std::vector<uint64_t> HotspotManager::PopPendingInitCuids() {
 bool HotspotManager::HasPendingInitCuids() const {
   std::lock_guard<std::mutex> lock(pending_init_mutex_);
   return !pending_init_cuids_.empty();
+}
+
+// --------------------- Metadata Scan Queue --------------------- //
+void HotspotManager::EnqueueMetadataScan(uint64_t cuid) {
+  std::lock_guard<std::mutex> lock(pending_metadata_mutex_);
+  // 避免重复添加
+  for (uint64_t c : pending_metadata_scans_) {
+    if (c == cuid) return;
+  }
+  pending_metadata_scans_.push_back(cuid);
+  fprintf(stdout,
+          "[HotspotManager] Enqueued CUID %lu for metadata ref-count scan\n",
+          cuid);
+}
+
+std::vector<uint64_t> HotspotManager::PopPendingMetadataScans() {
+  std::lock_guard<std::mutex> lock(pending_metadata_mutex_);
+  std::vector<uint64_t> result = std::move(pending_metadata_scans_);
+  pending_metadata_scans_.clear();
+  return result;
+}
+
+bool HotspotManager::HasPendingMetadataScans() const {
+  std::lock_guard<std::mutex> lock(pending_metadata_mutex_);
+  return !pending_metadata_scans_.empty();
 }
 
 // --------------------- Partial Merge Queue --------------------- //

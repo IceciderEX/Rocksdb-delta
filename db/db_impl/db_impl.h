@@ -3207,6 +3207,7 @@ class DBImpl : public DB {
   public: std::shared_ptr<HotspotManager> GetHotspotManager() { return hotspot_manager_; }
 
   void ProcessPendingHotCuids();
+  void ProcessPendingMetadataScans();
   void ProcessPendingPartialMerge();
 };
 

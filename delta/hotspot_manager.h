@@ -153,6 +153,15 @@ class HotspotManager {
   // 检查是否有待处理的初始化任务
   bool HasPendingInitCuids() const;
 
+    // 将 CUID 加入待补全元数据的扫描队列
+  void EnqueueMetadataScan(uint64_t cuid);
+
+  // 获取并清空待补全元数据的扫描队列
+  std::vector<uint64_t> PopPendingMetadataScans();
+
+  // 检查是否有待处理的物理单元计数扫描任务
+  bool HasPendingMetadataScans() const;
+
   void DebugDump(const std::string& label) {
     std::string dump_file =
         "/home/wam/HWKV/rocksdb-delta/build/a_test_db/a_mgr.log";
@@ -177,6 +186,9 @@ class HotspotManager {
   std::unordered_set<uint64_t> active_buffered_cuids_;
   std::mutex buffered_cuids_mutex_;
 
+  // 待补全物理 ID 计数的扫描队列
+  std::vector<uint64_t> pending_metadata_scans_;
+  mutable std::mutex pending_metadata_mutex_;
   // 待初始化全量扫描的 CUID 队列
   std::vector<uint64_t> pending_init_cuids_;
   mutable std::mutex pending_init_mutex_;
