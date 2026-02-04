@@ -565,7 +565,8 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                 // 维护引用计数
                 if (read_options_.delta_full_scan) {
                   uint64_t phys_id = GetCurrentPhysUnitId(iter_.iter());
-                  if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
+                  // 排除：phys_id=0（热点存储区的数据）+重复scan
+                  if (phys_id != 0 && delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
                     // 仅在 Full Scan 时更新
                     hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
                     delta_ctx_.visited_units_for_cuid.insert(phys_id);

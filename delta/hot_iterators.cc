@@ -94,6 +94,9 @@ void HotDeltaIterator::Prev() { merging_iter_->Prev(); }
 Slice HotDeltaIterator::key() const { return merging_iter_->key(); }
 Slice HotDeltaIterator::value() const { return merging_iter_->value(); }
 Status HotDeltaIterator::status() const { return merging_iter_->status(); }
+uint64_t HotDeltaIterator::GetPhysicalId() {
+  return merging_iter_->GetPhysicalId();
+}
 
 
 // ====================== HotSnapshotIterator ============================
@@ -269,6 +272,11 @@ void HotSnapshotIterator::SeekForPrev(const Slice& target) {
     }
 }
 
+uint64_t HotSnapshotIterator::GetPhysicalId() {
+  if (current_iter_) return current_iter_->GetPhysicalId();
+  return 0;
+}
+
 // ===================================================================
 // DeltaSwitchingIterator Implementation
 // ===================================================================
@@ -368,7 +376,7 @@ void DeltaSwitchingIterator::Seek(const Slice& target) {
 
   bool use_hot = false;
   // hot cuid
-  if (!read_options_.skip_hot_path && cuid != 0 && hotspot_manager_->IsHot(cuid)) {
+  if (!read_options_.skip_hot_path && !read_options_.delta_full_scan && cuid != 0 && hotspot_manager_->IsHot(cuid)) {
      use_hot = true;
   }
 
@@ -428,6 +436,10 @@ Status DeltaSwitchingIterator::status() const {
 bool DeltaSwitchingIterator::PrepareValue() {
     if (current_iter_) return current_iter_->PrepareValue();
     return false;
+}
+uint64_t DeltaSwitchingIterator::GetPhysicalId() {
+  if (current_iter_) return current_iter_->GetPhysicalId();
+  return 0;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

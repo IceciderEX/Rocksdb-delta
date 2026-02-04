@@ -40,6 +40,7 @@ class HotDeltaIterator : public InternalIterator {
   Slice value() const override;
   Status status() const override;
   bool PrepareValue() override { return merging_iter_->PrepareValue(); }
+  uint64_t GetPhysicalId() override;
 
  private:
   InternalIterator* merging_iter_;
@@ -75,6 +76,7 @@ class HotSnapshotIterator : public InternalIterator {
   Slice key() const override;
   Slice value() const override;
   Status status() const override;
+  uint64_t GetPhysicalId() override;
 
  private:
   // 初始化特定 index 的 segment iterator
@@ -131,6 +133,7 @@ class DeltaSwitchingIterator : public InternalIterator {
   Slice value() const override;
   Status status() const override;
   bool PrepareValue() override;
+  uint64_t GetPhysicalId() override;
 
  private:
   // 初始化冷数据迭代器 (Standard RocksDB Path)

@@ -133,11 +133,10 @@ class HotDataBufferIterator : public InternalIterator {
   }
 
   void Seek(const Slice& target) override {
+    // seek to the first entry with key >= target
     auto it = std::lower_bound(entries_.begin(), entries_.end(), target,
                                [this](const HotEntry& entry, const Slice& val) {
                                  if (this->icmp_) {
-                                     // icmp->Compare(a, b) < 0 意味着 a < b
-                                     // 注意：Slice(entry.key) 构造开销极小
                                      return this->icmp_->Compare(entry.key, val) < 0;
                                  } else {
                                      return entry.key < val.ToString();
@@ -168,6 +167,7 @@ class HotDataBufferIterator : public InternalIterator {
   }
 
   void Next() override {
+    // idx++
     if (idx_ < entries_.size()) {
       idx_++;
     }
@@ -177,7 +177,6 @@ class HotDataBufferIterator : public InternalIterator {
     if (idx_ > 0) {
       idx_--;
     } else {
-      // RocksDB 语义：Prev 越界后变为 Invalid
       idx_ = entries_.size();
     }
   }
@@ -195,6 +194,8 @@ class HotDataBufferIterator : public InternalIterator {
   Status status() const override {
     return Status::OK();
   }
+
+  uint64_t GetPhysicalId() override { return 0; }
 
  private:
   std::vector<HotEntry> entries_;
@@ -241,6 +242,7 @@ InternalIterator* HotDataBuffer::NewIterator(uint64_t cuid, const InternalKeyCom
   
   std::vector<HotEntry> filtered_entries;
 
+  // todo：这里的性能优化
   // Immutable Queue
   for (const auto& block : immutable_queue_) {
       // 遍历队列中的每个 Block

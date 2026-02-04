@@ -532,7 +532,7 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
   // 策略阈值
   const int kL0TriggerCount = 3;      // 触发阈值：SST 数量 >= 20
   const uint64_t kL0TriggerAge = 3600; // 时间阈值：最老文件超过1h
-  const size_t kFilesToPick = 3;      // 每次合并选取的最大文件数
+  const size_t kFilesToPick = 10;      // 每次合并选取的最大文件数
 
   // 2. 获取 L0 文件列表
   // TODO: 检查 seqno 排列顺序

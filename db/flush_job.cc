@@ -1089,10 +1089,10 @@ Status FlushJob::WriteLevel0Table() {
             uint64_t cuid = kv.first;
             const DataSegment& seg = kv.second;
 
-            // GDCT的更新
-            if (seg.Valid()) {
-              db_options_.hotspot_manager->UpdateFlushRefCount(cuid, file_number);
-            }
+            // GDCT的更新（暂时不需要，假设最后一次全版本scan之后没有newdata）
+            // if (seg.Valid()) {
+            //   db_options_.hotspot_manager->UpdateFlushRefCount(cuid, file_number);
+            // }
             
             // 当 CUID 已经是热点时，才记录索引
             if (seg.Valid() && db_options_.hotspot_manager->IsHot(cuid)) {

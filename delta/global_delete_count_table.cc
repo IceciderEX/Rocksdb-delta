@@ -140,7 +140,6 @@ void GlobalDeleteCountTable::ApplyFlushChange(uint64_t cuid,
   if (pos != entry.tracked_phys_ids.end() && *pos == 0) {
     // 移除占位的 Memtable ID
     entry.tracked_phys_ids.erase(pos);
-    // 添加实际生成的 SST ID
     auto out_pos = std::lower_bound(entry.tracked_phys_ids.begin(),
                                     entry.tracked_phys_ids.end(), output_file);
     if (out_pos == entry.tracked_phys_ids.end() || *out_pos != output_file) {

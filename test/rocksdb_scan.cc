@@ -292,6 +292,8 @@ int main() {
   // =================================================================
   std::cout << "\n>>> TEST 6: L0 Compaction Index Update <<<\n";
 
+  int rows = PerformFullScan(db, CUID_PARTIAL);
+
   // 记录 Compaction 前的 Delta 状态
   hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
   size_t deltas_before = entry.deltas.size();
