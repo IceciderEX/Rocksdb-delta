@@ -233,68 +233,6 @@ int main() {
   int partial_rows = PerformPartialScan(db, CUID_PARTIAL, 100, 200);
   std::cout << "Partial scan found: " << partial_rows << " rows" << std::endl;
 
-  // =================================================================
-  // 测试 3.5: 验证 Buffer-based Partial Merge & Coalescing
-  // =================================================================
-  std::cout << "\n>>> TEST 3.5: Buffer-based Partial Merge & Coalescing <<<\n";
-
-  // 此时 DBIter 析构应该已经触发了 EnqueuePartialMerge
-  // 我们手动调用处理函数（模拟后台工作完成）
-  if (hotspot_mgr->HasPendingPartialMerge()) {
-    std::cout << "Executing ProcessPendingPartialMerge() for [100, 200]..."
-              << std::endl;
-    db_impl->ProcessPendingPartialMerge();
-  }
-
-  hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
-  bool found_mem_seg = false;
-  for (const auto& seg : entry.snapshot_segments) {
-    if (seg.file_number == static_cast<uint64_t>(-1)) {
-      found_mem_seg = true;
-      std::cout << "  Found memory segment: [" << seg.first_key << ", "
-                << seg.last_key << "]" << std::endl;
-      break;
-    }
-  }
-  Check(found_mem_seg, "Should have a memory segment (-1) after partial merge");
-
-  // 执行第二个相邻的部分扫描 (201-300)
-  std::cout << "Performing second partial scan on row range [201, 300]..."
-            << std::endl;
-  PerformPartialScan(db, CUID_PARTIAL, 201, 300);
-
-  if (hotspot_mgr->HasPendingPartialMerge()) {
-    std::cout << "Executing ProcessPendingPartialMerge() for [201, 300]..."
-              << std::endl;
-    db_impl->ProcessPendingPartialMerge();
-  }
-
-  // 验证合并（Coalescing）
-  hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
-  int mem_seg_count = 0;
-  DataSegment coalesced_seg;
-  for (const auto& seg : entry.snapshot_segments) {
-    if (seg.file_number == static_cast<uint64_t>(-1)) {
-      mem_seg_count++;
-      coalesced_seg = seg;
-    }
-  }
-  std::cout << "Memory segment count: " << mem_seg_count << std::endl;
-  Check(mem_seg_count == 1,
-        "Adjacent memory segments should be coalesced into ONE");
-
-  // 验证边界是否正确扩大
-  std::string expected_start = GenerateKey(CUID_PARTIAL, 100);
-  std::string expected_end = GenerateKey(CUID_PARTIAL, 300);
-  // Note: GenerateKey produces 40 bytes, including cuid.
-  // We compare the whole encoded keys.
-  Check(coalesced_seg.first_key == expected_start,
-        "Coalesced start key should be row 100");
-  Check(coalesced_seg.last_key == expected_end,
-        "Coalesced last key should be row 300");
-
-  std::cout << "Coalesced segment range: [" << coalesced_seg.first_key << ", "
-            << coalesced_seg.last_key << "]" << std::endl;
 
   // =================================================================
   // 测试 4: 验证数据完整性

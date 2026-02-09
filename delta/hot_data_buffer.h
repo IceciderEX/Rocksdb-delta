@@ -1,15 +1,16 @@
 #pragma once
 
-#include <vector>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <unordered_map>
-#include <mutex>
-#include <deque>
-#include "rocksdb/slice.h"
-#include "rocksdb/rocksdb_namespace.h"
-#include "rocksdb/status.h"
+#include <vector>
+
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 #include "table/internal_iterator.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -19,11 +20,9 @@ struct HotEntry {
   std::string key;
   std::string value;
   // uint64_t seq;
-  
+
   // 用于排序
-  bool operator<(const HotEntry& other) const {
-    return key < other.key; 
-  }
+  bool operator<(const HotEntry& other) const { return key < other.key; }
 };
 
 // buffer block
@@ -31,7 +30,7 @@ struct HotDataBlock {
   std::vector<HotEntry> entries;
   size_t current_size_bytes = 0;
   std::unordered_map<uint64_t, std::pair<std::string, std::string>> bounds;
-  
+
   void Add(uint64_t c, const Slice& k, const Slice& v) {
     std::string k_str = k.ToString();
     std::string v_str = v.ToString();
@@ -40,14 +39,14 @@ struct HotDataBlock {
 
     auto it = bounds.find(c);
     if (it == bounds.end()) {
-        bounds[c] = {k_str, k_str};
+      bounds[c] = {k_str, k_str};
     } else {
-        if (k_str < it->second.first) it->second.first = k_str;
-        if (k_str > it->second.second) it->second.second = k_str;
+      if (k_str < it->second.first) it->second.first = k_str;
+      if (k_str > it->second.second) it->second.second = k_str;
     }
   }
-  
-  void Sort(); // 按 CUID, Key 排序
+
+  void Sort();  // 按 CUID, Key 排序
 
   void Clear() {
     entries.clear();
@@ -56,11 +55,12 @@ struct HotDataBlock {
   }
 };
 
-
 class HotDataBuffer {
  public:
-  // explicit HotDataBuffer(size_t threshold_bytes = 64 * 1024 * 1024); // 默认 64MB
-  explicit HotDataBuffer(size_t threshold_bytes = 1 * 1024 * 1024); // 先用 1MB 测试
+  // explicit HotDataBuffer(size_t threshold_bytes = 64 * 1024 * 1024); // 默认
+  // 64MB
+  explicit HotDataBuffer(size_t threshold_bytes = 1 * 1024 *
+                                                  1024);  // 先用 1MB 测试
 
   // 将数据追加到对应 CUID 的 buffer 中
   // 如果 buffer 大小超过阈值，返回 true (need Flush)
@@ -75,10 +75,12 @@ class HotDataBuffer {
 
   size_t GetTotalBufferedSize() const { return total_buffered_size_; }
 
-  bool GetBoundaryKeys(uint64_t cuid, std::string* min_key, std::string* max_key);
+  bool GetBoundaryKeys(uint64_t cuid, std::string* min_key,
+                       std::string* max_key);
 
   // for reading
-  InternalIterator* NewIterator(uint64_t cuid, const InternalKeyComparator* icmp);
+  InternalIterator* NewIterator(uint64_t cuid,
+                                const InternalKeyComparator* icmp);
 
  private:
   // flush threshold
@@ -107,12 +109,12 @@ class HotSstLifecycleManager {
  private:
   Env* env_;
   std::mutex mutex_;
-  
+
   struct FileState {
     std::string file_path;
     int ref_count;
   };
-  
+
   std::unordered_map<uint64_t, FileState> files_;
 };
 

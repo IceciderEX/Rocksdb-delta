@@ -283,12 +283,33 @@ void HotIndexTable::ReplaceOverlappingSegments(
     }
 
     // insert new_segment
-    auto insert_pos =
+    auto it_insert_pos =
         std::upper_bound(snapshots.begin(), snapshots.end(), new_segment,
                          [](const DataSegment& a, const DataSegment& b) {
                            return a.first_key < b.first_key;
                          });
-    snapshots.insert(insert_pos, new_segment);
+    auto insert_pos = snapshots.insert(it_insert_pos, new_segment);
+
+    // 合并相邻的内存段 (-1)
+    if (new_segment.file_number == static_cast<uint64_t>(-1)) {
+      // 检查前一个
+      if (insert_pos != snapshots.begin()) {
+        auto prev = std::prev(insert_pos);
+        if (prev->file_number == static_cast<uint64_t>(-1)) {
+          insert_pos->first_key = prev->first_key;
+          snapshots.erase(prev);
+          // erase 后 insert_pos 依然指向插入的那个元素
+        }
+      }
+      // 检查后一个
+      auto next = std::next(insert_pos);
+      if (next != snapshots.end()) {
+        if (next->file_number == static_cast<uint64_t>(-1)) {
+          insert_pos->last_key = next->last_key;
+          snapshots.erase(next);
+        }
+      }
+    }
 
     if (!obsolete_delta_files.empty()) {
       auto& deltas = entry.deltas;
@@ -311,7 +332,9 @@ void HotIndexTable::ReplaceOverlappingSegments(
   }  // Unlock
 
   if (lifecycle_manager_) {
-    lifecycle_manager_->Ref(new_segment.file_number);
+    if (new_segment.file_number != static_cast<uint64_t>(-1)) {
+      lifecycle_manager_->Ref(new_segment.file_number);
+    }
     for (const auto& seg : segments_to_unref) {
       lifecycle_manager_->Unref(seg.file_number);
     }

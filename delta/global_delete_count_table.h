@@ -1,11 +1,12 @@
 // delta/global_delete_count_table.h
 
 #pragma once
-#include <unordered_map>
-#include <shared_mutex>
 #include <mutex>
-#include <vector>
+#include <shared_mutex>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
+
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -15,9 +16,7 @@ struct GDCTEntry {
   int32_t ref_count = 0;
   bool is_deleted = false;
 
-  int GetRefCount() const { 
-    return ref_count; 
-  }
+  int GetRefCount() const { return ref_count; }
 };
 
 class GlobalDeleteCountTable {
@@ -48,13 +47,13 @@ class GlobalDeleteCountTable {
 
   int GetRefCount(uint64_t cuid) const;
 
-  void ApplyCompactionChange(uint64_t cuid, 
-                             int32_t input_count, int32_t output_count,
+  void ApplyCompactionChange(uint64_t cuid, int32_t input_count,
+                             int32_t output_count,
                              const std::vector<uint64_t>& input_files,
                              uint64_t output_file);
-  
+
   void ApplyFlushChange(uint64_t cuid, uint64_t output_file);
-  
+
   void DecreaseRefCount(uint64_t cuid, uint64_t phys_id, int32_t count = 1);
 
  private:
@@ -62,4 +61,4 @@ class GlobalDeleteCountTable {
   std::unordered_map<uint64_t, GDCTEntry> table_;
 };
 
-} // namespace ROCKSDB_NAMESPACE
+}  // namespace ROCKSDB_NAMESPACE

@@ -201,9 +201,6 @@ class HotspotManager {
   void EnqueuePartialMerge(uint64_t cuid, const std::string& scan_first_key,
                            const std::string& scan_last_key);
 
-  // 处理 Partial Merge 任务 (后台调用)
-  void ProcessPartialMerge();
-
   // 检查是否有待处理的 Partial Merge 任务
   bool HasPendingPartialMerge() const;
 

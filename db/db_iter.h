@@ -165,7 +165,7 @@ class DBIter final : public Iterator {
     //   hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
     // }
 
-    if (hotspot_manager_ && delta_ctx_.last_cuid != 0 && 
+    if (hotspot_manager_ && delta_ctx_.last_cuid != 0 &&
         delta_ctx_.trigger_scan_as_compaction) {
       auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
           delta_ctx_.last_cuid, read_options_.delta_full_scan,
@@ -177,8 +177,9 @@ class DBIter final : public Iterator {
     }
 
     // for delta: 异步补全元数据 (当热路径 Full Scan 结束时入队)
+    // 关键：只有非后台扫描 (!skip_hot_path) 才允许触发下一次扫描，防止无限递归
     if (hotspot_manager_ && read_options_.delta_full_scan &&
-        delta_ctx_.is_current_hot) {
+        delta_ctx_.is_current_hot && !read_options_.skip_hot_path) {
       hotspot_manager_->EnqueueMetadataScan(delta_ctx_.last_cuid);
     }
 

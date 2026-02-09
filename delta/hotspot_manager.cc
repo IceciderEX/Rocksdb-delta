@@ -441,7 +441,6 @@ bool HotspotManager::HasPendingInitCuids() const {
 // --------------------- Metadata Scan Queue --------------------- //
 void HotspotManager::EnqueueMetadataScan(uint64_t cuid) {
   std::lock_guard<std::mutex> lock(pending_metadata_mutex_);
-  // 避免重复添加
   for (uint64_t c : pending_metadata_scans_) {
     if (c == cuid) return;
   }
@@ -478,44 +477,6 @@ void HotspotManager::EnqueuePartialMerge(uint64_t cuid,
       stdout,
       "[HotspotManager] Enqueued PartialMerge for CUID %lu, range [%zu, %zu]\n",
       cuid, scan_first_key.size(), scan_last_key.size());
-}
-
-void HotspotManager::ProcessPartialMerge() {
-  PartialMergePendingTask task;
-  {
-    std::lock_guard<std::mutex> lock(partial_merge_mutex_);
-    if (partial_merge_queue_.empty()) return;
-    task = std::move(partial_merge_queue_.front());
-    partial_merge_queue_.pop_front();
-  }
-
-  // 获取重叠的 segments
-  std::vector<DataSegment> overlapping_snaps, overlapping_deltas;
-  index_table_.GetOverlappingSegments(task.cuid, task.scan_first_key,
-                                      task.scan_last_key, &overlapping_snaps,
-                                      &overlapping_deltas);
-
-  // 如果没有重叠数据，使用 FullReplace 逻辑
-  if (overlapping_snaps.empty() && overlapping_deltas.empty()) {
-    FinalizeScanAsCompaction(task.cuid);
-    return;
-  }
-
-  // TODO: 实现完整的归并逻辑
-  // 1. 创建 HotSnapshotIterator 读取 overlapping_snaps
-  // 2. 创建 HotDeltaIterator 读取 overlapping_deltas
-  // 3. 创建 BufferIterator 读取新扫描数据
-  // 4. 使用 MergingIterator 归并三路
-  // 5. 写入新 SST
-  // 6. 调用 ReplaceOverlappingSegments()
-
-  fprintf(stdout,
-          "[HotspotManager] ProcessPartialMerge for CUID %lu: "
-          "found %zu overlapping snapshots, %zu overlapping deltas\n",
-          task.cuid, overlapping_snaps.size(), overlapping_deltas.size());
-
-  // 暂时使用 FullReplace 作为 fallback
-  FinalizeScanAsCompaction(task.cuid);
 }
 
 bool HotspotManager::HasPendingPartialMerge() const {

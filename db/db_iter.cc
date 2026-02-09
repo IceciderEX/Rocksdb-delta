@@ -538,21 +538,24 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                 // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
                 if (delta_ctx_.last_cuid != cuid) {
                   // 将上个 cuid 的 Scan-as-Compaction 结果提交
-                  if (delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
-                      // hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
-                      // 将上个 cuid 的 Scan-as-Compaction 结果提交
-                      auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
-                              delta_ctx_.last_cuid, read_options_.delta_full_scan,
-                              delta_ctx_.scan_first_key,
-                              delta_ctx_.scan_last_key);
+                  if (delta_ctx_.last_cuid != 0 &&
+                      delta_ctx_.trigger_scan_as_compaction) {
+                    // hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+                    // 将上个 cuid 的 Scan-as-Compaction 结果提交
+                    auto strategy =
+                        hotspot_manager_->EvaluateScanAsCompactionStrategy(
+                            delta_ctx_.last_cuid, read_options_.delta_full_scan,
+                            delta_ctx_.scan_first_key,
+                            delta_ctx_.scan_last_key);
 
-                      hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
-                          delta_ctx_.last_cuid, strategy,
-                          delta_ctx_.scan_first_key, delta_ctx_.scan_last_key);
+                    hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
+                        delta_ctx_.last_cuid, strategy,
+                        delta_ctx_.scan_first_key, delta_ctx_.scan_last_key);
                   }
 
                   // fullscan 需要进行一次coldpath，更新GDCT
-                  if (read_options_.delta_full_scan && delta_ctx_.is_current_hot && delta_ctx_.last_cuid != 0) {
+                  if (read_options_.delta_full_scan &&
+                      delta_ctx_.is_current_hot && delta_ctx_.last_cuid != 0) {
                     hotspot_manager_->EnqueueMetadataScan(delta_ctx_.last_cuid);
                   }
 
@@ -570,10 +573,12 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   if (became_hot) {
                     hotspot_manager_->EnqueueForInitScan(cuid);
                     delta_ctx_.trigger_scan_as_compaction = false;
-                  } else if (delta_ctx_.is_current_hot && read_options_.delta_full_scan) {
+                  } else if (delta_ctx_.is_current_hot &&
+                             read_options_.delta_full_scan) {
                     // 只有全量扫描且已经是热点（非首次）才触发
                     // Scan-as-Compaction
-                    delta_ctx_.trigger_scan_as_compaction = hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
+                    delta_ctx_.trigger_scan_as_compaction =
+                        hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
                   } else {
                     delta_ctx_.trigger_scan_as_compaction = false;
                   }
@@ -583,16 +588,20 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                 if (read_options_.delta_full_scan) {
                   uint64_t phys_id = GetCurrentPhysUnitId(iter_.iter());
                   // 排除：phys_id=0（热点存储区的数据）+重复scan
-                  if (phys_id != 0 && delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
+                  if (phys_id != 0 &&
+                      delta_ctx_.visited_units_for_cuid.find(phys_id) ==
+                          delta_ctx_.visited_units_for_cuid.end()) {
                     // 仅在 Full Scan 时更新
-                    hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
+                    hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(
+                        cuid, phys_id);
                     delta_ctx_.visited_units_for_cuid.insert(phys_id);
                   }
                 }
 
                 // 将 scan数据送入热点 Buffer
                 if (delta_ctx_.trigger_scan_as_compaction) {
-                  InternalKey temp_internal_key(saved_key_.GetUserKey(), ikey_.sequence, ikey_.type);
+                  InternalKey temp_internal_key(saved_key_.GetUserKey(),
+                                                ikey_.sequence, ikey_.type);
                   std::string key_str = temp_internal_key.Encode().ToString();
                   // std::string ukey_str = saved_key_.GetUserKey().ToString();
 

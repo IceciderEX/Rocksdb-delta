@@ -284,9 +284,10 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   ColumnFamilyOptions default_cf_opts;
   Options hotspot_opts(initial_db_options_, default_cf_opts);
 
-  hotspot_manager_ = std::make_shared<HotspotManager>(hotspot_opts, hotspot_dir);
+  hotspot_manager_ =
+      std::make_shared<HotspotManager>(hotspot_opts, hotspot_dir);
   immutable_db_options_.hotspot_manager = hotspot_manager_;
-  //immutable_db_options_.hotspot_manager = hotspot_manager_;
+  // immutable_db_options_.hotspot_manager = hotspot_manager_;
 
   ROCKS_LOG_INFO(immutable_db_options_.info_log,
                  "HotspotManager initialized at DBImpl%s", hotspot_dir.c_str());
@@ -6999,7 +7000,7 @@ void DBImpl::ProcessPendingHotCuids() {
     std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
     Slice start_slice(start_key);
     size_t count = 0;
-    
+
     for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
       count++;
     }
@@ -7137,7 +7138,7 @@ void DBImpl::ProcessPendingPartialMerge() {
     children.push_back(delta_iter);
   }
 
-  // 3. Buffer Iterator (新扫描数据)
+  // 3. Buffer Iterator 
   InternalIterator* buffer_iter =
       hotspot_manager_->NewBufferIterator(task.cuid, &icmp);
   if (buffer_iter) {
@@ -7153,52 +7154,26 @@ void DBImpl::ProcessPendingPartialMerge() {
   InternalIterator* merging_iter = NewMergingIterator(
       &icmp, children.data(), static_cast<int>(children.size()));
 
-  // 写入新 SST
-  EnvOptions env_options;
-  auto db_opts = immutable_db_options_;
-  Options opts(BuildDBOptions(db_opts, mutable_db_options_),
-               cfd->GetLatestCFOptions());
-  SstFileWriter sst_writer(env_options, opts);
-
-  auto now = std::chrono::system_clock::now();
-  uint64_t file_number = std::chrono::duration_cast<std::chrono::microseconds>(
-                             now.time_since_epoch())
-                             .count();
-  std::string data_dir = hotspot_manager_->GetDataDir();
-  std::string file_path =
-      data_dir + "/hot_merged_" + std::to_string(file_number) + ".sst";
-
-  Status s = sst_writer.Open(file_path);
-  if (!s.ok()) {
-    fprintf(stderr, "[DBImpl] Failed to open SST for merge: %s\n",
-            s.ToString().c_str());
-    delete merging_iter;
-    ReturnAndCleanupSuperVersion(cfd, sv);
-    return;
-  }
-
-  // 遍历归并并写入，去重
+  // 遍历归并并写入 Buffer，去重
   std::string last_user_key;
   std::string segment_first_key, segment_last_key;
   size_t written_count = 0;
+  bool trigger_flush = false;
 
-  for (merging_iter->SeekToFirst(); merging_iter->Valid();
-       merging_iter->Next()) {
+  for (merging_iter->SeekToFirst(); merging_iter->Valid(); merging_iter->Next()) {
     Slice key = merging_iter->key();
     Slice value = merging_iter->value();
     Slice user_key = ExtractUserKey(key);
 
-    // 去重：相同 user_key 只保留第一个（最新版本）
+    // 去重
     if (user_key.ToString() == last_user_key) {
       continue;
     }
     last_user_key = user_key.ToString();
 
-    s = sst_writer.Put(key, value);
-    if (!s.ok()) {
-      fprintf(stderr, "[DBImpl] Failed to write to merged SST: %s\n",
-              s.ToString().c_str());
-      break;
+    // 写入 Buffer
+    if (hotspot_manager_->BufferHotData(task.cuid, key, value)) {
+      trigger_flush = true;
     }
 
     if (segment_first_key.empty()) {
@@ -7212,42 +7187,37 @@ void DBImpl::ProcessPendingPartialMerge() {
   ReturnAndCleanupSuperVersion(cfd, sv);
 
   if (written_count == 0) {
-    sst_writer.Finish();
     return;
   }
 
-  ExternalSstFileInfo file_info;
-  s = sst_writer.Finish(&file_info);
-  if (!s.ok()) {
-    fprintf(stderr, "[DBImpl] Failed to finish merged SST: %s\n",
-            s.ToString().c_str());
-    return;
+  if (trigger_flush) {
+    hotspot_manager_->TriggerBufferFlush();
   }
 
   // 构造新的 DataSegment
   DataSegment new_segment;
-  new_segment.file_number = file_number;
+  new_segment.file_number = static_cast<uint64_t>(-1);
   new_segment.first_key = segment_first_key;
   new_segment.last_key = segment_last_key;
 
   // 收集需要清理的旧文件
   std::vector<uint64_t> obsolete_files;
   for (const auto& seg : overlapping_snaps) {
-    obsolete_files.push_back(seg.file_number);
+    if (seg.file_number != static_cast<uint64_t>(-1)) {
+      obsolete_files.push_back(seg.file_number);
+    }
   }
   for (const auto& seg : overlapping_deltas) {
     obsolete_files.push_back(seg.file_number);
   }
 
-  // 更新 HotIndexTable
-  hotspot_manager_->GetLifecycleManager()->RegisterFile(file_number, file_path);
   hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
       task.cuid, new_segment, obsolete_files);
 
   fprintf(stdout,
           "[DBImpl] PartialMerge completed for CUID %lu: merged %zu entries "
-          "into %s\n",
-          task.cuid, written_count, file_path.c_str());
+          "into HotDataBuffer\n",
+          task.cuid, written_count);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
