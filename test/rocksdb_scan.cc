@@ -258,6 +258,21 @@ int main() {
   }
   Check(found_mem_seg, "Should have a memory segment (-1) after partial merge");
 
+  // 确保 CUID 是热点 (Warm up)
+  std::cout << "Warming up CUID to ensure it is HOT..." << std::endl;
+  for (int i = 0; i < 3; ++i) {
+    PerformFullScan(db, CUID_PARTIAL);
+  }
+  Check(hotspot_mgr->IsHot(CUID_PARTIAL),
+        "CUID should be hot before 2nd partial scan");
+
+  // 写入新的 Delta (SST files) 以确保满足 kPartialMerge 的 Delta 数量阈值 (>2)
+  std::cout << "Creating new Deltas for [201, 300] range..." << std::endl;
+  for (int i = 0; i < 3; ++i) {
+    WriteBatchAndFlush(db, {CUID_PARTIAL}, 201 + i * 20,
+                       20);  // 201-220, 221-240, etc.
+  }
+
   // 执行第二个相邻的部分扫描 (201-300)
   std::cout << "Performing second partial scan on row range [201, 300]..."
             << std::endl;
@@ -267,6 +282,10 @@ int main() {
     std::cout << "Executing ProcessPendingPartialMerge() for [201, 300]..."
               << std::endl;
     db_impl->ProcessPendingPartialMerge();
+  } else {
+    std::cerr << "[WARNING] No pending partial merge found after 2nd scan! "
+                 "Coalescing might fail."
+              << std::endl;
   }
 
   // 验证合并（Coalescing）
@@ -286,8 +305,22 @@ int main() {
   // 验证边界是否正确扩大
   std::string expected_start = GenerateKey(CUID_PARTIAL, 100);
   std::string expected_end = GenerateKey(CUID_PARTIAL, 300);
-  // Note: GenerateKey produces 40 bytes, including cuid.
-  // We compare the whole encoded keys.
+
+  std::cout << "Expected Seg Start: "
+            << (expected_start.size() >= 24 ? ExtractCUID(expected_start) : 0)
+            << "..."
+            << (expected_start.size() > 24 ? expected_start.substr(24) : "")
+            << std::endl;
+  std::cout << "Actual Seg Start: "
+            << (coalesced_seg.first_key.size() >= 24
+                    ? ExtractCUID(coalesced_seg.first_key)
+                    : 0)
+            << "..."
+            << (coalesced_seg.first_key.size() > 24
+                    ? coalesced_seg.first_key.substr(24)
+                    : "")
+            << std::endl;
+
   Check(coalesced_seg.first_key == expected_start,
         "Coalesced start key should be row 100");
   Check(coalesced_seg.last_key == expected_end,

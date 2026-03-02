@@ -573,10 +573,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   if (became_hot) {
                     hotspot_manager_->EnqueueForInitScan(cuid);
                     delta_ctx_.trigger_scan_as_compaction = false;
-                  } else if (delta_ctx_.is_current_hot &&
-                             read_options_.delta_full_scan) {
-                    // 只有全量扫描且已经是热点（非首次）才触发
-                    // Scan-as-Compaction
+                  } else if (delta_ctx_.is_current_hot) {
                     delta_ctx_.trigger_scan_as_compaction =
                         hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
                   } else {
@@ -730,7 +727,13 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
   if (hotspot_manager_) {
     // 最后一个 CUID 正在进行 Scan-as-Compaction，需要 Finalize
     if (delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
-      hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+      auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
+          delta_ctx_.last_cuid, read_options_.delta_full_scan,
+          delta_ctx_.scan_first_key, delta_ctx_.scan_last_key);
+
+      hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
+          delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
+          delta_ctx_.scan_last_key);
     }
     delta_ctx_.Reset();
   }
