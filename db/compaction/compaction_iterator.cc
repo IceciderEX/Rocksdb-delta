@@ -465,38 +465,35 @@ void CompactionIterator::CheckHotspotFilters() {
   uint64_t cuid = hotspot_manager_->ExtractCUID(input_.key());
   uint64_t file_id = input_file_number();
 
-  // 文件编号进行了改变，看看是否需要更新输入文件列表
+  // 文件编号进行了改变或 CUID 改变，重新评估是否需要跳过
   if (cuid != current_cuid_ || file_id != current_file_number_) {
-      // cuid valid
-      if (input_map_ && cuid != 0) {
-          (*input_map_)[cuid].insert(file_id);
+    // 记录涉及到的物理输入文件
+    if (input_map_ && cuid != 0) {
+      if (file_id != 0) {
+        (*input_map_)[cuid].insert(file_id);
       }
-      current_file_number_ = file_id;
-  }
+    }
+    
+    current_cuid_ = cuid;
+    current_file_number_ = file_id;
+    skip_current_cuid_ = false;
 
-  if (cuid == current_cuid_ && cuid != 0) {
-    return;
-  }
-
-  current_cuid_ = cuid;
-  skip_current_cuid_ = false;
-  if (cuid == 0) return;
-
-  // c)	当读取到某个CUid的数据时，检查全局CUid删除计数表，若该CUid已被标记为删除，
-  // 则直接跳过该段数据，不写入新文件，并减去一次该CUid在计数表中的引用计数
-  if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid)) {
-    skip_current_cuid_ = true;
-    // hotspot_manager_->GetDeleteTable().UntrackFiles(cuid, input_file_numbers_); 防止 compaction 失败
-    return; 
-  }
-
-  // d)	若遇到热点CUid，检查其热点索引表，若发现Deltas列表中对应的该段数据已被标记为 Obsolete，
-  // 则直接跳过该段数据，并删除对应的Deltas记录。
-  if (hotspot_manager_->IsHot(cuid)) {
-      if (hotspot_manager_->ShouldSkipObsoleteDelta(cuid, input_file_numbers_)) {
-        skip_current_cuid_ = true;  
-        return;
+    if (cuid != 0) {
+      // c)
+      // 当读取到某个CUid的数据时，检查全局CUid删除计数表，若该CUid已被标记为删除，
+      // 则直接跳过该段数据，不写入新文件，并减去一次该CUid在计数表中的引用计数
+      if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid)) {
+        skip_current_cuid_ = true;
+      } 
+      // d) 检查热点索引表（仅判断当前文件 id）
+      // 若遇到热点CUid，检查其热点索引表，若发现Deltas列表中对应的该段数据已被标记为
+      // Obsolete， 则直接跳过该段数据，并删除对应的Deltas记录。
+      else if (hotspot_manager_->IsHot(cuid)) {
+        if (hotspot_manager_->ShouldSkipObsoleteDelta(cuid, std::vector<uint64_t>{file_id})) {
+          skip_current_cuid_ = true;
+        }
       }
+    }
   }
 }
 

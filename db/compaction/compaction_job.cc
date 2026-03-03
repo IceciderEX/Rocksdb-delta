@@ -140,6 +140,8 @@ struct DeltaCompactionContext {
     std::string current_first_key;
     std::string current_last_key;
     uint64_t current_entry_count = 0;
+    // 记录输入文件id
+    std::unordered_set<uint64_t> current_input_files; 
 
     // segment 是否已经初始化 sk
     bool has_started_segment = false;
@@ -147,6 +149,13 @@ struct DeltaCompactionContext {
     void FlushSegment(uint64_t actual_file_number) {
         // cuid 不为0并且有数据
         if (current_cuid != 0 && pending_outputs && current_entry_count > 0) {
+            std::string input_str;
+            for (auto fid : current_input_files) {
+                input_str += std::to_string(fid) + " ";
+            }
+            fprintf(stdout, "[Compaction] CUID %lu generated Output File %lu from Input Files: [%s]\n",
+                current_cuid, actual_file_number, input_str.c_str());
+
             pending_outputs->push_back({
                 current_cuid,
                 actual_file_number,
@@ -159,6 +168,7 @@ struct DeltaCompactionContext {
         has_started_segment = false;
         current_first_key.clear();
         current_last_key.clear();
+        current_input_files.clear();
     }
 
     void HandleFileSwitch(uint64_t old_file_number, uint64_t new_file_number) {
@@ -1094,7 +1104,8 @@ Status CompactionJob::Install(bool* compaction_released) {
 
   if (status.ok()) {
     status = InstallCompactionResults(compaction_released);
-    // for delta，成功之后再修改metadata
+    // for delta
+    // fix: 成功之后再修改metadata
     if (status.ok() && hotspot_manager_) {
         if (status.ok() && hotspot_manager_) {
           // CUID -> List<Segments>
@@ -1657,6 +1668,7 @@ Status CompactionJob::ProcessKeyValue(
       static_cast<void*>(const_cast<Compaction*>(sub_compact->compaction)));
   
   // for delta
+  // 有kv到来，更新delta_ctx
   while (status.ok() && !cfd->IsDropped() && c_iter->Valid() &&
          c_iter->status().ok()) {
     assert(!end.has_value() ||
@@ -1665,6 +1677,7 @@ Status CompactionJob::ProcessKeyValue(
     // cuid change(如果数据有效)
     if (delta_ctx && delta_ctx->manager) {
         uint64_t cuid = delta_ctx->manager->ExtractCUID(c_iter->key());
+        uint64_t input_file_id = c_iter->input_file_number();
         
         if (cuid != delta_ctx->current_cuid) {
              delta_ctx->FlushSegment(delta_ctx->current_file_number);
@@ -1683,6 +1696,9 @@ Status CompactionJob::ProcessKeyValue(
 
         delta_ctx->current_last_key = key_str;
         delta_ctx->current_entry_count++;
+        if (input_file_id != 0) {
+            delta_ctx->current_input_files.insert(input_file_id);
+        }
     }
 
     if (c_iter->iter_stats().num_input_records % kRecordStatsEvery ==
