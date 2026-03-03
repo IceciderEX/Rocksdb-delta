@@ -468,7 +468,7 @@ void HotspotManager::EnqueuePartialMerge(uint64_t cuid,
                                          const std::string& scan_first_key,
                                          const std::string& scan_last_key) {
   std::lock_guard<std::mutex> lock(partial_merge_mutex_);
-  // 避免重复添加相同 cuid 的任务
+  // 避免重复添加相同 cuid 的任务?
   for (const auto& task : partial_merge_queue_) {
     if (task.cuid == cuid) return;
   }

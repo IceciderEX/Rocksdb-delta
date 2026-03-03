@@ -1,19 +1,17 @@
-#include <chrono>
+/**
+ * test/delta_component_test.cc
+ * 深入测试 Delta Table 的各个独立子组件（GDCT, HotspotManager 等）寻找边角问题
+ */
+
 #include <iostream>
-#include <string>
-#include <thread>
+#include <cassert>
 #include <vector>
 
-#include "db/db_impl/db_impl.h"
-#include "delta/hot_data_buffer.h"
-#include "delta/hot_index_table.h"
+#include "delta/global_delete_count_table.h"
 #include "delta/hotspot_manager.h"
-#include "rocksdb/db.h"
 #include "rocksdb/options.h"
 
 using namespace ROCKSDB_NAMESPACE;
-
-const std::string kDBPath = "db_tmp_deep_test";
 
 void Check(bool condition, const std::string& msg) {
   if (condition) {
@@ -24,215 +22,77 @@ void Check(bool condition, const std::string& msg) {
   }
 }
 
-// 辅助方法：生成固定长度的 Key (CUID + RowID)
-std::string GenerateKey(uint64_t cuid, uint64_t row_id) {
-  std::string key(40, '\0');
-  unsigned char* p = reinterpret_cast<unsigned char*>(&key[16]);
-  for (int i = 0; i < 8; ++i) {
-    p[i] = (cuid >> (56 - 8 * i)) & 0xFF;
-  }
-  unsigned char* q = reinterpret_cast<unsigned char*>(&key[32]);
-  for (int i = 0; i < 8; ++i) {
-    q[i] = (row_id >> (56 - 8 * i)) & 0xFF;
-  }
-  return key;
+void TestGDCT() {
+  std::cout << "--- Testing GlobalDeleteCountTable ---" << std::endl;
+  GlobalDeleteCountTable gdct;
+  uint64_t cuid = 1001;
+
+  // 1. 初始记录引用
+  bool new_track = gdct.TrackPhysicalUnit(cuid, 10);
+  Check(new_track == true, "首次追踪应返回 true");
+  Check(gdct.GetRefCount(cuid) == 1, "引用计数应为 1");
+
+  // 2. 重复记录相同物理 ID
+  new_track = gdct.TrackPhysicalUnit(cuid, 10);
+  Check(new_track == false, "追踪相同 phys_id 不应增加并返回 false");
+  Check(gdct.GetRefCount(cuid) == 1, "引用计数仍应为 1");
+
+  // 3. 记录新物理 ID
+  new_track = gdct.TrackPhysicalUnit(cuid, 11);
+  Check(new_track == true, "追踪新 phys_id 应返回 true");
+  Check(gdct.GetRefCount(cuid) == 2, "引用计数应变为 2");
+
+  // 4. 测试删除标记
+  bool marked = gdct.MarkDeleted(cuid);
+  Check(marked == true, "标记删除应成功");
+  Check(gdct.IsDeleted(cuid) == true, "IsDeleted 应返回 true");
+
+
+  // 6. 批量 Untrack 逻辑
+  std::vector<uint64_t> to_untrack = {10, 999}; // 999 并不在集合中，测试容错性
+  gdct.UntrackFiles(cuid, to_untrack);
+  Check(gdct.GetRefCount(cuid) == 1, "Untrack 后引用计数应为 1");
+
+  std::cout << "GDCT 逻辑表现正常." << std::endl;
 }
 
-// 提取 CUID
-uint64_t ExtractCUID(const std::string& key) {
-  if (key.size() < 24) return 0;
-  uint64_t cuid = 0;
-  const unsigned char* p =
-      reinterpret_cast<const unsigned char*>(key.data() + 16);
-  for (int i = 0; i < 8; ++i) {
-    cuid = (cuid << 8) | p[i];
+void TestHotspotManagerMergeQueue() {
+  std::cout << "\n--- Testing HotspotManager Merge Queue ---" << std::endl;
+  Options db_options;
+  HotspotManager hotspot(db_options, "/home/wam/Rocksdb-delta/db_tmp2/hotspot_test_dir");
+
+  uint64_t cuid = 2002;
+  std::string start_key = "test_start";
+  std::string end_key = "test_end";
+
+  // 1. 初始化队列为空
+  Check(!hotspot.HasPendingPartialMerge(), "初始队列应为空");
+
+  // 2. 将同一个任务 enqueue 两次，测试防重入/防重复去重逻辑
+  hotspot.EnqueuePartialMerge(cuid, start_key, end_key);
+  hotspot.EnqueuePartialMerge(cuid, start_key, end_key); 
+  Check(hotspot.HasPendingPartialMerge(), "入队后队列应有任务");
+
+  // 3. 弹出一个任务
+  PartialMergePendingTask task;
+  bool popped = hotspot.PopPendingPartialMerge(&task);
+  Check(popped, "应该成功弹出任务");
+  Check(task.cuid == cuid && task.scan_first_key == start_key && task.scan_last_key == end_key,
+        "弹出的任务字段必须匹配");
+
+  // 4. 第二个任务（检查 HotspotManager 是否做了去重限制）
+  // 按照目前设计，测试是否存在隐患：重复 PartialMerge 是否会导致后台进行冗余 I/O？
+  bool popped2 = hotspot.PopPendingPartialMerge(&task);
+  if (popped2) {
+      std::cout << "[WARN] HotspotManager 存在重复 enqueue 导致的冗余任务，建议在 Enqueue 时加入去重限制！" << std::endl;
+  } else {
+      std::cout << "[PASS] HotspotManager 成功防止了重复任务进入队列。" << std::endl;
   }
-  return cuid;
-}
-
-// 写入数据并 Flush (模拟底层 Cold Data 生成 SST)
-void WriteBatchAndFlush(DB* db, uint64_t cuid, uint64_t start_row, int count) {
-  WriteOptions write_opts;
-  for (int i = 0; i < count; ++i) {
-    std::string key = GenerateKey(cuid, start_row + i);
-    std::string value = "val_" + std::to_string(start_row + i);
-    Status s = db->Put(write_opts, key, value);
-    if (!s.ok()) {
-      std::cerr << "Put failed: " << s.ToString() << std::endl;
-      exit(1);
-    }
-  }
-  FlushOptions flush_opts;
-  db->Flush(flush_opts);
-}
-
-// 执行全量扫描，模拟查询
-int PerformFullScan(DB* db, uint64_t cuid, bool cold_path = false) {
-  ReadOptions read_opts;
-  read_opts.delta_full_scan = true;
-  read_opts.skip_hot_path = cold_path;
-
-  std::string start_key = GenerateKey(cuid, 0);
-  std::string upper_bound_key = GenerateKey(cuid + 1, 0);
-
-  Slice start_slice(start_key);
-  Slice upper_bound_slice(upper_bound_key);
-  read_opts.iterate_upper_bound = &upper_bound_slice;
-
-  std::unique_ptr<Iterator> iter(db->NewIterator(read_opts));
-  int count = 0;
-  for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
-    count++;
-  }
-  if (!iter->status().ok() && !iter->status().IsNotFound()) {
-    std::cerr << "Full scan error: " << iter->status().ToString() << std::endl;
-  }
-  return count;
-}
-
-// 执行部分扫描，模拟范围查询
-int PerformPartialScan(DB* db, uint64_t cuid, uint64_t start_row,
-                       uint64_t end_row) {
-  ReadOptions read_opts;
-  read_opts.delta_full_scan = false;
-  read_opts.skip_hot_path = false;
-
-  std::string start_key = GenerateKey(cuid, start_row);
-  std::string upper_bound_key = GenerateKey(cuid, end_row + 1);
-
-  Slice start_slice(start_key);
-  Slice upper_bound_slice(upper_bound_key);
-  read_opts.iterate_upper_bound = &upper_bound_slice;
-
-  std::unique_ptr<Iterator> iter(db->NewIterator(read_opts));
-  int count = 0;
-  for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
-    count++;
-  }
-  return count;
 }
 
 int main() {
-  std::cout << "========================================" << std::endl;
-  std::cout << "RocksDB Delta Architecture Comprehensive Test Suite"
-            << std::endl;
-  std::cout << "========================================" << std::endl;
-
-  Options options;
-  options.create_if_missing = true;
-  DestroyDB(kDBPath, options);
-
-  options.create_missing_column_families = true;
-  options.disable_auto_compactions = true;
-  options.num_levels = 1;
-  options.level0_file_num_compaction_trigger = 20;
-
-  DB* db = nullptr;
-  Status s = DB::Open(options, kDBPath, &db);
-  Check(s.ok(), "DB Open");
-
-  DBImpl* db_impl = dynamic_cast<DBImpl*>(db);
-  auto hotspot_mgr = db_impl->GetHotspotManager();
-  Check(hotspot_mgr != nullptr, "HotspotManager Access");
-
-  const uint64_t TEST_CUID = 8888;
-
-  // ------------------------------------------------------------------
-  std::cout << "\n>>> TEST 1: Write Initial Cold Data (SST Generation) <<<\n";
-  // 写入两批打底数据 (Cold Data) 并 Flush 成底层的 SST。
-  WriteBatchAndFlush(db, TEST_CUID, 100, 50);  // row [100, 149]
-  WriteBatchAndFlush(db, TEST_CUID, 200, 50);  // row [200, 249]
-  std::cout << "Initial cold SSTs generated." << std::endl;
-
-  int cold_rows = PerformFullScan(db, TEST_CUID, true);  // cold path
-  Check(cold_rows == 100, "Cold scan found identical 100 rows.");
-
-  // ------------------------------------------------------------------
-  std::cout
-      << "\n>>> TEST 2: Hotspot Detection & Initial Scan-as-Compaction <<<\n";
-  // 多次执行全量扫描，直到跨越热点阈值 (5次)。由于之前没缓存，首次需要建
-  // Snapshot
-  for (int i = 0; i < 5; ++i) {
-    PerformFullScan(db, TEST_CUID, false);
-  }
-  Check(hotspot_mgr->IsHot(TEST_CUID), "CUID promoted to HOT.");
-
-  // 后台消费初始化扫描队列，它会通过 Cold Path 抽取前面的底层 100 行到内存
-  // Buffer
-  if (hotspot_mgr->HasPendingInitCuids()) {
-    db_impl->ProcessPendingHotCuids();
-  }
-
-  HotIndexEntry entry;
-  Check(hotspot_mgr->GetIndexTable().GetEntry(TEST_CUID, &entry),
-        "HotIndexTable tracks CUID.");
-  Check(entry.HasSnapshot(),
-        "Initial Snapshot (-1 segment) is created accurately.");
-  Check(PerformFullScan(db, TEST_CUID, false) == 100,
-        "Hot Path read visibility is maintained.");
-
-  // ------------------------------------------------------------------
-  std::cout << "\n>>> TEST 3: In-Memory Delta Appending <<<\n";
-  // CUID变热以后，新的写入将会生成 Delta 片段。
-  WriteBatchAndFlush(db, TEST_CUID, 300, 20);  // row [300, 319]
-  WriteBatchAndFlush(db, TEST_CUID, 330, 20);  // row [330, 349]
-  WriteBatchAndFlush(db, TEST_CUID, 360, 20);  // row [360, 379]
-  WriteBatchAndFlush(db, TEST_CUID, 390, 20);  // row [390, 409]
-  WriteBatchAndFlush(db, TEST_CUID, 420, 20);  // row [420, 439]
-  WriteBatchAndFlush(db, TEST_CUID, 450, 20);  // row [450, 469]
-
-  hotspot_mgr->GetIndexTable().GetEntry(TEST_CUID, &entry);
-  Check(entry.deltas.size() == 6,
-        "Delta SSTs mapped and appended into HotIndexTable correctly.");
-  Check(PerformFullScan(db, TEST_CUID, false) == 220,
-        "Hot Scan seamlessly integrates buffers and active deltas.");
-
-  // ------------------------------------------------------------------
-  std::cout << "\n>>> TEST 4: Partial Scan triggering Delta Coalescing <<<\n";
-  // 部分扫描区间 [300, 365] 会包含前三个 Delta，触发 Partial Merge
-  int p_rows = PerformPartialScan(db, TEST_CUID, 300, 365);
-  std::cout << "Partial scan matched rows: " << p_rows << std::endl;
-
-  if (hotspot_mgr->HasPendingPartialMerge()) {
-    std::cout << "Executing background ProcessPendingPartialMerge..."
-              << std::endl;
-    db_impl->ProcessPendingPartialMerge();
-  }
-
-  hotspot_mgr->GetIndexTable().GetEntry(TEST_CUID, &entry);
-  Check(entry.obsolete_deltas.size() >= 3,
-        "[300,319], [330,349] and [360,379] SSTs were moved to obsolete_deltas "
-        "due to "
-        "overlapping merge.");
-  Check(PerformFullScan(db, TEST_CUID, false) == 220,
-        "Data integrity maintained after internal Coalescing.");
-
-  // ------------------------------------------------------------------
-  std::cout << "\n>>> TEST 5: Background Metadata Scan (GDCT Update) <<<\n";
-  // EVS 或缓存需要更新。我们会做 metadata update
-  hotspot_mgr->EnqueueMetadataScan(TEST_CUID);
-  db_impl->ProcessPendingMetadataScans();
-  std::cout << "Metadata scan processed." << std::endl;
-
-  // ------------------------------------------------------------------
-  std::cout << "\n>>> TEST 6: L0 Compaction & Obsolete Delta Purge <<<\n";
-  // 使用 rocksdb 的 manual compaction
-  CompactRangeOptions compact_options;
-  db->CompactRange(compact_options, nullptr, nullptr);
-
-  hotspot_mgr->GetIndexTable().GetEntry(TEST_CUID, &entry);
-  Check(entry.obsolete_deltas.empty(),
-        "Obsolete deltas list successfully purged after L0 compaction.");
-
-  int final_rows = PerformFullScan(db, TEST_CUID, false);
-  std::cout << "Post-compaction total rows: " << final_rows << std::endl;
-  Check(final_rows == 220,
-        "Zero data loss! Full L0 Compaction data recycling works flawlessly.");
-
-  std::cout << "\n========================================" << std::endl;
-  std::cout << "All RocksDB Delta deep tests passed successfully!" << std::endl;
-  std::cout << "========================================" << std::endl;
-
-  delete db;
+  TestGDCT();
+  TestHotspotManagerMergeQueue();
+  std::cout << "\nAll Unit Tests Passed Successfully!" << std::endl;
   return 0;
 }

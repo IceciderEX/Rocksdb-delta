@@ -43,7 +43,7 @@ class GlobalDeleteCountTable {
 
   // 【Compaction 阶段调用】
   // 物理清理后减少引用计数
-  void DecrementRefCount(uint64_t cuid);
+  // void DecrementRefCount(uint64_t cuid);
 
   int GetRefCount(uint64_t cuid) const;
 

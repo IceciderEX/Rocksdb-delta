@@ -9,12 +9,13 @@ bool GlobalDeleteCountTable::TrackPhysicalUnit(uint64_t cuid, uint64_t phys_id) 
   auto& entry = table_[cuid]; // Lazy Init
   
   // count++
-  entry.ref_count++;
   auto it = std::lower_bound(entry.tracked_phys_ids.begin(), 
                              entry.tracked_phys_ids.end(), 
                              phys_id);
   if (it == entry.tracked_phys_ids.end() || *it != phys_id) {
     entry.tracked_phys_ids.insert(it, phys_id);
+    entry.ref_count++;
+    return true;
   }
   return false;
 }
