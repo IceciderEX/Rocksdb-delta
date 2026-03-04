@@ -550,7 +550,8 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
 
                     hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
                         delta_ctx_.last_cuid, strategy,
-                        delta_ctx_.scan_first_key, delta_ctx_.scan_last_key);
+                        delta_ctx_.scan_first_key, delta_ctx_.scan_last_key,
+                        delta_ctx_.visited_units_for_cuid);
                   }
 
                   // fullscan 需要进行一次coldpath，更新GDCT
@@ -733,7 +734,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
 
       hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
           delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
-          delta_ctx_.scan_last_key);
+          delta_ctx_.scan_last_key, delta_ctx_.visited_units_for_cuid);
     }
     delta_ctx_.Reset();
   }

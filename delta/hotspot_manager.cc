@@ -263,7 +263,8 @@ void HotspotManager::TriggerBufferFlush() {
   }
 }
 
-void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
+void HotspotManager::FinalizeScanAsCompaction(
+    uint64_t cuid, const std::unordered_set<uint64_t>& visited_files) {
   if (cuid == 0) return;
 
   std::vector<DataSegment> final_segments;
@@ -313,7 +314,7 @@ void HotspotManager::FinalizeScanAsCompaction(uint64_t cuid) {
 
   // 更新这个 cuid 的 Snapshot
   index_table_.UpdateSnapshot(cuid, final_segments);
-  index_table_.MarkDeltasAsObsolete(cuid);
+  index_table_.MarkDeltasAsObsolete(cuid, visited_files);
 
   // fprintf(stdout, "[HotspotManager] Finalized CUID %lu. Snapshot has %zu
   // segments (incl tail).\n",
@@ -354,14 +355,15 @@ size_t HotspotManager::CountInvolvedDeltas(uint64_t cuid,
 
 void HotspotManager::FinalizeScanAsCompactionWithStrategy(
     uint64_t cuid, ScanAsCompactionStrategy strategy,
-    const std::string& scan_first_key, const std::string& scan_last_key) {
+    const std::string& scan_first_key, const std::string& scan_last_key,
+    const std::unordered_set<uint64_t>& visited_files) {
   if (cuid == 0) return;
 
   switch (strategy) {
     case ScanAsCompactionStrategy::kNoAction:
       return;
     case ScanAsCompactionStrategy::kFullReplace:
-      FinalizeScanAsCompaction(cuid);
+      FinalizeScanAsCompaction(cuid, visited_files);
       break;
     case ScanAsCompactionStrategy::kPartialMerge:
       EnqueuePartialMerge(cuid, scan_first_key, scan_last_key);

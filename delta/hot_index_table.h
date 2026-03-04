@@ -49,7 +49,8 @@ class HotIndexTable {
 
   void AddDelta(uint64_t cuid, const DataSegment& segment);
 
-  void MarkDeltasAsObsolete(uint64_t cuid);
+  void MarkDeltasAsObsolete(uint64_t cuid,
+                            const std::unordered_set<uint64_t>& visited_files);
 
   bool CheckAndRemoveObsoleteDeltas(uint64_t cuid,
                                     const std::vector<uint64_t>& input_files);

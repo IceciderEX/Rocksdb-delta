@@ -7097,7 +7097,12 @@ void DBImpl::ProcessPendingPartialMerge() {
 
   // 如果没有重叠数据，使用 FullReplace 逻辑
   if (overlapping_snaps.empty() && overlapping_deltas.empty()) {
-    hotspot_manager_->FinalizeScanAsCompaction(task.cuid);
+    DataSegment new_segment;
+    new_segment.file_number = static_cast<uint64_t>(-1);
+    new_segment.first_key = task.scan_first_key;
+    new_segment.last_key = task.scan_last_key;
+    hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
+        task.cuid, new_segment, std::vector<uint64_t>{});
     return;
   }
 
@@ -7138,7 +7143,7 @@ void DBImpl::ProcessPendingPartialMerge() {
     children.push_back(delta_iter);
   }
 
-  // 3. Buffer Iterator 
+  // 3. Buffer Iterator
   InternalIterator* buffer_iter =
       hotspot_manager_->NewBufferIterator(task.cuid, &icmp);
   if (buffer_iter) {
@@ -7160,7 +7165,8 @@ void DBImpl::ProcessPendingPartialMerge() {
   size_t written_count = 0;
   bool trigger_flush = false;
 
-  for (merging_iter->SeekToFirst(); merging_iter->Valid(); merging_iter->Next()) {
+  for (merging_iter->SeekToFirst(); merging_iter->Valid();
+       merging_iter->Next()) {
     Slice key = merging_iter->key();
     Slice value = merging_iter->value();
     Slice user_key = ExtractUserKey(key);

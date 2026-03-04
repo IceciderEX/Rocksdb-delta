@@ -93,7 +93,8 @@ bool HotIndexTable::GetEntry(uint64_t cuid, HotIndexEntry* entry) const {
   return false;
 }
 
-void HotIndexTable::MarkDeltasAsObsolete(uint64_t cuid) {
+void HotIndexTable::MarkDeltasAsObsolete(
+    uint64_t cuid, const std::unordered_set<uint64_t>& visited_files) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto it = table_.find(cuid);
   if (it == table_.end()) return;
@@ -101,11 +102,16 @@ void HotIndexTable::MarkDeltasAsObsolete(uint64_t cuid) {
   auto& entry = it->second;
   if (entry.deltas.empty()) return;
 
-  // 将 deltas 移动到 obsolete_deltas
-  entry.obsolete_deltas.insert(entry.obsolete_deltas.end(),
-                               entry.deltas.begin(), entry.deltas.end());
-  entry.deltas.clear();
-  // 等待L0Compaction清理它们
+  if (visited_files.empty()) return;
+
+  for (auto d_it = entry.deltas.begin(); d_it != entry.deltas.end();) {
+    if (visited_files.count(d_it->file_number)) {
+      entry.obsolete_deltas.push_back(*d_it);
+      d_it = entry.deltas.erase(d_it);
+    } else {
+      ++d_it;
+    }
+  }
 }
 
 // d)

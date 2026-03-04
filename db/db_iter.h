@@ -161,7 +161,8 @@ class DBIter final : public Iterator {
     iter_.DeleteIter(arena_mode_);
     ThreadStatusUtil::SetThreadOperation(cur_op_type);
 
-    // if (hotspot_manager_ && delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
+    // if (hotspot_manager_ && delta_ctx_.last_cuid != 0 &&
+    // delta_ctx_.trigger_scan_as_compaction) {
     //   hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
     // }
 
@@ -173,7 +174,7 @@ class DBIter final : public Iterator {
 
       hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
           delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
-          delta_ctx_.scan_last_key);
+          delta_ctx_.scan_last_key, delta_ctx_.visited_units_for_cuid);
     }
 
     // for delta: 异步补全元数据 (当热路径 Full Scan 结束时入队)

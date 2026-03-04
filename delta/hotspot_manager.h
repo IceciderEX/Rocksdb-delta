@@ -79,13 +79,15 @@ class HotspotManager {
   size_t CountInvolvedDeltas(uint64_t cuid, const std::string& first_key,
                              const std::string& last_key);
 
-  void FinalizeScanAsCompaction(uint64_t cuid);
+  void FinalizeScanAsCompaction(
+      uint64_t cuid, const std::unordered_set<uint64_t>& visited_files = {});
 
   // 带策略的 Finalize 方法，支持不同的策略处理
   void FinalizeScanAsCompactionWithStrategy(
       uint64_t cuid, ScanAsCompactionStrategy strategy,
       const std::string& scan_first_key = "",
-      const std::string& scan_last_key = "");
+      const std::string& scan_last_key = "",
+      const std::unordered_set<uint64_t>& visited_files = {});
 
   bool IsCuidDeleted(uint64_t cuid) { return delete_table_.IsDeleted(cuid); }
 
@@ -153,7 +155,7 @@ class HotspotManager {
   // 检查是否有待处理的初始化任务
   bool HasPendingInitCuids() const;
 
-    // 将 CUID 加入待补全元数据的扫描队列
+  // 将 CUID 加入待补全元数据的扫描队列
   void EnqueueMetadataScan(uint64_t cuid);
 
   // 获取并清空待补全元数据的扫描队列
