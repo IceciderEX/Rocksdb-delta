@@ -277,8 +277,10 @@ void HotIndexTable::ReplaceOverlappingSegments(
 
     // 判定与new snapshot相关的snapshot -> !(End < New.Start || Start > New.End)
     for (auto it = snapshots.begin(); it != snapshots.end();) {
-      bool is_left = (it->last_key < new_segment.first_key);
-      bool is_right = (it->first_key > new_segment.last_key);
+      bool is_left = (ExtractUserKey(it->last_key).ToString() <
+                      ExtractUserKey(new_segment.first_key).ToString());
+      bool is_right = (ExtractUserKey(it->first_key).ToString() >
+                       ExtractUserKey(new_segment.last_key).ToString());
 
       if (!is_left && !is_right) {
         segments_to_unref.push_back(*it);
@@ -359,8 +361,10 @@ size_t HotIndexTable::CountOverlappingDeltas(
 
   for (const auto& delta : entry.deltas) {
     // Key 范围重叠判断: !(delta.last < first || delta.first > last)
-    bool is_left = (delta.last_key < first_key);
-    bool is_right = (delta.first_key > last_key);
+    bool is_left = (ExtractUserKey(delta.last_key).ToString() <
+                    ExtractUserKey(first_key).ToString());
+    bool is_right = (ExtractUserKey(delta.first_key).ToString() >
+                     ExtractUserKey(last_key).ToString());
     if (!is_left && !is_right) {
       count++;
     }
@@ -411,8 +415,10 @@ void HotIndexTable::GetOverlappingSegments(
   // 收集重叠的 snapshot segments
   for (const auto& seg : entry.snapshot_segments) {
     // !(seg.last < first || seg.first > last)
-    bool is_left = (seg.last_key < first_key);
-    bool is_right = (seg.first_key > last_key);
+    bool is_left = (ExtractUserKey(seg.last_key).ToString() <
+                    ExtractUserKey(first_key).ToString());
+    bool is_right = (ExtractUserKey(seg.first_key).ToString() >
+                     ExtractUserKey(last_key).ToString());
     if (!is_left && !is_right) {
       overlapping_snapshots->push_back(seg);
     }
@@ -420,8 +426,10 @@ void HotIndexTable::GetOverlappingSegments(
 
   // 收集重叠的 delta segments
   for (const auto& seg : entry.deltas) {
-    bool is_left = (seg.last_key < first_key);
-    bool is_right = (seg.first_key > last_key);
+    bool is_left = (ExtractUserKey(seg.last_key).ToString() <
+                    ExtractUserKey(first_key).ToString());
+    bool is_right = (ExtractUserKey(seg.first_key).ToString() >
+                     ExtractUserKey(last_key).ToString());
     if (!is_left && !is_right) {
       overlapping_deltas->push_back(seg);
     }

@@ -39,8 +39,8 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
 
   // slices for bounds
   for (const auto& delta : deltas_) {
-    bounds_storage_.push_back(delta.first_key);
-    bounds_storage_.push_back(delta.last_key);
+    bounds_storage_.push_back(ExtractUserKey(delta.first_key).ToString());
+    bounds_storage_.push_back(ExtractUserKey(delta.last_key).ToString());
   }
   for (size_t i = 0; i < bounds_storage_.size(); ++i) {
     bounds_slices_.emplace_back(bounds_storage_[i]);
@@ -144,8 +144,8 @@ void HotSnapshotIterator::InitIterForSegment(size_t index) {
     FileMetaData meta = MakeFileMetaFromSegment(seg);
 
     current_read_options_ = read_options_;
-    current_lower_bound_str_ = seg.first_key;
-    current_upper_bound_str_ = seg.last_key;
+    current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
+    current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
     current_lower_bound_slice_ = Slice(current_lower_bound_str_);
     current_upper_bound_slice_ = Slice(current_upper_bound_str_);
     current_read_options_.iterate_lower_bound = &current_lower_bound_slice_;
@@ -404,21 +404,21 @@ void DeltaSwitchingIterator::Seek(const Slice& target) {
   // }
   // skip_hot_path (eg. Metadata Scan)，强制冷路径
   if (read_options_.skip_hot_path) {
-      InitColdIter();
-      current_iter_ = cold_iter_;
-      is_hot_mode_ = false;
-  } 
+    InitColdIter();
+    current_iter_ = cold_iter_;
+    is_hot_mode_ = false;
+  }
   // 否则，不论是点查还是全扫描(delta_full_scan)，只要是热点，全部走热点路径提供给用户！
   else if (cuid != 0 && hotspot_manager_->IsHot(cuid)) {
-      InitHotIter(cuid);
-      current_iter_ = hot_iter_;
-      is_hot_mode_ = true;
-  } 
+    InitHotIter(cuid);
+    current_iter_ = hot_iter_;
+    is_hot_mode_ = true;
+  }
   // 既不是 skip_hot_path 也不是热点，默认走冷路径
   else {
-      InitColdIter();
-      current_iter_ = cold_iter_;
-      is_hot_mode_ = false;
+    InitColdIter();
+    current_iter_ = cold_iter_;
+    is_hot_mode_ = false;
   }
 
   // fprintf(stderr, "[DEBUG] current_iter_=%p, about to call
