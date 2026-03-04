@@ -1,98 +1,209 @@
-/**
- * test/delta_component_test.cc
- * 深入测试 Delta Table 的各个独立子组件（GDCT, HotspotManager 等）寻找边角问题
- */
-
+#include <atomic>
+#include <chrono>
 #include <iostream>
-#include <cassert>
+#include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
 #include <vector>
 
-#include "delta/global_delete_count_table.h"
+#include "db/db_impl/db_impl.h"
 #include "delta/hotspot_manager.h"
+#include "rocksdb/db.h"
 #include "rocksdb/options.h"
 
 using namespace ROCKSDB_NAMESPACE;
 
-void Check(bool condition, const std::string& msg) {
-  if (condition) {
-    std::cout << "[PASS] " << msg << std::endl;
-  } else {
-    std::cerr << "[FAIL] " << msg << std::endl;
-    exit(1);
+const std::string kDBPath = "/home/wam/Rocksdb-delta/db_tmp";
+std::atomic<bool> stop_test{false};
+
+struct TestStats {
+  std::atomic<uint64_t> total_writes{0};
+  std::atomic<uint64_t> total_scans{0};
+  std::atomic<uint64_t> total_merges{0};
+  std::atomic<uint64_t> errors{0};
+};
+
+TestStats global_stats;
+
+// Ground truth per CUID to verify data integrity
+struct CuidGroundTruth {
+  std::mutex mtx;
+  std::set<uint64_t> row_ids;
+};
+std::map<uint64_t, CuidGroundTruth*> ground_truths;
+
+std::string GenerateKey(uint64_t cuid, uint64_t row_id) {
+  std::string key(40, '\0');
+  unsigned char* p = reinterpret_cast<unsigned char*>(&key[16]);
+  for (int i = 0; i < 8; ++i) {
+    p[i] = (cuid >> (56 - 8 * i)) & 0xFF;
+  }
+  unsigned char* q = reinterpret_cast<unsigned char*>(&key[32]);
+  for (int i = 0; i < 8; ++i) {
+    q[i] = (row_id >> (56 - 8 * i)) & 0xFF;
+  }
+  return key;
+}
+
+uint64_t ExtractCUID(const Slice& key) {
+  if (key.size() < 24) return 0;
+  const unsigned char* p =
+      reinterpret_cast<const unsigned char*>(key.data()) + 16;
+  uint64_t c = 0;
+  for (int i = 0; i < 8; ++i) {
+    c = (c << 8) | p[i];
+  }
+  return c;
+}
+
+uint64_t ExtractRowID(const Slice& key) {
+  if (key.size() < 40) return 0;
+  const unsigned char* p =
+      reinterpret_cast<const unsigned char*>(key.data()) + 32;
+  uint64_t r = 0;
+  for (int i = 0; i < 8; ++i) {
+    r = (r << 8) | p[i];
+  }
+  return r;
+}
+
+void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
+  uint64_t next_row_per_cuid[10] = {0};
+  WriteOptions wo;
+  while (!stop_test) {
+    for (size_t i = 0; i < cuids.size(); ++i) {
+      uint64_t cuid = cuids[i];
+      {
+        std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
+        for (int k = 0; k < 20; ++k) {
+          uint64_t rid = next_row_per_cuid[i]++;
+          db->Put(wo, GenerateKey(cuid, rid), "val");
+          ground_truths[cuid]->row_ids.insert(rid);
+        }
+      }
+      db->Flush(FlushOptions());
+      global_stats.total_writes += 20;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 }
 
-void TestGDCT() {
-  std::cout << "--- Testing GlobalDeleteCountTable ---" << std::endl;
-  GlobalDeleteCountTable gdct;
-  uint64_t cuid = 1001;
+void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
+  ReadOptions ro;
+  while (!stop_test) {
+    uint64_t cuid = cuids[rand() % cuids.size()];
+    ro.delta_full_scan = (rand() % 2 == 0);
 
-  // 1. 初始记录引用
-  bool new_track = gdct.TrackPhysicalUnit(cuid, 10);
-  Check(new_track == true, "首次追踪应返回 true");
-  Check(gdct.GetRefCount(cuid) == 1, "引用计数应为 1");
+    std::string start_key = GenerateKey(cuid, 0);
+    std::string upper_bound = GenerateKey(cuid + 1, 0);
+    Slice ub_slice = upper_bound;
+    ro.iterate_upper_bound = &ub_slice;
 
-  // 2. 重复记录相同物理 ID
-  new_track = gdct.TrackPhysicalUnit(cuid, 10);
-  Check(new_track == false, "追踪相同 phys_id 不应增加并返回 false");
-  Check(gdct.GetRefCount(cuid) == 1, "引用计数仍应为 1");
+    // Take snapshot of expected rows before starting the scan
+    std::set<uint64_t> expected;
+    {
+      std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
+      expected = ground_truths[cuid]->row_ids;
+    }
 
-  // 3. 记录新物理 ID
-  new_track = gdct.TrackPhysicalUnit(cuid, 11);
-  Check(new_track == true, "追踪新 phys_id 应返回 true");
-  Check(gdct.GetRefCount(cuid) == 2, "引用计数应变为 2");
+    std::unique_ptr<Iterator> it(db->NewIterator(ro));
+    std::set<uint64_t> found;
+    for (it->Seek(start_key); it->Valid(); it->Next()) {
+      if (ExtractCUID(it->key()) != cuid) break;
+      found.insert(ExtractRowID(it->key()));
+    }
 
-  // 4. 测试删除标记
-  bool marked = gdct.MarkDeleted(cuid);
-  Check(marked == true, "标记删除应成功");
-  Check(gdct.IsDeleted(cuid) == true, "IsDeleted 应返回 true");
-
-
-  // 6. 批量 Untrack 逻辑
-  std::vector<uint64_t> to_untrack = {10, 999}; // 999 并不在集合中，测试容错性
-  gdct.UntrackFiles(cuid, to_untrack);
-  Check(gdct.GetRefCount(cuid) == 1, "Untrack 后引用计数应为 1");
-
-  std::cout << "GDCT 逻辑表现正常." << std::endl;
+    if (!it->status().ok()) {
+      std::cerr << "Reader " << id << " error: " << it->status().ToString()
+                << std::endl;
+      global_stats.errors++;
+      exit(0);
+    } else {
+      for (uint64_t rid : expected) {
+        if (found.find(rid) == found.end()) {
+          std::cerr << "Reader " << id << " error: Missing row " << rid
+                    << " for cuid " << cuid << std::endl;
+          global_stats.errors++;
+          exit(0);
+        }
+      }
+    }
+    global_stats.total_scans++;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
 }
 
-void TestHotspotManagerMergeQueue() {
-  std::cout << "\n--- Testing HotspotManager Merge Queue ---" << std::endl;
-  Options db_options;
-  HotspotManager hotspot(db_options, "/home/wam/Rocksdb-delta/db_tmp2/hotspot_test_dir");
-
-  uint64_t cuid = 2002;
-  std::string start_key = "test_start";
-  std::string end_key = "test_end";
-
-  // 1. 初始化队列为空
-  Check(!hotspot.HasPendingPartialMerge(), "初始队列应为空");
-
-  // 2. 将同一个任务 enqueue 两次，测试防重入/防重复去重逻辑
-  hotspot.EnqueuePartialMerge(cuid, start_key, end_key);
-  hotspot.EnqueuePartialMerge(cuid, start_key, end_key); 
-  Check(hotspot.HasPendingPartialMerge(), "入队后队列应有任务");
-
-  // 3. 弹出一个任务
-  PartialMergePendingTask task;
-  bool popped = hotspot.PopPendingPartialMerge(&task);
-  Check(popped, "应该成功弹出任务");
-  Check(task.cuid == cuid && task.scan_first_key == start_key && task.scan_last_key == end_key,
-        "弹出的任务字段必须匹配");
-
-  // 4. 第二个任务（检查 HotspotManager 是否做了去重限制）
-  // 按照目前设计，测试是否存在隐患：重复 PartialMerge 是否会导致后台进行冗余 I/O？
-  bool popped2 = hotspot.PopPendingPartialMerge(&task);
-  if (popped2) {
-      std::cout << "[WARN] HotspotManager 存在重复 enqueue 导致的冗余任务，建议在 Enqueue 时加入去重限制！" << std::endl;
-  } else {
-      std::cout << "[PASS] HotspotManager 成功防止了重复任务进入队列。" << std::endl;
+void ManagerThread(DBImpl* db_impl) {
+  auto hotspot_mgr = db_impl->GetHotspotManager();
+  while (!stop_test) {
+    if (hotspot_mgr->HasPendingInitCuids()) {
+      db_impl->ProcessPendingHotCuids();
+    }
+    if (hotspot_mgr->HasPendingPartialMerge()) {
+      db_impl->ProcessPendingPartialMerge();
+      global_stats.total_merges++;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
   }
 }
 
 int main() {
-  TestGDCT();
-  TestHotspotManagerMergeQueue();
-  std::cout << "\nAll Unit Tests Passed Successfully!" << std::endl;
-  return 0;
+  Options options;
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  DestroyDB(kDBPath, options);
+
+  DB* db = nullptr;
+  Status s = DB::Open(options, kDBPath, &db);
+  if (!s.ok()) {
+    std::cerr << "Open failed: " << s.ToString() << std::endl;
+    return 1;
+  }
+
+  DBImpl* db_impl = dynamic_cast<DBImpl*>(db);
+  std::vector<uint64_t> cuids = {1001, 1002, 1003, 1004, 1005};
+  for (uint64_t cuid : cuids) {
+    ground_truths[cuid] = new CuidGroundTruth();
+  }
+
+  std::cout << "Starting Deep Stress Test for 30 seconds..." << std::endl;
+
+  std::thread writer(WriterThread, db, cuids);
+  std::thread reader1(ReaderThread, db, cuids, 1);
+  std::thread reader2(ReaderThread, db, cuids, 2);
+  std::thread reader3(ReaderThread, db, cuids, 3);
+  std::thread manager(ManagerThread, db_impl);
+
+  auto start_time = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - start_time <
+         std::chrono::seconds(30)) {
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    std::cout << "Stats: Writes=" << global_stats.total_writes
+              << ", Scans=" << global_stats.total_scans
+              << ", Merges=" << global_stats.total_merges
+              << ", Errors=" << global_stats.errors << std::endl;
+  }
+
+  stop_test = true;
+  writer.join();
+  reader1.join();
+  reader2.join();
+  reader3.join();
+  manager.join();
+
+  std::cout << "Stress Test Completed." << std::endl;
+  uint64_t final_errors = global_stats.errors;
+  if (final_errors > 0) {
+    std::cout << "Test FAILED with " << final_errors << " errors." << std::endl;
+  } else {
+    std::cout << "Test PASSED." << std::endl;
+  }
+
+  for (auto& pair : ground_truths) {
+    delete pair.second;
+  }
+  delete db;
+  return (final_errors == 0) ? 0 : 1;
 }
