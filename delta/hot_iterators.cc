@@ -40,7 +40,9 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
   // slices for bounds
   for (const auto& delta : deltas_) {
     bounds_storage_.push_back(ExtractUserKey(delta.first_key).ToString());
-    bounds_storage_.push_back(ExtractUserKey(delta.last_key).ToString());
+    std::string upper = ExtractUserKey(delta.last_key).ToString();
+    upper.push_back('\0');  // Make it an exclusive bound
+    bounds_storage_.push_back(upper);
   }
   for (size_t i = 0; i < bounds_storage_.size(); ++i) {
     bounds_slices_.emplace_back(bounds_storage_[i]);
@@ -146,6 +148,7 @@ void HotSnapshotIterator::InitIterForSegment(size_t index) {
     current_read_options_ = read_options_;
     current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
     current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
+    current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
     current_lower_bound_slice_ = Slice(current_lower_bound_str_);
     current_upper_bound_slice_ = Slice(current_upper_bound_str_);
     current_read_options_.iterate_lower_bound = &current_lower_bound_slice_;

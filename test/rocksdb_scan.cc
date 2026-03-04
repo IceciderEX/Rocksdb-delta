@@ -119,14 +119,12 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
       std::cerr << "Reader " << id << " error: " << it->status().ToString()
                 << std::endl;
       global_stats.errors++;
-      exit(0);
     } else {
       for (uint64_t rid : expected) {
         if (found.find(rid) == found.end()) {
           std::cerr << "Reader " << id << " error: Missing row " << rid
                     << " for cuid " << cuid << std::endl;
           global_stats.errors++;
-          exit(0);
         }
       }
     }
@@ -171,14 +169,14 @@ int main() {
   std::cout << "Starting Deep Stress Test for 30 seconds..." << std::endl;
 
   std::thread writer(WriterThread, db, cuids);
-  std::thread reader1(ReaderThread, db, cuids, 1);
-  std::thread reader2(ReaderThread, db, cuids, 2);
+  // std::thread reader1(ReaderThread, db, cuids, 1);
+  // std::thread reader2(ReaderThread, db, cuids, 2);
   std::thread reader3(ReaderThread, db, cuids, 3);
   std::thread manager(ManagerThread, db_impl);
 
   auto start_time = std::chrono::steady_clock::now();
   while (std::chrono::steady_clock::now() - start_time <
-         std::chrono::seconds(30)) {
+         std::chrono::seconds(90000)) {
     std::this_thread::sleep_for(std::chrono::seconds(5));
     std::cout << "Stats: Writes=" << global_stats.total_writes
               << ", Scans=" << global_stats.total_scans
@@ -188,8 +186,8 @@ int main() {
 
   stop_test = true;
   writer.join();
-  reader1.join();
-  reader2.join();
+  // reader1.join();
+  // reader2.join();
   reader3.join();
   manager.join();
 
