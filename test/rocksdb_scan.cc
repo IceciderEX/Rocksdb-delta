@@ -138,21 +138,52 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
             std::cerr << "Reader " << id << " error: Missing row " << missing[i]
                       << " for cuid " << cuid << std::endl;
           }
-          std::cerr << "Reader " << id << " error: ... (skipped " << (missing.size() - 40)
-                    << " entries) ..." << std::endl;
+          std::cerr << "Reader " << id << " error: ... (skipped "
+                    << (missing.size() - 40) << " entries) ..." << std::endl;
           for (size_t i = missing.size() - 5; i < missing.size(); i++) {
             std::cerr << "Reader " << id << " error: Missing row " << missing[i]
                       << " for cuid " << cuid << std::endl;
           }
         }
-        std::cerr << "Reader " << id << " error: Total missing rows: " << missing.size()
-                  << " for cuid " << cuid << std::endl;
+        std::cerr << "Reader " << id
+                  << " error: Total missing rows: " << missing.size()
+                  << " for cuid " << cuid << ", found=" << found.size()
+                  << ", expected=" << expected.size() << std::endl;
         global_stats.errors += missing.size();
 
-        found.clear();
-        for (it->Seek(start_key); it->Valid(); it->Next()) {
-          if (ExtractCUID(it->key()) != cuid) break;
-          found.insert(ExtractRowID(it->key()));
+        // Diagnostic: dump HotIndexEntry state
+        auto hotspot_mgr = dynamic_cast<DBImpl*>(db)->GetHotspotManager();
+        if (hotspot_mgr) {
+          HotIndexEntry diag_entry;
+          if (hotspot_mgr->GetHotIndexEntry(cuid, &diag_entry)) {
+            std::cerr << "[DIAG] CUID " << cuid << " snapshot_segments="
+                      << diag_entry.snapshot_segments.size()
+                      << " deltas=" << diag_entry.deltas.size() << std::endl;
+            for (size_t si = 0; si < diag_entry.snapshot_segments.size();
+                 si++) {
+              const auto& seg = diag_entry.snapshot_segments[si];
+              std::cerr << "[DIAG]   snap[" << si
+                        << "] file=" << (int64_t)seg.file_number
+                        << " first_key.size=" << seg.first_key.size()
+                        << " last_key.size=" << seg.last_key.size()
+                        << std::endl;
+            }
+          } else {
+            std::cerr << "[DIAG] CUID " << cuid << " has NO HotIndexEntry!"
+                      << std::endl;
+          }
+
+          // Check buffer data count
+          auto* buf_iter = hotspot_mgr->NewBufferIterator(cuid, nullptr);
+          if (buf_iter) {
+            size_t buf_count = 0;
+            for (buf_iter->SeekToFirst(); buf_iter->Valid(); buf_iter->Next()) {
+              buf_count++;
+            }
+            std::cerr << "[DIAG] Buffer data count for CUID " << cuid << ": "
+                      << buf_count << std::endl;
+            delete buf_iter;
+          }
         }
       }
     }

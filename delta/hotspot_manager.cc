@@ -245,37 +245,30 @@ void HotspotManager::TriggerBufferFlush() {
       for (const auto& kv : new_segments) {
         uint64_t cuid = kv.first;
         const DataSegment& real_segment = kv.second;
-        // 先尝试在 IndexTable 中寻找对应的 {-1} 记录进行替换 (Promote)【PartialMerge不会进行finalize】
-        // -1 记录 -> 一次 cuid 的 buffer append没有填满buffer
-        bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
 
-        if (!promoted) {
-          // 无 -1，可能是前台 Scan_as_compaction 还在进行中触发的 Flush
-          // 放入 pending_snapshots_ 等待 Finalize 时统一提交
+        // 先检查 pending_snapshots_，再尝试 PromoteSnapshot
+        // 如果该 CUID 有正在进行的 Scan（pending_snapshots_ 中有注册），
+        // 将 SST 放入 pending，由 FinalizeScanAsCompaction 提交
+        bool added_to_pending = false;
+        {
           std::lock_guard<std::mutex> lock(pending_mutex_);
           auto it = pending_snapshots_.find(cuid);
           if (it != pending_snapshots_.end()) {
             it->second.push_back(real_segment);
-          } else {
-            // 如果连 pending_snapshots_ 都没注册，强制 Append
-            index_table_.AppendSnapshotSegment(cuid, real_segment);
+            added_to_pending = true;
           }
         }
 
-        // if (it != pending_snapshots_.end()) {
-        //   // Case A: 前台的 Full Scan 全版本扫描，可能会产生多个 Snapshot 片段
-        //   // 这次 Scan 过程中触发的 Flush, 等到这个 scan 的 Finalize 时一起提交
-        //   // 问题：后台 partial merge 不进行 finalize
-        //   it->second.push_back(real_segment);
-        // } else {
-        //   // Case B: 有一个 cuid 在 scan 之后被其他cuid数据填满 flush（此cuid数据在pending_snapshots_）
-        //   // 检查这个 cuid 的 Index 中 {-1} 的记录通过 PromoteSnapshot 匹配绑定
-        //   bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
-        //   if (!promoted) {
-        //     // 如果没有 -1?
-        //     index_table_.AppendSnapshotSegment(kv.first, kv.second);
-        //   }
-        // }
+        if (!added_to_pending) {
+          // 无活跃 Scan，尝试 PromoteSnapshot（将 {-1} 内存段替换为真实 SST）
+          // 但是 partialMerge 是后台任务，不会进行
+          // FinalizeScanAsCompaction，需要考虑
+          bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
+          if (!promoted) {
+            // 既无活跃 Scan 也无 {-1} 段，强制 Append
+            index_table_.AppendSnapshotSegment(cuid, real_segment);
+          }
+        }
       }
     } else {
       fprintf(stderr, "[HotspotManager] Failed to flush shared block: %s\n",
@@ -313,6 +306,11 @@ void HotspotManager::FinalizeScanAsCompaction(
 
   // 防止空scan写入snapshot的情况
   if (final_segments.empty() && !has_buffered_data) {
+    fprintf(stdout,
+            "[HotspotManager] FinalizeScanAsCompaction for CUID %lu skipped: "
+            "no pending SSTs and no buffered data. (Expected for Metadata "
+            "Scans)\n",
+            cuid);
     return;
   }
 
@@ -326,13 +324,33 @@ void HotspotManager::FinalizeScanAsCompaction(
 
     final_segments.push_back(tail_segment);
   } else {
+    // If we have no boundary keys, it means the buffer has no data for this
+    // CUID. We shouldn't proceed with UpdateSnapshot if there's no tail unless
+    // we have pending SSTs. But even with pending SSTs, replacing the whole
+    // snapshot might be dangerous if we didn't scan everything.
     fprintf(stderr,
             "[HotspotManager] GetBoundaryKeys failed for CUID %lu. Has "
-            "buffered data: %d\n",
-            cuid, has_buffered_data ? 1 : 0);
+            "buffered data: %d, Pending SSTs: %zu\n",
+            cuid, has_buffered_data ? 1 : 0, final_segments.size());
+
+    if (final_segments.empty()) {
+      return;
+    }
   }
 
-  if (final_segments.empty()) return;
+  // Only update snapshot if we actually have segments to update with
+  if (final_segments.empty()) {
+    fprintf(stdout,
+            "[HotspotManager] FinalizeScanAsCompaction for CUID %lu skipped: "
+            "final_segments is empty.\n",
+            cuid);
+    return;
+  }
+
+  fprintf(stdout,
+          "[HotspotManager] FinalizeScanAsCompaction for CUID %lu updating "
+          "snapshot with %zu segments.\n",
+          cuid, final_segments.size());
 
   // 更新这个 cuid 的 Snapshot
   index_table_.UpdateSnapshot(cuid, final_segments);

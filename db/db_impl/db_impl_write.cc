@@ -92,6 +92,7 @@ Status DBImpl::Delete(const WriteOptions& write_options,
     return s;
   }
   // for delta
+  // 问题：没有 WAL, seqno 等等的记录
   if (hotspot_manager_ && hotspot_manager_->InterceptDelete(key)) {
     return Status::OK();
   }

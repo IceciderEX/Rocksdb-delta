@@ -574,10 +574,19 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   if (became_hot) {
                     hotspot_manager_->EnqueueForInitScan(cuid);
                     delta_ctx_.trigger_scan_as_compaction = false;
-                  } else if (delta_ctx_.is_current_hot) {
+                  } else if (delta_ctx_.is_current_hot &&
+                             read_options_.skip_hot_path &&
+                             read_options_.populate_hot_buffer) {
+                    // Cold path scan (Init Scan) requested to populate buffer
                     delta_ctx_.trigger_scan_as_compaction =
                         hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
+                  } else if (delta_ctx_.is_current_hot &&
+                             read_options_.skip_hot_path &&
+                             !read_options_.populate_hot_buffer) {
+                    // Metadata Scan - DO NOT trigger buffering
+                    delta_ctx_.trigger_scan_as_compaction = false;
                   } else {
+                    // Hot path scan -> 由 partial merge 处理
                     delta_ctx_.trigger_scan_as_compaction = false;
                   }
                 }

@@ -6989,6 +6989,7 @@ void DBImpl::ProcessPendingHotCuids() {
     ReadOptions read_opts;
     read_opts.delta_full_scan = true;
     read_opts.skip_hot_path = true;
+    read_opts.populate_hot_buffer = true;
     Slice upper_bound_slice(upper_bound_key);
     read_opts.iterate_upper_bound = &upper_bound_slice;
     ColumnFamilyHandle* cfh = DefaultColumnFamily();
@@ -7016,6 +7017,9 @@ void DBImpl::ProcessPendingHotCuids() {
   }
 }
 
+// 用户的全版本scan仍然走热数据path，
+// 在系统后台进行一次全版本的scan（冷数据path），用于更新GDCT
+// 即为MetadataScans
 void DBImpl::ProcessPendingMetadataScans() {
   if (!hotspot_manager_) {
     return;
