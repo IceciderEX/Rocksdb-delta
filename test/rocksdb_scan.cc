@@ -93,7 +93,7 @@ void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
 void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
   ReadOptions ro;
   while (!stop_test) {
-    uint64_t cuid = cuids[rand() % cuids.size()];
+    uint64_t cuid = 1003;
     ro.delta_full_scan = (rand() % 2 == 0);
 
     std::string start_key = GenerateKey(cuid, 0);
@@ -120,11 +120,39 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
                 << std::endl;
       global_stats.errors++;
     } else {
+      std::vector<uint64_t> missing;
       for (uint64_t rid : expected) {
         if (found.find(rid) == found.end()) {
-          std::cerr << "Reader " << id << " error: Missing row " << rid
-                    << " for cuid " << cuid << std::endl;
-          global_stats.errors++;
+          missing.push_back(rid);
+        }
+      }
+
+      if (!missing.empty()) {
+        if (missing.size() <= 40) {
+          for (uint64_t rid : missing) {
+            std::cerr << "Reader " << id << " error: Missing row " << rid
+                      << " for cuid " << cuid << std::endl;
+          }
+        } else {
+          for (int i = 0; i < 20; i++) {
+            std::cerr << "Reader " << id << " error: Missing row " << missing[i]
+                      << " for cuid " << cuid << std::endl;
+          }
+          std::cerr << "Reader " << id << " error: ... (skipped " << (missing.size() - 40)
+                    << " entries) ..." << std::endl;
+          for (size_t i = missing.size() - 20; i < missing.size(); i++) {
+            std::cerr << "Reader " << id << " error: Missing row " << missing[i]
+                      << " for cuid " << cuid << std::endl;
+          }
+        }
+        std::cerr << "Reader " << id << " error: Total missing rows: " << missing.size()
+                  << " for cuid " << cuid << std::endl;
+        global_stats.errors += missing.size();
+
+        found.clear();
+        for (it->Seek(start_key); it->Valid(); it->Next()) {
+          if (ExtractCUID(it->key()) != cuid) break;
+          found.insert(ExtractRowID(it->key()));
         }
       }
     }

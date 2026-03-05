@@ -50,15 +50,24 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   auto& entry = it->second;
   bool found_mem_segment = false;
 
-  // 遍历 Snapshot 片段，寻找 file_number 为 -1 的片段，进行一个promote
+  // 遍历 Snapshot 片段，寻找 file_number 为 -1
+  // 且键范围对应片段，进行一个promote
   for (auto& seg : entry.snapshot_segments) {
     if (seg.file_number == static_cast<uint64_t>(-1)) {
-      seg.file_number = new_segment.file_number;
-      seg.first_key = new_segment.first_key;
-      seg.last_key = new_segment.last_key;
+      // 新生成的 segment 应该属于这个 mem segment (-1)的一部分或全部？
+      // [first, last] -> [seg.first, -1 seg.last] 之间
+      bool is_left = (ExtractUserKey(new_segment.last_key).ToString() <
+                      ExtractUserKey(seg.first_key).ToString());
+      bool is_right = (ExtractUserKey(new_segment.first_key).ToString() >
+                       ExtractUserKey(seg.last_key).ToString());
+      if (!is_left && !is_right) {
+        seg.file_number = new_segment.file_number;
+        seg.first_key = new_segment.first_key;
+        seg.last_key = new_segment.last_key;
 
-      found_mem_segment = true;
-      break;
+        found_mem_segment = true;
+        break;
+      }
     }
   }
 
@@ -281,6 +290,10 @@ void HotIndexTable::ReplaceOverlappingSegments(
                       ExtractUserKey(new_segment.first_key).ToString());
       bool is_right = (ExtractUserKey(it->first_key).ToString() >
                        ExtractUserKey(new_segment.last_key).ToString());
+      std::string s1 = ExtractUserKey(new_segment.first_key).ToString();
+      std::string s2 = ExtractUserKey(new_segment.last_key).ToString();
+      std::string s3 = ExtractUserKey(it->first_key).ToString();
+      std::string s4 = ExtractUserKey(it->last_key).ToString();
 
       if (!is_left && !is_right) {
         segments_to_unref.push_back(*it);

@@ -182,18 +182,24 @@ Status HotspotManager::FlushBlockToSharedSST(
 
     // 当前 CUID 的所有 Entry
     while (i < entries.size() && entries[i].cuid == current_cuid) {
-      const auto& current_key = entries[i].key;
-      // 去重(在delta表中按理说不存在，因为是append-only key)
+      const std::string& current_internal_key = entries[i].key;
+      Slice current_user_key_slice = ExtractUserKey(current_internal_key);
+      std::string current_user_key = current_user_key_slice.ToString();
+
+      // 去重
       if (!is_first_entry_in_segment &&
-          current_key == last_written_key_in_segment) {
+          current_user_key == last_written_key_in_segment) {
         i++;
         continue;
       }
-      s = sst_writer.Put(entries[i].key, entries[i].value);
+      // TODO:这里待确定的问题：
+      // sst writer 期望写入 user key，并为它们统一赋 seq = 0, type = value
+      // 对于 snapshot 数据 + append-only 情形下，可以吗？
+      s = sst_writer.Put(current_user_key_slice, entries[i].value);
       if (!s.ok()) return s;
 
-      last_written_key_in_segment = current_key;
-      segment_last_key = current_key;  // 实时更新 Segment Last Key
+      last_written_key_in_segment = current_user_key;
+      segment_last_key = current_internal_key;  // 实时更新 Segment Last Key
       written_count++;
       is_first_entry_in_segment = false;
       i++;

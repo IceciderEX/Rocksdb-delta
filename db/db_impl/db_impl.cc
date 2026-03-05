@@ -7196,10 +7196,6 @@ void DBImpl::ProcessPendingPartialMerge() {
     return;
   }
 
-  if (trigger_flush) {
-    hotspot_manager_->TriggerBufferFlush();
-  }
-
   // 构造新的 DataSegment
   DataSegment new_segment;
   new_segment.file_number = static_cast<uint64_t>(-1);
@@ -7217,8 +7213,16 @@ void DBImpl::ProcessPendingPartialMerge() {
     obsolete_files.push_back(seg.file_number);
   }
 
+  // MUST swap the order BEFORE TriggerBufferFlush:
+  // insert the {-1} memory segment first so that if TriggerBufferFlush is
+  // called, it can properly find and promote the {-1} segment to a real
+  // physical file.
   hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
       task.cuid, new_segment, obsolete_files);
+
+  if (trigger_flush) {
+    hotspot_manager_->TriggerBufferFlush();
+  }
 
   fprintf(stdout,
           "[DBImpl] PartialMerge completed for CUID %lu: merged %zu entries "

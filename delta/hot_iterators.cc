@@ -355,8 +355,8 @@ void DeltaSwitchingIterator::InitColdIter() {
   }
 }
 
-void DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
-  if (hot_iter_ && current_hot_cuid_ == cuid) return;
+bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
+  if (hot_iter_ && current_hot_cuid_ == cuid) return true;
 
   if (hot_iter_) {
     delete hot_iter_;
@@ -366,9 +366,8 @@ void DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
   // 1. 获取元数据
   HotIndexEntry entry;
   if (!hotspot_manager_->GetHotIndexEntry(cuid, &entry)) {
-    // hot 但是没有index
-    hot_iter_ = NewEmptyInternalIterator<Slice>(arena_);
-    return;
+    // hot 但是没有index (可能正在后台执行 Init Scan)
+    return false;
   }
 
   // snapshot and delta
@@ -384,6 +383,7 @@ void DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
   std::vector<InternalIterator*> children = {delta_iter, snapshot_iter};
   hot_iter_ = NewMergingIterator(&icmp_, children.data(), 2);
   current_hot_cuid_ = cuid;
+  return true;
 }
 
 void DeltaSwitchingIterator::Seek(const Slice& target) {
@@ -413,9 +413,15 @@ void DeltaSwitchingIterator::Seek(const Slice& target) {
   }
   // 否则，不论是点查还是全扫描(delta_full_scan)，只要是热点，全部走热点路径提供给用户！
   else if (cuid != 0 && hotspot_manager_->IsHot(cuid)) {
-    InitHotIter(cuid);
-    current_iter_ = hot_iter_;
-    is_hot_mode_ = true;
+    if (InitHotIter(cuid)) {
+      current_iter_ = hot_iter_;
+      is_hot_mode_ = true;
+    } else {
+      // 热点索引尚未建立（如 Init Scan 还在进行中），回退到 Cold Path
+      InitColdIter();
+      current_iter_ = cold_iter_;
+      is_hot_mode_ = false;
+    }
   }
   // 既不是 skip_hot_path 也不是热点，默认走冷路径
   else {
