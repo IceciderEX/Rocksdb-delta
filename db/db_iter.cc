@@ -537,21 +537,29 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
 
                 // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
                 if (delta_ctx_.last_cuid != cuid) {
-                  // 将上个 cuid 的 Scan-as-Compaction 结果提交
+                  // 将上个 cuid 的扫描结果提交
                   if (delta_ctx_.last_cuid != 0 &&
-                      delta_ctx_.trigger_scan_as_compaction) {
-                    // hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
-                    // 将上个 cuid 的 Scan-as-Compaction 结果提交
+                      !read_options_.is_metadata_scan) {
+                    // 只有非 metadata_scan 才需要评估和触发后续动作
                     auto strategy =
                         hotspot_manager_->EvaluateScanAsCompactionStrategy(
                             delta_ctx_.last_cuid, read_options_.delta_full_scan,
                             delta_ctx_.scan_first_key,
                             delta_ctx_.scan_last_key);
 
-                    hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
-                        delta_ctx_.last_cuid, strategy,
-                        delta_ctx_.scan_first_key, delta_ctx_.scan_last_key,
-                        delta_ctx_.visited_units_for_cuid);
+                    // 如果决定要 kFullReplace，但其实并未发生缓冲
+                    bool execute = true;
+                    if (strategy == ScanAsCompactionStrategy::kFullReplace &&
+                        !delta_ctx_.trigger_scan_as_compaction) {
+                      execute = false;
+                    }
+
+                    if (execute) {
+                      hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
+                          delta_ctx_.last_cuid, strategy,
+                          delta_ctx_.scan_first_key, delta_ctx_.scan_last_key,
+                          delta_ctx_.visited_units_for_cuid);
+                    }
                   }
 
                   // fullscan 需要进行一次coldpath，更新GDCT
@@ -576,8 +584,10 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                     delta_ctx_.trigger_scan_as_compaction = false;
                   } else if (delta_ctx_.is_current_hot &&
                              read_options_.skip_hot_path &&
-                             read_options_.populate_hot_buffer) {
-                    // Cold path scan (Init Scan) requested to populate buffer
+                             !read_options_.is_metadata_scan) {
+                    // 只有非 metadata_scan 的 cold path scan 才触发
+                    // scan-as-compaction hot path scan
+                    // 读的是热点数据结构本身,不应该再次 buffer 并替换 snapshot
                     delta_ctx_.trigger_scan_as_compaction =
                         hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
                   } else if (delta_ctx_.is_current_hot &&
@@ -618,10 +628,19 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   }
                   delta_ctx_.scan_last_key = key_str;
 
-                  bool buffer_full = hotspot_manager_->BufferHotData(
-                      cuid, temp_internal_key.Encode(), value());
-                  if (buffer_full) {
-                    hotspot_manager_->TriggerBufferFlush();
+                  // 将 scan数据送入热点 Buffer
+                  if (delta_ctx_.trigger_scan_as_compaction) {
+                    bool buffer_full = hotspot_manager_->BufferHotData(
+                        cuid, temp_internal_key.Encode(), value());
+                    if (buffer_full) {
+                      hotspot_manager_->TriggerBufferFlush();
+                    }
+                  } else if (!read_options_.is_metadata_scan) {
+                    // 如果不是全量 Scan（比如是用户的部分 Scan），且不是
+                    // metadata scan 我们收集本次 scan 涉及的每条数据，后续交给
+                    // PartialMerge 去重合并
+                    delta_ctx_.scan_data.push_back(
+                        {key_str, value().ToString()});
                   }
                 }
               }

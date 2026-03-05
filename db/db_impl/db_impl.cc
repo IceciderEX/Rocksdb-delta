@@ -7054,6 +7054,8 @@ void DBImpl::ProcessPendingMetadataScans() {
     ReadOptions read_opts;
     read_opts.delta_full_scan = true;
     read_opts.skip_hot_path = true;  // 强制走 Cold Path
+    read_opts.is_metadata_scan =
+        true;  // 隔离 Metadata Scan，防止其替换 Snapshot
     Slice upper_bound_slice(upper_bound_key);
     read_opts.iterate_upper_bound = &upper_bound_slice;
     ColumnFamilyHandle* cfh = DefaultColumnFamily();
@@ -7080,6 +7082,57 @@ void DBImpl::ProcessPendingMetadataScans() {
     }
   }
 }
+
+namespace {
+class ScanDataIterator : public InternalIterator {
+ public:
+  explicit ScanDataIterator(
+      const std::vector<std::pair<std::string, std::string>>& data)
+      : data_(data), it_(data_.begin()) {}
+
+  bool Valid() const override { return it_ != data_.end(); }
+  void SeekToFirst() override { it_ = data_.begin(); }
+  void SeekToLast() override {
+    if (data_.empty()) {
+      it_ = data_.end();
+    } else {
+      it_ = data_.end() - 1;
+    }
+  }
+  void Seek(const Slice& target) override {
+    it_ = std::lower_bound(
+        data_.begin(), data_.end(), target,
+        [](const std::pair<std::string, std::string>& a, const Slice& b) {
+          return Slice(a.first).compare(b) < 0;
+        });
+  }
+  void SeekForPrev(const Slice& target) override {
+    Seek(target);
+    if (!Valid()) {
+      SeekToLast();
+    } else if (Slice(it_->first).compare(target) > 0) {
+      Prev();
+    }
+  }
+  void Next() override {
+    if (Valid()) ++it_;
+  }
+  void Prev() override {
+    if (it_ != data_.begin()) {
+      --it_;
+    } else {
+      it_ = data_.end();
+    }
+  }
+  Slice key() const override { return Slice(it_->first); }
+  Slice value() const override { return Slice(it_->second); }
+  Status status() const override { return Status::OK(); }
+
+ private:
+  const std::vector<std::pair<std::string, std::string>>& data_;
+  std::vector<std::pair<std::string, std::string>>::const_iterator it_;
+};
+}  // namespace
 
 // 处理 Partial Merge 任务
 void DBImpl::ProcessPendingPartialMerge() {
@@ -7147,11 +7200,11 @@ void DBImpl::ProcessPendingPartialMerge() {
     children.push_back(delta_iter);
   }
 
-  // 3. Buffer Iterator
-  InternalIterator* buffer_iter =
-      hotspot_manager_->NewBufferIterator(task.cuid, &icmp);
-  if (buffer_iter) {
-    children.push_back(buffer_iter);
+  // 3. Scan Data Iterator (Local to this PartialMerge execution)
+  InternalIterator* scan_data_iter = nullptr;
+  if (!task.scan_data.empty()) {
+    scan_data_iter = new ScanDataIterator(task.scan_data);
+    children.push_back(scan_data_iter);
   }
 
   if (children.empty()) {

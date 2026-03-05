@@ -2277,9 +2277,8 @@ struct ReadOptions {
   bool delta_full_scan = false;
   // 跳过热点路径，直接读取冷数据
   bool skip_hot_path = false;
-  // If true, the scan will populate the HotDataBuffer (used for Init Scan).
-  // If false, it only reads and calculates physical units (for Metadata Scan).
-  bool populate_hot_buffer = false;
+  // 用于标记是否为系统后台触发的 Metadata Scan，如果是，则不执行缓冲和替换
+  bool is_metadata_scan = false;
 
   ReadOptions() {}
   ReadOptions(bool _verify_checksums, bool _fill_cache);

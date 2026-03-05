@@ -396,7 +396,8 @@ size_t HotspotManager::CountInvolvedDeltas(uint64_t cuid,
 void HotspotManager::FinalizeScanAsCompactionWithStrategy(
     uint64_t cuid, ScanAsCompactionStrategy strategy,
     const std::string& scan_first_key, const std::string& scan_last_key,
-    const std::unordered_set<uint64_t>& visited_files) {
+    const std::unordered_set<uint64_t>& visited_files,
+    const std::vector<std::pair<std::string, std::string>>& scan_data) {
   if (cuid == 0) return;
 
   switch (strategy) {
@@ -406,7 +407,7 @@ void HotspotManager::FinalizeScanAsCompactionWithStrategy(
       FinalizeScanAsCompaction(cuid, visited_files);
       break;
     case ScanAsCompactionStrategy::kPartialMerge:
-      EnqueuePartialMerge(cuid, scan_first_key, scan_last_key);
+      EnqueuePartialMerge(cuid, scan_first_key, scan_last_key, scan_data);
       break;
   }
 }
@@ -506,19 +507,25 @@ bool HotspotManager::HasPendingMetadataScans() const {
 
 // --------------------- Partial Merge Queue --------------------- //
 
-void HotspotManager::EnqueuePartialMerge(uint64_t cuid,
-                                         const std::string& scan_first_key,
-                                         const std::string& scan_last_key) {
+void HotspotManager::EnqueuePartialMerge(
+    uint64_t cuid, const std::string& scan_first_key,
+    const std::string& scan_last_key,
+    const std::vector<std::pair<std::string, std::string>>& scan_data) {
   std::lock_guard<std::mutex> lock(partial_merge_mutex_);
   // 避免重复添加相同 cuid 的任务?
-  for (const auto& task : partial_merge_queue_) {
-    if (task.cuid == cuid) return;
+  for (auto& task : partial_merge_queue_) {
+    if (task.cuid == cuid) {
+      // 已经有一个队列了，暂时忽略本次小的 scan触发，或者也可以用更大的 range
+      // 更新
+      return;
+    }
   }
-  partial_merge_queue_.push_back({cuid, scan_first_key, scan_last_key});
-  fprintf(
-      stdout,
-      "[HotspotManager] Enqueued PartialMerge for CUID %lu, range [%zu, %zu]\n",
-      cuid, scan_first_key.size(), scan_last_key.size());
+  partial_merge_queue_.push_back(
+      {cuid, scan_first_key, scan_last_key, scan_data});
+  fprintf(stdout,
+          "[HotspotManager] Enqueued PartialMerge for CUID %lu, range [%zu, "
+          "%zu], %zu pairs\n",
+          cuid, scan_first_key.size(), scan_last_key.size(), scan_data.size());
 }
 
 bool HotspotManager::HasPendingPartialMerge() const {
