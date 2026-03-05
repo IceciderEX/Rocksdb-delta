@@ -245,21 +245,37 @@ void HotspotManager::TriggerBufferFlush() {
       for (const auto& kv : new_segments) {
         uint64_t cuid = kv.first;
         const DataSegment& real_segment = kv.second;
-        // 直接作为 Snapshot 片段追加?
-        // index_table_.AppendSnapshotSegment(kv.first, kv.second);
-        auto it = pending_snapshots_.find(cuid);
-        if (it != pending_snapshots_.end()) {
-          // Case A: Scan 过程中触发的 Flush, Finalize 时一起提交
-          it->second.push_back(real_segment);
-        } else {
-          // Case B: scan 之后被其他cuid数据填满 flush，
-          // 检查 Index 中 {-1} 的记录
-          bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
-          if (!promoted) {
-            // 如果没有 -1?
-            index_table_.AppendSnapshotSegment(kv.first, kv.second);
+        // 先尝试在 IndexTable 中寻找对应的 {-1} 记录进行替换 (Promote)【PartialMerge不会进行finalize】
+        // -1 记录 -> 一次 cuid 的 buffer append没有填满buffer
+        bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
+
+        if (!promoted) {
+          // 无 -1，可能是前台 Scan_as_compaction 还在进行中触发的 Flush
+          // 放入 pending_snapshots_ 等待 Finalize 时统一提交
+          std::lock_guard<std::mutex> lock(pending_mutex_);
+          auto it = pending_snapshots_.find(cuid);
+          if (it != pending_snapshots_.end()) {
+            it->second.push_back(real_segment);
+          } else {
+            // 如果连 pending_snapshots_ 都没注册，强制 Append
+            index_table_.AppendSnapshotSegment(cuid, real_segment);
           }
         }
+
+        // if (it != pending_snapshots_.end()) {
+        //   // Case A: 前台的 Full Scan 全版本扫描，可能会产生多个 Snapshot 片段
+        //   // 这次 Scan 过程中触发的 Flush, 等到这个 scan 的 Finalize 时一起提交
+        //   // 问题：后台 partial merge 不进行 finalize
+        //   it->second.push_back(real_segment);
+        // } else {
+        //   // Case B: 有一个 cuid 在 scan 之后被其他cuid数据填满 flush（此cuid数据在pending_snapshots_）
+        //   // 检查这个 cuid 的 Index 中 {-1} 的记录通过 PromoteSnapshot 匹配绑定
+        //   bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
+        //   if (!promoted) {
+        //     // 如果没有 -1?
+        //     index_table_.AppendSnapshotSegment(kv.first, kv.second);
+        //   }
+        // }
       }
     } else {
       fprintf(stderr, "[HotspotManager] Failed to flush shared block: %s\n",
@@ -453,9 +469,9 @@ void HotspotManager::EnqueueMetadataScan(uint64_t cuid) {
     if (c == cuid) return;
   }
   pending_metadata_scans_.push_back(cuid);
-  fprintf(stdout,
-          "[HotspotManager] Enqueued CUID %lu for metadata ref-count scan\n",
-          cuid);
+  // fprintf(stdout,
+  //         "[HotspotManager] Enqueued CUID %lu for metadata ref-count scan\n",
+  //         cuid);
 }
 
 std::vector<uint64_t> HotspotManager::PopPendingMetadataScans() {

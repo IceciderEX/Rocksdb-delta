@@ -7027,10 +7027,10 @@ void DBImpl::ProcessPendingMetadataScans() {
     return;
   }
 
-  fprintf(
-      stdout,
-      "[DBImpl] Processing %zu pending CUIDs for background metadata scan\n",
-      pending_cuids.size());
+  // fprintf(
+  //     stdout,
+  //     "[DBImpl] Processing %zu pending CUIDs for background metadata scan\n",
+  //     pending_cuids.size());
 
   for (uint64_t cuid : pending_cuids) {
     // 构造扫描范围

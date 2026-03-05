@@ -128,19 +128,19 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
       }
 
       if (!missing.empty()) {
-        if (missing.size() <= 40) {
+        if (missing.size() <= 10) {
           for (uint64_t rid : missing) {
             std::cerr << "Reader " << id << " error: Missing row " << rid
                       << " for cuid " << cuid << std::endl;
           }
         } else {
-          for (int i = 0; i < 20; i++) {
+          for (int i = 0; i < 5; i++) {
             std::cerr << "Reader " << id << " error: Missing row " << missing[i]
                       << " for cuid " << cuid << std::endl;
           }
           std::cerr << "Reader " << id << " error: ... (skipped " << (missing.size() - 40)
                     << " entries) ..." << std::endl;
-          for (size_t i = missing.size() - 20; i < missing.size(); i++) {
+          for (size_t i = missing.size() - 5; i < missing.size(); i++) {
             std::cerr << "Reader " << id << " error: Missing row " << missing[i]
                       << " for cuid " << cuid << std::endl;
           }
