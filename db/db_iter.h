@@ -589,6 +589,8 @@ class DBIter final : public Iterator {
     // 当前 Scan 的 key 范围
     std::string scan_first_key;
     std::string scan_last_key;
+    // 小 Scan 采集的精确 KV 数据，供后台 PartialMerge 使用
+    std::vector<std::pair<std::string, std::string>> scan_data;
 
     void Reset() {
       last_cuid = 0;
@@ -597,6 +599,7 @@ class DBIter final : public Iterator {
       trigger_scan_as_compaction = false;
       scan_first_key.clear();
       scan_last_key.clear();
+      scan_data.clear();
     }
   } delta_ctx_;
 

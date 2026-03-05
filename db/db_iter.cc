@@ -558,7 +558,8 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                       hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
                           delta_ctx_.last_cuid, strategy,
                           delta_ctx_.scan_first_key, delta_ctx_.scan_last_key,
-                          delta_ctx_.visited_units_for_cuid);
+                          delta_ctx_.visited_units_for_cuid,
+                          delta_ctx_.scan_data);  // ✅ 传递本次 scan 的精确数据
                     }
                   }
 
@@ -572,6 +573,8 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   delta_ctx_.visited_units_for_cuid.clear();
                   delta_ctx_.scan_first_key.clear();
                   delta_ctx_.scan_last_key.clear();
+                  delta_ctx_.scan_data
+                      .clear();  // ✅ 清除上个 CUID 的 scan 数据
 
                   // 对这个 cuid 进行一次访问计数，用于判断是否为热点
                   bool became_hot = false;
@@ -585,18 +588,19 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   } else if (delta_ctx_.is_current_hot &&
                              read_options_.skip_hot_path &&
                              !read_options_.is_metadata_scan) {
-                    // 只有非 metadata_scan 的 cold path scan 才触发
-                    // scan-as-compaction hot path scan
-                    // 读的是热点数据结构本身,不应该再次 buffer 并替换 snapshot
+                    // 冷路径 scan（如 Init Scan）触发 SAC（全量缓冲）
                     delta_ctx_.trigger_scan_as_compaction =
                         hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
                   } else if (delta_ctx_.is_current_hot &&
-                             read_options_.skip_hot_path &&
-                             !read_options_.populate_hot_buffer) {
-                    // Metadata Scan - DO NOT trigger buffering
-                    delta_ctx_.trigger_scan_as_compaction = false;
+                             !read_options_.skip_hot_path &&
+                             read_options_.delta_full_scan) {
+                    // 用户热路径 Full Scan：同样根据条件触发 SAC
+                    // 条件：已有 snapshot 且 delta 数 >= threshold
+                    delta_ctx_.trigger_scan_as_compaction =
+                        hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
                   } else {
-                    // Hot path scan -> 由 partial merge 处理
+                    // 小 Scan 或其他情况：不缓冲数据，PartialMerge 依赖
+                    // scan_data
                     delta_ctx_.trigger_scan_as_compaction = false;
                   }
                 }
@@ -615,33 +619,29 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   }
                 }
 
-                // 将 scan数据送入热点 Buffer
+                InternalKey temp_internal_key(saved_key_.GetUserKey(),
+                                              ikey_.sequence, ikey_.type);
+                std::string key_str = temp_internal_key.Encode().ToString();
+
+                // 记录 scan 的 key 范围（始终记录，用于后续 Finalize
+                // 时定位范围）
+                if (delta_ctx_.scan_first_key.empty()) {
+                  delta_ctx_.scan_first_key = key_str;
+                }
+                delta_ctx_.scan_last_key = key_str;
+
                 if (delta_ctx_.trigger_scan_as_compaction) {
-                  InternalKey temp_internal_key(saved_key_.GetUserKey(),
-                                                ikey_.sequence, ikey_.type);
-                  std::string key_str = temp_internal_key.Encode().ToString();
-                  // std::string ukey_str = saved_key_.GetUserKey().ToString();
-
-                  // 记录 scan 的 key 范围
-                  if (delta_ctx_.scan_first_key.empty()) {
-                    delta_ctx_.scan_first_key = key_str;
+                  // Full Scan / Init Scan: 缓冲数据进全局 HotDataBuffer
+                  bool buffer_full = hotspot_manager_->BufferHotData(
+                      cuid, temp_internal_key.Encode(), value());
+                  if (buffer_full) {
+                    hotspot_manager_->TriggerBufferFlush();
                   }
-                  delta_ctx_.scan_last_key = key_str;
-
-                  // 将 scan数据送入热点 Buffer
-                  if (delta_ctx_.trigger_scan_as_compaction) {
-                    bool buffer_full = hotspot_manager_->BufferHotData(
-                        cuid, temp_internal_key.Encode(), value());
-                    if (buffer_full) {
-                      hotspot_manager_->TriggerBufferFlush();
-                    }
-                  } else if (!read_options_.is_metadata_scan) {
-                    // 如果不是全量 Scan（比如是用户的部分 Scan），且不是
-                    // metadata scan 我们收集本次 scan 涉及的每条数据，后续交给
-                    // PartialMerge 去重合并
-                    delta_ctx_.scan_data.push_back(
-                        {key_str, value().ToString()});
-                  }
+                } else if (!read_options_.is_metadata_scan &&
+                           !read_options_.delta_full_scan) {
+                  // 小 Scan（非 Full Scan，非 Metadata Scan）：
+                  // 收集精准 KV 数据，供后台 PartialMerge 使用
+                  delta_ctx_.scan_data.push_back({key_str, value().ToString()});
                 }
               }
             }
