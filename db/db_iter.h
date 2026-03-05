@@ -167,14 +167,23 @@ class DBIter final : public Iterator {
     // }
 
     if (hotspot_manager_ && delta_ctx_.last_cuid != 0 &&
-        delta_ctx_.trigger_scan_as_compaction) {
+        !read_options_.is_metadata_scan) {
       auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
           delta_ctx_.last_cuid, read_options_.delta_full_scan,
           delta_ctx_.scan_first_key, delta_ctx_.scan_last_key);
 
-      hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
-          delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
-          delta_ctx_.scan_last_key, delta_ctx_.visited_units_for_cuid);
+      bool execute = true;
+      if (strategy == ScanAsCompactionStrategy::kFullReplace &&
+          !delta_ctx_.trigger_scan_as_compaction) {
+        execute = false;
+      }
+
+      if (execute) {
+        hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
+            delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
+            delta_ctx_.scan_last_key, delta_ctx_.visited_units_for_cuid,
+            delta_ctx_.scan_data);
+      }
     }
 
     // for delta: 异步补全元数据 (当热路径 Full Scan 结束时入队)

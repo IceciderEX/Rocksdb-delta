@@ -245,37 +245,30 @@ void HotspotManager::TriggerBufferFlush() {
       for (const auto& kv : new_segments) {
         uint64_t cuid = kv.first;
         const DataSegment& real_segment = kv.second;
-        // 先尝试在 IndexTable 中寻找对应的 {-1} 记录进行替换 (Promote)【PartialMerge不会进行finalize】
-        // -1 记录 -> 一次 cuid 的 buffer append没有填满buffer
-        bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
 
-        if (!promoted) {
-          // 无 -1，可能是前台 Scan_as_compaction 还在进行中触发的 Flush
-          // 放入 pending_snapshots_ 等待 Finalize 时统一提交
+        // 先检查 pending_snapshots_，再尝试 PromoteSnapshot
+        // 如果该 CUID 有正在进行的 Scan（pending_snapshots_ 中有注册），
+        // 将 SST 放入 pending，由 FinalizeScanAsCompaction 提交
+        bool added_to_pending = false;
+        {
           std::lock_guard<std::mutex> lock(pending_mutex_);
           auto it = pending_snapshots_.find(cuid);
           if (it != pending_snapshots_.end()) {
             it->second.push_back(real_segment);
-          } else {
-            // 如果连 pending_snapshots_ 都没注册，强制 Append
-            index_table_.AppendSnapshotSegment(cuid, real_segment);
+            added_to_pending = true;
           }
         }
 
-        // if (it != pending_snapshots_.end()) {
-        //   // Case A: 前台的 Full Scan 全版本扫描，可能会产生多个 Snapshot 片段
-        //   // 这次 Scan 过程中触发的 Flush, 等到这个 scan 的 Finalize 时一起提交
-        //   // 问题：后台 partial merge 不进行 finalize
-        //   it->second.push_back(real_segment);
-        // } else {
-        //   // Case B: 有一个 cuid 在 scan 之后被其他cuid数据填满 flush（此cuid数据在pending_snapshots_）
-        //   // 检查这个 cuid 的 Index 中 {-1} 的记录通过 PromoteSnapshot 匹配绑定
-        //   bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
-        //   if (!promoted) {
-        //     // 如果没有 -1?
-        //     index_table_.AppendSnapshotSegment(kv.first, kv.second);
-        //   }
-        // }
+        if (!added_to_pending) {
+          // 无活跃 Scan，尝试 PromoteSnapshot（将 {-1} 内存段替换为真实 SST）
+          // 但是 partialMerge 是后台任务，不会进行
+          // FinalizeScanAsCompaction，需要考虑
+          bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
+          if (!promoted) {
+            // 既无活跃 Scan 也无 {-1} 段，强制 Append
+            index_table_.AppendSnapshotSegment(cuid, real_segment);
+          }
+        }
       }
     } else {
       fprintf(stderr, "[HotspotManager] Failed to flush shared block: %s\n",
@@ -378,7 +371,8 @@ size_t HotspotManager::CountInvolvedDeltas(uint64_t cuid,
 void HotspotManager::FinalizeScanAsCompactionWithStrategy(
     uint64_t cuid, ScanAsCompactionStrategy strategy,
     const std::string& scan_first_key, const std::string& scan_last_key,
-    const std::unordered_set<uint64_t>& visited_files) {
+    const std::unordered_set<uint64_t>& visited_files,
+    const std::vector<std::pair<std::string, std::string>>& scan_data) {
   if (cuid == 0) return;
 
   switch (strategy) {
@@ -388,7 +382,7 @@ void HotspotManager::FinalizeScanAsCompactionWithStrategy(
       FinalizeScanAsCompaction(cuid, visited_files);
       break;
     case ScanAsCompactionStrategy::kPartialMerge:
-      EnqueuePartialMerge(cuid, scan_first_key, scan_last_key);
+      EnqueuePartialMerge(cuid, scan_first_key, scan_last_key, scan_data);
       break;
   }
 }
@@ -488,19 +482,25 @@ bool HotspotManager::HasPendingMetadataScans() const {
 
 // --------------------- Partial Merge Queue --------------------- //
 
-void HotspotManager::EnqueuePartialMerge(uint64_t cuid,
-                                         const std::string& scan_first_key,
-                                         const std::string& scan_last_key) {
+void HotspotManager::EnqueuePartialMerge(
+    uint64_t cuid, const std::string& scan_first_key,
+    const std::string& scan_last_key,
+    const std::vector<std::pair<std::string, std::string>>& scan_data) {
   std::lock_guard<std::mutex> lock(partial_merge_mutex_);
   // 避免重复添加相同 cuid 的任务?
-  for (const auto& task : partial_merge_queue_) {
-    if (task.cuid == cuid) return;
+  for (auto& task : partial_merge_queue_) {
+    if (task.cuid == cuid) {
+      // 已经有一个队列了，暂时忽略本次小的 scan触发，或者也可以用更大的 range
+      // 更新
+      return;
+    }
   }
-  partial_merge_queue_.push_back({cuid, scan_first_key, scan_last_key});
-  fprintf(
-      stdout,
-      "[HotspotManager] Enqueued PartialMerge for CUID %lu, range [%zu, %zu]\n",
-      cuid, scan_first_key.size(), scan_last_key.size());
+  partial_merge_queue_.push_back(
+      {cuid, scan_first_key, scan_last_key, scan_data});
+  fprintf(stdout,
+          "[HotspotManager] Enqueued PartialMerge for CUID %lu, range [%zu, "
+          "%zu], %zu pairs\n",
+          cuid, scan_first_key.size(), scan_last_key.size(), scan_data.size());
 }
 
 bool HotspotManager::HasPendingPartialMerge() const {

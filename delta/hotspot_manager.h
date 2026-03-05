@@ -38,6 +38,8 @@ struct PartialMergePendingTask {
   uint64_t cuid;
   std::string scan_first_key;
   std::string scan_last_key;
+  // 小 Scan 中精准抓取的 KV 对数据
+  std::vector<std::pair<std::string, std::string>> scan_data;
 };
 
 class HotspotManager {
@@ -87,7 +89,8 @@ class HotspotManager {
       uint64_t cuid, ScanAsCompactionStrategy strategy,
       const std::string& scan_first_key = "",
       const std::string& scan_last_key = "",
-      const std::unordered_set<uint64_t>& visited_files = {});
+      const std::unordered_set<uint64_t>& visited_files = {},
+      const std::vector<std::pair<std::string, std::string>>& scan_data = {});
 
   bool IsCuidDeleted(uint64_t cuid) { return delete_table_.IsDeleted(cuid); }
 
@@ -200,8 +203,10 @@ class HotspotManager {
 
  public:
   // 加入 Partial Merge 队列 (前台调用，不阻塞)
-  void EnqueuePartialMerge(uint64_t cuid, const std::string& scan_first_key,
-                           const std::string& scan_last_key);
+  void EnqueuePartialMerge(
+      uint64_t cuid, const std::string& scan_first_key,
+      const std::string& scan_last_key,
+      const std::vector<std::pair<std::string, std::string>>& scan_data);
 
   // 检查是否有待处理的 Partial Merge 任务
   bool HasPendingPartialMerge() const;
