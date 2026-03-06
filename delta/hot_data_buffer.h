@@ -59,8 +59,7 @@ class HotDataBuffer {
  public:
   // explicit HotDataBuffer(size_t threshold_bytes = 64 * 1024 * 1024); // 默认
   // 64MB
-  explicit HotDataBuffer(size_t threshold_bytes = 1024 *
-                                                  1024);  // 先用 1MB 测试
+  explicit HotDataBuffer(size_t threshold_bytes = 16 * 1024);  // 先用 1MB 测试
 
   // 将数据追加到对应 CUID 的 buffer 中
   // 如果 buffer 大小超过阈值，返回 true (need Flush)
@@ -96,8 +95,9 @@ class HotSstLifecycleManager {
  public:
   HotSstLifecycleManager(const Options& options) : env_(options.env) {}
 
-  // 注册一个新生成的文件，初始引用计数为 0
-  void RegisterFile(uint64_t file_number, const std::string& file_path);
+  // 注册一个新生成的文件，以及它在 DB 根目录的链接路径
+  void RegisterFile(uint64_t file_number, const std::string& file_path,
+                    const std::string& link_path);
 
   // 增加引用计数 (当 IndexTable 添加指向该文件的 Segment 时调用)
   void Ref(uint64_t file_number);
@@ -112,6 +112,7 @@ class HotSstLifecycleManager {
 
   struct FileState {
     std::string file_path;
+    std::string link_path;
     int ref_count;
   };
 

@@ -167,7 +167,23 @@ Status HotspotManager::FlushBlockToSharedSST(
   Status s = sst_writer.Open(file_path);
   if (!s.ok()) return s;
 
-  lifecycle_manager_->RegisterFile(file_number, file_path);
+  // link file，让 snapshot 的 iterator 能够正确找到文件
+  // link_path = db_root / <file_number>.sst
+  // data_dir_ = dbname_ / hotspot_data
+  std::string db_root = data_dir_;
+  size_t last_slash = db_root.find_last_of("/\\");
+  if (last_slash != std::string::npos) {
+    db_root = db_root.substr(0, last_slash);
+  }
+  std::string link_path = db_root + "/" + std::to_string(file_number) + ".sst";
+
+  s = db_options_.env->LinkFile(file_path, link_path);
+  if (!s.ok()) {
+    fprintf(stderr, "[HotspotManager] Failed to create link %s -> %s: %s\n",
+            file_path.c_str(), link_path.c_str(), s.ToString().c_str());
+  }
+
+  lifecycle_manager_->RegisterFile(file_number, file_path, link_path);
 
   // 3. 遍历写入并记录 Segment
   auto& entries = block->entries;

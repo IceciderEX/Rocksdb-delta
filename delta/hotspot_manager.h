@@ -50,9 +50,6 @@ class HotspotManager {
 
   ~HotspotManager() = default;
 
-  // 返回数据给用户前调用 【暂时不要了】
-  //   void OnUserScan(const Slice& key, const Slice& value);
-
   // 返回 true 表示该 CUID 是热点
   // became_hot: 如果不为 nullptr，返回是否为首次成为热点
   bool RegisterScan(uint64_t cuid, bool is_full_scan,

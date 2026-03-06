@@ -314,10 +314,12 @@ int main() {
   int mem_seg_count = 0;
   DataSegment coalesced_seg;
   for (const auto& seg : entry.snapshot_segments) {
-    if (seg.file_number == static_cast<uint64_t>(-1)) {
-      mem_seg_count++;
-      coalesced_seg = seg;
-    }
+    // if (seg.file_number == static_cast<uint64_t>(-1)) {
+    //   mem_seg_count++;
+    //   coalesced_seg = seg;
+    // }
+    coalesced_seg = seg;
+    mem_seg_count++;
   }
   std::cout << "Memory segment count: " << mem_seg_count << std::endl;
   Check(mem_seg_count == 1,

@@ -67,9 +67,10 @@ std::unique_ptr<HotDataBlock> HotDataBuffer::ExtractBlockToFlush() {
 // --------------------- SST Lifecycle Management --------------------- //
 
 void HotSstLifecycleManager::RegisterFile(uint64_t file_number,
-                                          const std::string& file_path) {
+                                          const std::string& file_path,
+                                          const std::string& link_path) {
   std::lock_guard<std::mutex> lock(mutex_);
-  files_[file_number] = {file_path, 0};
+  files_[file_number] = {file_path, link_path, 0};
 }
 
 void HotSstLifecycleManager::Ref(uint64_t file_number) {
@@ -82,16 +83,26 @@ void HotSstLifecycleManager::Ref(uint64_t file_number) {
 
 void HotSstLifecycleManager::Unref(uint64_t file_number) {
   std::string file_to_delete;
+  std::string link_to_delete;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = files_.find(file_number);
     if (it != files_.end()) {
       it->second.ref_count--;
       if (it->second.ref_count <= 0) {
-        // 引用计数为 0，物理删除文件
+        // 引用计数为 0，物理删除文件及链接
         file_to_delete = it->second.file_path;
+        link_to_delete = it->second.link_path;
         files_.erase(it);
       }
+    }
+  }
+
+  if (!link_to_delete.empty()) {
+    Status s = env_->DeleteFile(link_to_delete);
+    if (!s.ok()) {
+      fprintf(stderr, "[HotSstLifecycle] Failed to delete link %s: %s\n",
+              link_to_delete.c_str(), s.ToString().c_str());
     }
   }
 
