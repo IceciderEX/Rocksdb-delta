@@ -1,9 +1,17 @@
 #include "delta/hot_iterators.h"
+#include "util/extract_cuid.h"
 
 #include "table/merging_iterator.h"
 #include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+std::string FormatKeyDisplay(const Slice& key) {
+  std::string cuid_part = std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
+  std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
+  return cuid_part + "..." + suffix;
+}
+
 
 static FileMetaData MakeFileMetaFromSegment(const DataSegment& seg) {
   FileMetaData meta;
@@ -67,6 +75,9 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
         TableReaderCaller::kUserIterator, nullptr, false,
         0,  // L0
         0, nullptr, nullptr, allow_unprepared_value, nullptr, nullptr);
+    
+    std::cout << "DELTA: " << FormatKeyDisplay(delta.first_key) << " - " << FormatKeyDisplay(delta.last_key)
+              << " (file: " << delta.file_number << ")" << std::endl;
 
     if (iter) {
       children.push_back(iter);
@@ -148,6 +159,8 @@ void HotSnapshotIterator::InitIterForSegment(size_t index) {
     current_read_options_ = read_options_;
     current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
     current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
+    std::cout << "SNAPSHOT Segment " << index << ": [" << FormatKeyDisplay(seg.first_key) << ", "
+              << FormatKeyDisplay(seg.last_key) << "]" << std::endl;
     current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
     current_lower_bound_slice_ = Slice(current_lower_bound_str_);
     current_upper_bound_slice_ = Slice(current_upper_bound_str_);

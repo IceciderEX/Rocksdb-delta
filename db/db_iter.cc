@@ -573,8 +573,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   delta_ctx_.visited_units_for_cuid.clear();
                   delta_ctx_.scan_first_key.clear();
                   delta_ctx_.scan_last_key.clear();
-                  delta_ctx_.scan_data
-                      .clear();  // ✅ 清除上个 CUID 的 scan 数据
+                  delta_ctx_.scan_data.clear();  // 清除上个 CUID 的 scan 数据
 
                   // 对这个 cuid 进行一次访问计数，用于判断是否为热点
                   bool became_hot = false;
@@ -589,15 +588,19 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                              read_options_.skip_hot_path &&
                              !read_options_.is_metadata_scan) {
                     // 冷路径 scan（如 Init Scan）触发 SAC（全量缓冲）
-                    delta_ctx_.trigger_scan_as_compaction =
-                        hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
+                    if (hotspot_manager_->ShouldTriggerScanAsCompaction(cuid)) {
+                      delta_ctx_.trigger_scan_as_compaction = true;
+                      hotspot_manager_->PrepareForFullReplace(cuid);
+                    }
                   } else if (delta_ctx_.is_current_hot &&
                              !read_options_.skip_hot_path &&
                              read_options_.delta_full_scan) {
                     // 用户热路径 Full Scan：同样根据条件触发 SAC
                     // 条件：已有 snapshot 且 delta 数 >= threshold
-                    delta_ctx_.trigger_scan_as_compaction =
-                        hotspot_manager_->ShouldTriggerScanAsCompaction(cuid);
+                    if (hotspot_manager_->ShouldTriggerScanAsCompaction(cuid)) {
+                      delta_ctx_.trigger_scan_as_compaction = true;
+                      hotspot_manager_->PrepareForFullReplace(cuid);
+                    }
                   } else {
                     // 小 Scan 或其他情况：不缓冲数据，PartialMerge 依赖
                     // scan_data
@@ -754,16 +757,33 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
 
   // for delta, this scan ends
   if (hotspot_manager_) {
-    // 最后一个 CUID 正在进行 Scan-as-Compaction，需要 Finalize
-    if (delta_ctx_.last_cuid != 0 && delta_ctx_.trigger_scan_as_compaction) {
+    // 最后一个 CUID 扫描结束，需要决定是否发起后台 Compaction (FullReplace
+    // 或 PartialMerge)
+    if (delta_ctx_.last_cuid != 0 && !read_options_.is_metadata_scan) {
       auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
           delta_ctx_.last_cuid, read_options_.delta_full_scan,
           delta_ctx_.scan_first_key, delta_ctx_.scan_last_key);
 
-      hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
-          delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
-          delta_ctx_.scan_last_key, delta_ctx_.visited_units_for_cuid);
+      bool execute = true;
+      if (strategy == ScanAsCompactionStrategy::kFullReplace &&
+          !delta_ctx_.trigger_scan_as_compaction) {
+        execute = false;
+      }
+
+      if (execute) {
+        hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
+            delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
+            delta_ctx_.scan_last_key, delta_ctx_.visited_units_for_cuid,
+            delta_ctx_.scan_data);
+      }
     }
+
+    // 如果是 Full Scan 且允许跳入冷数据，入队更新 GDCT 的 Metadata Scan
+    if (read_options_.delta_full_scan && delta_ctx_.is_current_hot &&
+        !read_options_.skip_hot_path && delta_ctx_.last_cuid != 0) {
+      hotspot_manager_->EnqueueMetadataScan(delta_ctx_.last_cuid);
+    }
+
     delta_ctx_.Reset();
   }
 

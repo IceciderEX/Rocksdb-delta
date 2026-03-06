@@ -61,6 +61,9 @@ class HotspotManager {
   // 收集数据 (只有 RegisterScan 返回 true 时才调用此函数)
   bool BufferHotData(uint64_t cuid, const Slice& key, const Slice& value);
 
+  // 为将要向 Buffer 写入 FullReplace 数据的 CUid 准备环境
+  void PrepareForFullReplace(uint64_t cuid);
+
   Status FlushBlockToSharedSST(
       std::unique_ptr<HotDataBlock> block,
       std::unordered_map<uint64_t, DataSegment>* output_segments);

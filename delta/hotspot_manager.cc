@@ -62,13 +62,9 @@ bool HotspotManager::RegisterScan(uint64_t cuid, bool is_full_scan,
   }
 
   if (is_hot && !first_time_hot) {
-    // 已经是热点（非首次），初始化 pending 列表
-    if (ShouldTriggerScanAsCompaction(cuid)) {
-      std::lock_guard<std::mutex> lock(pending_mutex_);
-      if (pending_snapshots_.find(cuid) == pending_snapshots_.end()) {
-        pending_snapshots_[cuid] = std::vector<DataSegment>();
-      }
-    }
+    // We do not eagerly initialize pending_snapshots_ here anymore.
+    // It should be explicitly initialized by PrepareForFullReplace when a
+    // FullScan really starts buffering.
   }
 
   if (is_full_scan) {
@@ -84,6 +80,13 @@ bool HotspotManager::BufferHotData(uint64_t cuid, const Slice& key,
     active_buffered_cuids_.insert(cuid);
   }
   return buffer_.Append(cuid, key, value);
+}
+
+void HotspotManager::PrepareForFullReplace(uint64_t cuid) {
+  std::lock_guard<std::mutex> lock(pending_mutex_);
+  if (pending_snapshots_.find(cuid) == pending_snapshots_.end()) {
+    pending_snapshots_[cuid] = std::vector<DataSegment>();
+  }
 }
 
 bool HotspotManager::InterceptDelete(const Slice& key) {

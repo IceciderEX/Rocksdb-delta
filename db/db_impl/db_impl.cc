@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "db/db_impl/db_impl.h"
+#include "util/extract_cuid.h"
 
 #include <cstdint>
 #ifdef OS_SOLARIS
@@ -6988,8 +6989,7 @@ void DBImpl::ProcessPendingHotCuids() {
 
     ReadOptions read_opts;
     read_opts.delta_full_scan = true;
-    read_opts.skip_hot_path = true;
-    read_opts.populate_hot_buffer = true;
+    read_opts.skip_hot_path = true;  // Init Scan 走冷路径，读 SST 文件
     Slice upper_bound_slice(upper_bound_key);
     read_opts.iterate_upper_bound = &upper_bound_slice;
     ColumnFamilyHandle* cfh = DefaultColumnFamily();
@@ -7190,6 +7190,13 @@ void DBImpl::ProcessPendingPartialMerge() {
         overlapping_snaps, task.cuid, hotspot_manager_.get(),
         cfd->table_cache(), read_opts, file_opts, icmp, mutable_cf_opts);
     children.push_back(snap_iter);
+
+    std::cout << "SNAPSHOT Seg Start:   " << (overlapping_snaps[0].first_key.size() >= 24 ? ExtractCUID(overlapping_snaps[0].first_key) : 0)
+            << "..." << (overlapping_snaps[0].first_key.size() > 24 ? overlapping_snaps[0].first_key.substr(24) : "")
+            << std::endl;
+    std::cout << "SNAPSHOT[0] Seg End:     " << (overlapping_snaps[0].last_key.size() >= 24 ? ExtractCUID(overlapping_snaps[0].last_key) : 0)
+            << "..." << (overlapping_snaps[0].last_key.size() > 24 ? overlapping_snaps[0].last_key.substr(24) : "")
+            << std::endl;
   }
 
   // 2. Delta Iterator
@@ -7198,6 +7205,16 @@ void DBImpl::ProcessPendingPartialMerge() {
         new HotDeltaIterator(overlapping_deltas, cfd->table_cache(), read_opts,
                              file_opts, icmp, mutable_cf_opts, false);
     children.push_back(delta_iter);
+
+    for (const auto& delta : overlapping_deltas) {
+      std::cout << "DELTA Seg Start:   " << (delta.first_key.size() >= 24 ? ExtractCUID(delta.first_key) : 0)
+              << "..." << (delta.first_key.size() > 24 ? delta.first_key.substr(24) : "")
+              << std::endl;
+
+      std::cout << "DELTA Seg End:     " << (delta.last_key.size() >= 24 ? ExtractCUID(delta.last_key) : 0)
+              << "..." << (delta.last_key.size() > 24 ? delta.last_key.substr(24) : "")
+              << std::endl;
+    }
   }
 
   // 3. Scan Data Iterator (Local to this PartialMerge execution)
@@ -7205,6 +7222,13 @@ void DBImpl::ProcessPendingPartialMerge() {
   if (!task.scan_data.empty()) {
     scan_data_iter = new ScanDataIterator(task.scan_data);
     children.push_back(scan_data_iter);
+
+    std::cout << "SCAN Data Start:   " << (task.scan_data[0].first.size() >= 24 ? ExtractCUID(task.scan_data[0].first) : 0)
+            << "..." << (task.scan_data[0].first.size() > 24 ? task.scan_data[0].first.substr(24) : "")
+            << std::endl;
+    std::cout << "SCAN Data End:     " << (task.scan_data.back().first.size() >= 24 ? ExtractCUID(task.scan_data.back().first) : 0)
+            << "..." << (task.scan_data.back().first.size() > 24 ? task.scan_data.back().first.substr(24) : "")
+            << std::endl;
   }
 
   if (children.empty()) {
@@ -7233,6 +7257,10 @@ void DBImpl::ProcessPendingPartialMerge() {
       continue;
     }
     last_user_key = user_key.ToString();
+
+    // std::cout << "This key: " << (key.size() >= 24 ? ExtractCUID(key) : 0)
+    //         << "..." << (key.size() > 24 ? key.ToString().substr(24) : "")
+    //         << std::endl;
 
     // 写入 Buffer
     if (hotspot_manager_->BufferHotData(task.cuid, key, value)) {
