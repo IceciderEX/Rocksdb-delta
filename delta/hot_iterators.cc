@@ -484,8 +484,33 @@ void DeltaSwitchingIterator::SeekToLast() {
 bool DeltaSwitchingIterator::Valid() const {
   return current_iter_ && current_iter_->Valid();
 }
+// void DeltaSwitchingIterator::Next() {
+//   if (current_iter_) current_iter_->Next();
+// }
 void DeltaSwitchingIterator::Next() {
-  if (current_iter_) current_iter_->Next();
+  if (!current_iter_) return;
+
+  if (is_hot_mode_ && current_iter_->Valid()) {
+    // current UserKey，用于去重
+    Slice prev_user_key = ExtractUserKey(current_iter_->key());
+    std::string prev_user_key_str = prev_user_key.ToString();
+
+    current_iter_->Next();
+
+    // 跳过与上一条相同 UserKey 的重复条目
+    // Delta(Seq>0) 和 Snapshot(Seq=0) 可能包含相同 UserKey，
+    // MergingIterator 会按 InternalKey 顺序依次输出，需要去重
+    while (current_iter_->Valid()) {
+      Slice cur_user_key = ExtractUserKey(current_iter_->key());
+      if (icmp_.user_comparator()->Compare(cur_user_key, prev_user_key_str) !=
+          0) {
+        break;
+      }
+      current_iter_->Next();
+    }
+  } else {
+    current_iter_->Next();
+  }
 }
 void DeltaSwitchingIterator::Prev() {
   if (current_iter_) current_iter_->Prev();

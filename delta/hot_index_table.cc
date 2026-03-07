@@ -110,17 +110,28 @@ void HotIndexTable::MarkDeltasAsObsolete(
   if (it == table_.end()) return;
 
   auto& entry = it->second;
-  if (entry.deltas.empty()) return;
-
   if (visited_files.empty()) return;
 
+  // 从 entry.deltas 中匹配并移入 obsolete_deltas
+  std::unordered_set<uint64_t> matched_files;
   for (auto d_it = entry.deltas.begin(); d_it != entry.deltas.end();) {
     if (visited_files.count(d_it->file_number)) {
+      matched_files.insert(d_it->file_number);
       entry.obsolete_deltas.push_back(*d_it);
       d_it = entry.deltas.erase(d_it);
     } else {
       ++d_it;
     }
+  }
+
+  // 对于 visited_files 中不在 deltas 中找到的文件
+  // 可能是因为第一次 full scan 之前生成的 SST，直接标记为 obsolete
+  // TIPS & TODO：是否存在问题？
+  for (uint64_t fid : visited_files) {
+    if (matched_files.count(fid)) continue;
+    DataSegment dummy;
+    dummy.file_number = fid;
+    entry.obsolete_deltas.push_back(dummy);
   }
 }
 

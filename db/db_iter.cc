@@ -559,7 +559,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                           delta_ctx_.last_cuid, strategy,
                           delta_ctx_.scan_first_key, delta_ctx_.scan_last_key,
                           delta_ctx_.visited_units_for_cuid,
-                          delta_ctx_.scan_data);  // ✅ 传递本次 scan 的精确数据
+                          delta_ctx_.scan_data);  // 本次 scan 的数据(for partial merge)
                     }
                   }
 
@@ -622,8 +622,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   }
                 }
 
-                InternalKey temp_internal_key(saved_key_.GetUserKey(),
-                                              ikey_.sequence, ikey_.type);
+                InternalKey temp_internal_key(saved_key_.GetUserKey(), ikey_.sequence, ikey_.type);
                 std::string key_str = temp_internal_key.Encode().ToString();
 
                 // 记录 scan 的 key 范围（始终记录，用于后续 Finalize
@@ -644,6 +643,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                            !read_options_.delta_full_scan) {
                   // 小 Scan（非 Full Scan，非 Metadata Scan）：
                   // 收集精准 KV 数据，供后台 PartialMerge 使用
+                  // 【可考虑优化点】
                   delta_ctx_.scan_data.push_back({key_str, value().ToString()});
                 }
               }
