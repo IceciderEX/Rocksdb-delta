@@ -64,6 +64,7 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
         seg.file_number = new_segment.file_number;
         seg.first_key = new_segment.first_key;
         seg.last_key = new_segment.last_key;
+        seg.file_size = new_segment.file_size;
 
         found_mem_segment = true;
         break;

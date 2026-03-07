@@ -1,23 +1,29 @@
 #include "delta/hot_iterators.h"
-#include "util/extract_cuid.h"
 
 #include "table/merging_iterator.h"
 #include "util/cast_util.h"
+#include "util/extract_cuid.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 std::string FormatKeyDisplay(const Slice& key) {
-  std::string cuid_part = std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
+  std::string cuid_part =
+      std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
   std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
   return cuid_part + "..." + suffix;
 }
 
-
-static FileMetaData MakeFileMetaFromSegment(const DataSegment& seg) {
+static FileMetaData MakeFileMetaFromSegment(const DataSegment& seg, bool is_delta = true) {
   FileMetaData meta;
-  // file_number, path_id=0, file_size=0 (unknown/cached)
-  meta.fd = FileDescriptor(seg.file_number, 0, 0);
-  // 这里需要是internal key
+  // file_number, path_id=0, file_size
+  meta.fd = FileDescriptor(seg.file_number, 0, seg.file_size);
+  // file_size = 0 对于 delta 来说会 Cache Hit，直接返回 FileReader
+  if (seg.file_size <= 0 && !is_delta) {
+    std::cerr << "[ERROR] Invalid file size " << seg.file_size
+              << " for segment with file number " << seg.file_number
+              << std::endl;
+  }
+  // internal key
   meta.smallest.DecodeFrom(seg.first_key);
   meta.largest.DecodeFrom(seg.last_key);
   return meta;
@@ -64,9 +70,7 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
     ro.iterate_lower_bound = &bounds_slices_[i * 2];
     ro.iterate_upper_bound = &bounds_slices_[i * 2 + 1];
 
-    FileDescriptor fd(delta.file_number, 0, 0);  // PathId=0, Size=0(unknown)
-    FileMetaData meta;
-    meta.fd = fd;
+    FileMetaData meta = MakeFileMetaFromSegment(delta, true);
 
     InternalIterator* iter = table_cache->NewIterator(
         ro, file_options, icmp,  // InternalKeyComparator
@@ -75,8 +79,9 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
         TableReaderCaller::kUserIterator, nullptr, false,
         0,  // L0
         0, nullptr, nullptr, allow_unprepared_value, nullptr, nullptr);
-    
-    std::cout << "DELTA: " << FormatKeyDisplay(delta.first_key) << " - " << FormatKeyDisplay(delta.last_key)
+
+    std::cout << "DELTA: " << FormatKeyDisplay(delta.first_key) << " - "
+              << FormatKeyDisplay(delta.last_key)
               << " (file: " << delta.file_number << ")" << std::endl;
 
     if (iter) {
@@ -153,13 +158,13 @@ void HotSnapshotIterator::InitIterForSegment(size_t index) {
     current_iter_.reset(mem_iter);
   } else {
     // Case B: 物理 SST
-    FileDescriptor fd(seg.file_number, 0, 0);
-    FileMetaData meta = MakeFileMetaFromSegment(seg);
+    FileMetaData meta = MakeFileMetaFromSegment(seg, false);
 
     current_read_options_ = read_options_;
     current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
     current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
-    std::cout << "SNAPSHOT Segment " << index << ": [" << FormatKeyDisplay(seg.first_key) << ", "
+    std::cout << "SNAPSHOT Segment " << index << ": ["
+              << FormatKeyDisplay(seg.first_key) << ", "
               << FormatKeyDisplay(seg.last_key) << "]" << std::endl;
     current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
     current_lower_bound_slice_ = Slice(current_lower_bound_str_);
@@ -248,6 +253,9 @@ bool HotSnapshotIterator::Valid() const {
   if (!current_iter_ || !current_iter_->Valid()) {
     return false;
   }
+
+  // std::cout << "HotSnapshotIterator Valid: key=" << FormatKeyDisplay(current_iter_->key())
+  //           << ", segment_index=" << current_segment_index_ << std::endl;
 
   // 边界检查：防止在 Buffer (-1) 场景下越过当前 Segment 范围
   const auto& seg = segments_[current_segment_index_];

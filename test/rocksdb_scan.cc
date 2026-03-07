@@ -97,6 +97,7 @@ int PerformFullScan(DB* db, uint64_t cuid) {
 
   int count = 0;
   for (it->Seek(start_key); it->Valid(); it->Next()) {
+    std::cout << "Full Scan Key: " << FormatKeyDisplay(it->key()) << std::endl;
     if (ExtractCUID(it->key()) != cuid) break;
     count++;
   }

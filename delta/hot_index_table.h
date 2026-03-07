@@ -15,6 +15,7 @@ namespace ROCKSDB_NAMESPACE {
 
 struct DataSegment {
   uint64_t file_number;
+  uint64_t file_size = 0;
   std::string first_key;
   std::string last_key;
 

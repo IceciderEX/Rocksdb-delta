@@ -241,6 +241,11 @@ Status HotspotManager::FlushBlockToSharedSST(
     return s;
   }
 
+  uint64_t actual_file_size = file_info.file_size;
+  for (auto& kv : *output_segments) {
+    kv.second.file_size = actual_file_size;
+  }
+
   fprintf(stdout, "[HotspotManager] Flushed Shared SST: %s, CUIDs: %lu\n",
           file_path.c_str(), output_segments->size());
 
