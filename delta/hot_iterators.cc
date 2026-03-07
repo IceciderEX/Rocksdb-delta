@@ -257,10 +257,13 @@ bool HotSnapshotIterator::Valid() const {
   // std::cout << "HotSnapshotIterator Valid: key=" << FormatKeyDisplay(current_iter_->key())
   //           << ", segment_index=" << current_segment_index_ << std::endl;
 
-  // 边界检查：防止在 Buffer (-1) 场景下越过当前 Segment 范围
+  // 边界检查：需要在 Segment 范围内
   const auto& seg = segments_[current_segment_index_];
   if (!seg.last_key.empty()) {
-    if (icmp_.Compare(current_iter_->key(), seg.last_key) > 0) {
+    // 使用 UserKey 比较
+    // because SST 中的 InternalKey Sequence = 0
+    if (icmp_.user_comparator()->Compare(ExtractUserKey(current_iter_->key()),
+                                         ExtractUserKey(seg.last_key)) > 0) {
       return false;
     }
   }
