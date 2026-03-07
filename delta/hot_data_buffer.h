@@ -1,51 +1,121 @@
 #pragma once
 
-#include <vector>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <unordered_map>
-#include <mutex>
+#include <vector>
+
+#include "rocksdb/env.h"
+#include "rocksdb/options.h"
+#include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/status.h"
+#include "table/internal_iterator.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-// 一个 CUID 对应的数据
-struct HotBufferBatch {
-  std::vector<std::string> keys;
-  std::vector<std::string> values;
-  size_t size_bytes = 0;
+struct HotEntry {
+  uint64_t cuid;
+  std::string key;
+  std::string value;
+  // uint64_t seq;
 
-  void Clear() {
-    keys.clear();
-    values.clear();
-    size_bytes = 0;
+  // 用于排序
+  bool operator<(const HotEntry& other) const { return key < other.key; }
+};
+
+// buffer block
+struct HotDataBlock {
+  std::vector<HotEntry> entries;
+  size_t current_size_bytes = 0;
+  std::unordered_map<uint64_t, std::pair<std::string, std::string>> bounds;
+
+  void Add(uint64_t c, const Slice& k, const Slice& v) {
+    std::string k_str = k.ToString();
+    std::string v_str = v.ToString();
+    entries.push_back({c, k_str, v_str});
+    current_size_bytes += (k_str.size() + v_str.size());
+
+    auto it = bounds.find(c);
+    if (it == bounds.end()) {
+      bounds[c] = {k_str, k_str};
+    } else {
+      if (k_str < it->second.first) it->second.first = k_str;
+      if (k_str > it->second.second) it->second.second = k_str;
+    }
   }
 
-  bool IsEmpty() const {
-    return keys.empty();
+  void Sort();  // 按 CUID, Key 排序
+
+  void Clear() {
+    entries.clear();
+    current_size_bytes = 0;
+    bounds.clear();
   }
 };
 
 class HotDataBuffer {
  public:
-  explicit HotDataBuffer(size_t threshold_bytes = 64 * 1024 * 1024); // 默认 64MB
+  // explicit HotDataBuffer(size_t threshold_bytes = 64 * 1024 * 1024); // 默认
+  // 64MB
+  explicit HotDataBuffer(size_t threshold_bytes = 1 * 1024 *
+                                                  1024);  // 先用 1MB 测试
 
   // 将数据追加到对应 CUID 的 buffer 中
   // 如果 buffer 大小超过阈值，返回 true (need Flush)
   bool Append(uint64_t cuid, const Slice& key, const Slice& value);
 
-  // 获取并清空指定 CUID 的数据 
-  HotBufferBatch ExtractBatch(uint64_t cuid);
+  // Active Buffer -> Immutable Queue
+  bool RotateBuffer();
 
-  size_t GetTotalSize() const;
+  std::unique_ptr<HotDataBlock> ExtractBlockToFlush();
+
+  // std::vector<HotEntry> ExtractAndReset();
+
+  size_t GetTotalBufferedSize() const { return total_buffered_size_; }
+
+  bool GetBoundaryKeys(uint64_t cuid, std::string* min_key,
+                       std::string* max_key);
+
+  // for reading
+  InternalIterator* NewIterator(uint64_t cuid,
+                                const InternalKeyComparator* icmp);
 
  private:
   // flush threshold
   size_t threshold_bytes_;
+  std::atomic<size_t> total_buffered_size_;
   mutable std::mutex mutex_;
-  // CUID -> BufferBatch 
-  std::unordered_map<uint64_t, HotBufferBatch> buffers_;
-  // 全局总大小统计
-  size_t total_size_bytes_;
+
+  std::unique_ptr<HotDataBlock> active_block_;
+  std::deque<std::unique_ptr<HotDataBlock>> immutable_queue_;
+};
+
+class HotSstLifecycleManager {
+ public:
+  HotSstLifecycleManager(const Options& options) : env_(options.env) {}
+
+  // 注册一个新生成的文件，初始引用计数为 0
+  void RegisterFile(uint64_t file_number, const std::string& file_path);
+
+  // 增加引用计数 (当 IndexTable 添加指向该文件的 Segment 时调用)
+  void Ref(uint64_t file_number);
+
+  // 减少引用计数 (当 IndexTable 删除 Segment 或 Compaction 完成后调用)
+  // 如果计数归零，物理删除文件
+  void Unref(uint64_t file_number);
+
+ private:
+  Env* env_;
+  std::mutex mutex_;
+
+  struct FileState {
+    std::string file_path;
+    int ref_count;
+  };
+
+  std::unordered_map<uint64_t, FileState> files_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

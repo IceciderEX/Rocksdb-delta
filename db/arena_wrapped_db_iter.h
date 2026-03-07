@@ -140,6 +140,8 @@ class ArenaWrappedDBIter : public Iterator {
   // tombstone when added under this DBIter.
   std::unique_ptr<TruncatedRangeDelIterator>* memtable_range_tombstone_iter_ =
       nullptr;
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager_;
 };
 
 ArenaWrappedDBIter* NewArenaWrappedDbIterator(

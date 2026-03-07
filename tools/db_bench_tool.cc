@@ -3891,10 +3891,13 @@ class Benchmark {
       } else if (name == "openandcompact") {
         fresh_db = false;
         method = &Benchmark::OpenAndCompact;
+      // for delta
+      } else if (name == "delta_lifecycle") {
+        method = &Benchmark::DeltaLifecycle;
       } else if (!name.empty()) {  // No error message for empty name
         fprintf(stderr, "unknown benchmark '%s'\n", name.c_str());
         ErrorExit();
-      }
+      } 
 
       if (fresh_db) {
         if (FLAGS_use_existing_db) {
@@ -6231,6 +6234,150 @@ class Benchmark {
     return Status::OK();
   }
 
+  // for delta
+  void GenerateDeltaKey(uint64_t cuid, int row_id, Slice* key_slice, std::string* key_buf) {
+      key_buf->resize(40); 
+      char* data = &(*key_buf)[0];
+      std::memset(data, 0, 40); 
+      
+      // Offset 0-15: dbid (8 bytes) + tableid (8 bytes) -> 保持为 0
+      
+      // Offset 16-23: CUID (Big Endian)
+      unsigned char* p = reinterpret_cast<unsigned char*>(data) + 16;
+      for (int i = 0; i < 8; ++i) {
+          p[i] = (cuid >> (56 - 8 * i)) & 0xFF;
+      }
+
+      // Offset 24...: row_id (String formatted, zero-padded for ordering)
+      char row_str[16];
+      int len = snprintf(row_str, sizeof(row_str), "%08d", row_id);
+      
+      // Copy row_id to offset 24
+      if (len > 0) {
+          size_t copy_len = std::min(static_cast<size_t>(len), key_buf->size() - 24);
+          std::memcpy(data + 24, row_str, copy_len);
+      }
+
+      *key_slice = Slice(*key_buf);
+  }
+
+  void GenerateUpperBound(uint64_t cuid, std::string* ub_buf, Slice* ub_slice) {
+      // 简单的逻辑：下一个 CUID 的第 0 行就是当前 CUID 的 Upper Bound
+      // 注意：这里没有处理 uint64_t 溢出的情况，但在 benchmark 中通常不会跑到 UINT64_MAX
+      Slice temp_slice;
+      GenerateDeltaKey(cuid + 1, 0, &temp_slice, ub_buf);
+      *ub_slice = Slice(*ub_buf);
+  }
+
+  void DeltaLifecycle(ThreadState* thread) {
+      if (FLAGS_keys_per_prefix <= 0) {
+          fprintf(stderr, "Error: --keys_per_prefix must be set for delta_lifecycle\n");
+          exit(1);
+      }
+
+      int64_t rows_per_cuid = FLAGS_keys_per_prefix;
+      int64_t total_cuids = FLAGS_num / rows_per_cuid;
+      
+      int64_t cuids_per_thread = total_cuids / FLAGS_threads;
+      int64_t start_cuid = thread->tid * cuids_per_thread + 1;
+      int64_t end_cuid = start_cuid + cuids_per_thread;
+
+      WriteOptions write_opts;
+      
+      // Key/Value Buffers
+      std::string key_buf;
+      Slice key_slice;
+      std::string val_buf(FLAGS_value_size, 'a');
+      Slice val_slice(val_buf);
+
+      // Upper Bound Buffers
+      std::string ub_buf;
+      Slice ub_slice;
+
+      auto db = db_.db; 
+
+      // 遍历分配给该线程的每一个 CUID
+      for (int64_t cuid = start_cuid; cuid < end_cuid; ++cuid) {
+          
+          // 准备 ReadOptions，设置 Upper Bound
+          // 必须在循环内设置，因为每个 CUID 的 Upper Bound 不同
+          ReadOptions read_opts;
+          GenerateUpperBound(cuid, &ub_buf, &ub_slice);
+          read_opts.iterate_upper_bound = &ub_slice;
+
+          // --- Step 1: Put (Initial Insert) ---
+          for (int r = 0; r < rows_per_cuid; ++r) {
+              GenerateDeltaKey(cuid, r, &key_slice, &key_buf);
+              db->Put(write_opts, key_slice, val_slice);
+              thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+          }
+
+          // --- Step 2: Warm-up Scans (Trigger Hot Detection) ---
+          // 根据设计文档：扫描频率达到阈值（如4次）才会被判定为热点
+          int scan_threshold = 4; 
+          for (int s = 0; s < scan_threshold; ++s) {
+              std::unique_ptr<Iterator> iter(db->NewIterator(read_opts));
+              
+              GenerateDeltaKey(cuid, 0, &key_slice, &key_buf); // Seek to Start
+              iter->Seek(key_slice);
+              
+              int valid_count = 0;
+              // 因为有了 iterate_upper_bound，这里不需要手动检查 ExtractCUID
+              while (iter->Valid()) {
+                  iter->Next();
+                  valid_count++;
+              }
+              thread->stats.FinishedOps(nullptr, db, valid_count, kSeek);
+          }
+
+          // --- Step 3: Put (Update/Delta) ---
+          // 再次写入，产生 Delta。
+          // 此时 CUID 在 ScanFrequencyTable 中应该已经被标记为 HOT
+          for (int r = 0; r < rows_per_cuid; ++r) {
+              GenerateDeltaKey(cuid, r, &key_slice, &key_buf);
+              db->Put(write_opts, key_slice, val_slice); 
+              thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+          }
+
+          // --- Step 4: Trigger Scan-as-Compaction ---
+          // 条件检查：
+          // 1. IsHot? Yes (Step 2 做了 4 次 scan)
+          // 2. No Snapshot? Yes (这是第一次触发) OR Deltas > 5? Yes (Step 3 写入了 rows_per_cuid 个 deltas)
+          // 此次 Scan 应该触发数据搬迁到 Hot Store
+          {
+              std::unique_ptr<Iterator> iter(db->NewIterator(read_opts));
+              GenerateDeltaKey(cuid, 0, &key_slice, &key_buf);
+              iter->Seek(key_slice);
+              while (iter->Valid()) {
+                  iter->Next();
+              }
+              thread->stats.FinishedOps(nullptr, db, 1, kSeek); 
+          }
+
+          // --- Step 5: Delete All (Trigger Intercept) ---
+          // 删除所有 Key。InterceptDelete 会拦截并更新 Global Delete Count Table。
+          for (int r = 0; r < rows_per_cuid; ++r) {
+              GenerateDeltaKey(cuid, r, &key_slice, &key_buf);
+              db->Delete(write_opts, key_slice);
+              thread->stats.FinishedOps(nullptr, db, 1, kDelete);
+          }
+
+          // --- Optional Step 6: Verify Deletion (Scan again) ---
+          // 验证 GDCT 是否生效（Scan 应该立刻返回空，且不读磁盘）
+          /*
+          {
+              std::unique_ptr<Iterator> iter(db->NewIterator(read_opts));
+              GenerateDeltaKey(cuid, 0, &key_slice, &key_buf);
+              iter->Seek(key_slice);
+              if (iter->Valid()) {
+                fprintf(stderr, "Error: CUID %ld should be deleted!\n", cuid);
+              }
+              thread->stats.FinishedOps(nullptr, db, 1, kSeek);
+          }
+          */
+      }
+  }
+
   void ReadSequential(ThreadState* thread) {
     if (db_.db != nullptr) {
       ReadSequential(thread, db_.db);
@@ -7294,9 +7441,20 @@ class Benchmark {
       options.snapshot = nullptr;
     }
     while (!duration.Done(1)) {
+
+      // previous logic
+      // int64_t seek_pos = thread->rand.Next() % FLAGS_num;
+      // GenerateKeyFromIntForSeek(static_cast<uint64_t>(seek_pos), FLAGS_num,
+      //                           &key);
+      // for delta
       int64_t seek_pos = thread->rand.Next() % FLAGS_num;
-      GenerateKeyFromIntForSeek(static_cast<uint64_t>(seek_pos), FLAGS_num,
-                                &key);
+      // 如果设置了 keys_per_prefix (即 rows_per_cuid)，强制对齐到该 CUID 的第一个 ID (RowID=0)
+      if (FLAGS_keys_per_prefix > 0) {
+          seek_pos = (seek_pos / FLAGS_keys_per_prefix) * FLAGS_keys_per_prefix;
+      }
+      GenerateKeyFromInt(static_cast<uint64_t>(seek_pos), FLAGS_num, &key);
+
+
       if (FLAGS_max_scan_distance != 0) {
         if (FLAGS_reverse_iterator) {
           GenerateKeyFromInt(

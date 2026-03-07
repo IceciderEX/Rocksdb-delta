@@ -31,6 +31,7 @@
 #include "db/version_edit.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
+#include "delta/hotspot_manager.h"
 #include "logging/event_logger.h"
 #include "options/cf_options.h"
 #include "options/db_options.h"
@@ -59,6 +60,7 @@ class VersionEdit;
 class VersionSet;
 
 class SubcompactionState;
+struct DeltaCompactionContext;
 
 // CompactionJob is responsible for executing the compaction. Each (manual or
 // automated) compaction corresponds to a CompactionJob object, and usually
@@ -142,6 +144,16 @@ class SubcompactionState;
 
 class CompactionJob {
  public:
+  // for delta
+  // 暂存 Output Segment 信息
+  struct DeltaOutputInfo {
+      uint64_t cuid;
+      uint64_t file_number;
+      std::string first_key;
+      std::string last_key;
+      uint64_t entry_count = 0;
+  };
+
   CompactionJob(int job_id, Compaction* compaction,
                 const ImmutableDBOptions& db_options,
                 const MutableDBOptions& mutable_db_options,
@@ -162,7 +174,9 @@ class CompactionJob {
                 std::string full_history_ts_low = "", std::string trim_ts = "",
                 BlobFileCompletionCallback* blob_callback = nullptr,
                 int* bg_compaction_scheduled = nullptr,
-                int* bg_bottom_compaction_scheduled = nullptr);
+                int* bg_bottom_compaction_scheduled = nullptr,
+                // for delta
+                std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
 
   virtual ~CompactionJob();
 
@@ -386,18 +400,25 @@ class CompactionJob {
                              ColumnFamilyData* cfd,
                              BlobFileResources& blob_resources,
                              const WriteOptions& write_options);
+  // for delta
   std::unique_ptr<CompactionIterator> CreateCompactionIterator(
       SubcompactionState* sub_compact, ColumnFamilyData* cfd,
       InternalIterator* input_iter, const CompactionFilter* compaction_filter,
       MergeHelper& merge, BlobFileResources& blob_resources,
-      const WriteOptions& write_options);
+      const WriteOptions& write_options,
+      std::unordered_set<uint64_t>* local_involved_cuids);
   std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc> CreateFileHandlers(
-      SubcompactionState* sub_compact, SubcompactionKeyBoundaries& boundaries);
+      SubcompactionState* sub_compact, SubcompactionKeyBoundaries& boundaries,
+      std::shared_ptr<DeltaCompactionContext> delta_ctx = nullptr);
   Status ProcessKeyValue(SubcompactionState* sub_compact, ColumnFamilyData* cfd,
                          CompactionIterator* c_iter,
                          const CompactionFileOpenFunc& open_file_func,
                          const CompactionFileCloseFunc& close_file_func,
-                         uint64_t& prev_cpu_micros);
+                         uint64_t& prev_cpu_micros,
+                         // for delta
+                         std::shared_ptr<DeltaCompactionContext> delta_ctx,
+                         std::map<uint64_t, std::unordered_set<uint64_t>>& local_inputs, 
+                         std::vector<CompactionJob::DeltaOutputInfo>& local_outputs);
   void UpdateSubcompactionJobStatsIncrementally(
       CompactionIterator* c_iter, CompactionJobStats* compaction_job_stats,
       uint64_t cur_cpu_micros, uint64_t& prev_cpu_micros);
@@ -557,6 +578,22 @@ class CompactionJob {
   void UpdateSubcompactionProgressPerLevel(
       SubcompactionState* sub_compact, bool is_proximal_level,
       SubcompactionProgress& subcompaction_progress);
+  
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+  std::vector<uint64_t> input_file_numbers_;
+  std::unordered_set<uint64_t> compaction_involved_cuids_;
+  std::mutex cuids_mutex_;
+
+public:
+
+  // CUID -> Set of Input File IDs
+  // 记录了每个 CUID 在哪些输入文件中出现过（包括被跳过的）
+  std::map<uint64_t, std::unordered_set<uint64_t>> global_cuid_inputs_;
+
+  // 所有的 Output Segments
+  std::vector<DeltaOutputInfo> global_outputs_;
+  std::mutex delta_mutex_;
 };
 
 // CompactionServiceInput is used the pass compaction information between two

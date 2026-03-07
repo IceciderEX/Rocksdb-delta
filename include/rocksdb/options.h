@@ -58,6 +58,8 @@ class InternalKeyComparator;
 class WalFilter;
 class FileSystem;
 class UserDefinedIndexFactory;
+// for delta
+class HotspotManager;
 
 struct Options;
 struct DbPath;
@@ -1726,6 +1728,9 @@ struct DBOptions {
   CompactionStyleSet calculate_sst_write_lifetime_hint_set = {
       CompactionStyle::kCompactionStyleLevel};
   // End EXPERIMENTAL
+
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager = nullptr;
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
@@ -2267,6 +2272,11 @@ struct ReadOptions {
   const std::string* request_id = nullptr;
 
   // *** END per-request settings for internal team use only ***
+
+  // for delta
+  bool delta_full_scan = false;
+  // 跳过热点路径，直接读取冷数据
+  bool skip_hot_path = false;
 
   ReadOptions() {}
   ReadOptions(bool _verify_checksums, bool _fill_cache);

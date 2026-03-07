@@ -18,6 +18,8 @@
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
 
+#include "delta/hotspot_manager.h"
+
 namespace ROCKSDB_NAMESPACE {
 // Convenience methods
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
@@ -89,6 +91,11 @@ Status DBImpl::Delete(const WriteOptions& write_options,
   if (!s.ok()) {
     return s;
   }
+  // for delta
+  if (hotspot_manager_ && hotspot_manager_->InterceptDelete(key)) {
+    return Status::OK();
+  }
+
   return DB::Delete(write_options, column_family, key);
 }
 
@@ -99,6 +106,11 @@ Status DBImpl::Delete(const WriteOptions& write_options,
   if (!s.ok()) {
     return s;
   }
+  // for delta
+  if (hotspot_manager_ && hotspot_manager_->InterceptDelete(key)) {
+    return Status::OK();
+  }
+
   return DB::Delete(write_options, column_family, key, ts);
 }
 

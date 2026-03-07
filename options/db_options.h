@@ -114,6 +114,9 @@ struct ImmutableDBOptions {
   Logger* logger;
   // End of convenience/helper objects.
 
+  // for delta
+  mutable std::shared_ptr<HotspotManager> hotspot_manager;
+
   bool IsWalDirSameAsDBPath() const;
   bool IsWalDirSameAsDBPath(const std::string& path) const;
   const std::string& GetWalDir() const;

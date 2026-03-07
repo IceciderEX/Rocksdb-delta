@@ -1,0 +1,491 @@
+#include "delta/hot_iterators.h"
+
+#include "table/merging_iterator.h"
+#include "util/cast_util.h"
+
+namespace ROCKSDB_NAMESPACE {
+
+static FileMetaData MakeFileMetaFromSegment(const DataSegment& seg) {
+  FileMetaData meta;
+  // file_number, path_id=0, file_size=0 (unknown/cached)
+  meta.fd = FileDescriptor(seg.file_number, 0, 0);
+  // 这里需要是internal key
+  meta.smallest.DecodeFrom(seg.first_key);
+  meta.largest.DecodeFrom(seg.last_key);
+  return meta;
+}
+
+// ======================= HotDeltaIterator ==========================
+
+HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
+                                   TableCache* table_cache,
+                                   const ReadOptions& read_options,
+                                   const FileOptions& file_options,
+                                   const InternalKeyComparator& icmp,
+                                   const MutableCFOptions& mutable_cf_options,
+                                   bool allow_unprepared_value)
+    : merging_iter_(nullptr), deltas_(deltas) {  // Copy deltas
+  if (deltas_.empty()) {
+    merging_iter_ = NewEmptyInternalIterator<Slice>(nullptr);
+    return;
+  }
+
+  bounds_storage_.reserve(deltas_.size() * 2);
+  bounds_slices_.reserve(deltas_.size() * 2);
+  read_options_storage_.reserve(deltas_.size());
+
+  std::vector<InternalIterator*> children;
+  children.reserve(deltas_.size());
+
+  // slices for bounds
+  for (const auto& delta : deltas_) {
+    bounds_storage_.push_back(ExtractUserKey(delta.first_key).ToString());
+    std::string upper = ExtractUserKey(delta.last_key).ToString();
+    upper.push_back('\0');  // Make it an exclusive bound
+    bounds_storage_.push_back(upper);
+  }
+  for (size_t i = 0; i < bounds_storage_.size(); ++i) {
+    bounds_slices_.emplace_back(bounds_storage_[i]);
+  }
+
+  for (size_t i = 0; i < deltas_.size(); ++i) {
+    const auto& delta = deltas_[i];
+    // ReadOptions
+    read_options_storage_.emplace_back(read_options);
+    ReadOptions& ro = read_options_storage_.back();
+    ro.iterate_lower_bound = &bounds_slices_[i * 2];
+    ro.iterate_upper_bound = &bounds_slices_[i * 2 + 1];
+
+    FileDescriptor fd(delta.file_number, 0, 0);  // PathId=0, Size=0(unknown)
+    FileMetaData meta;
+    meta.fd = fd;
+
+    InternalIterator* iter = table_cache->NewIterator(
+        ro, file_options, icmp,  // InternalKeyComparator
+        meta,                    // FileMetaData
+        nullptr, mutable_cf_options, nullptr, nullptr,
+        TableReaderCaller::kUserIterator, nullptr, false,
+        0,  // L0
+        0, nullptr, nullptr, allow_unprepared_value, nullptr, nullptr);
+
+    if (iter) {
+      children.push_back(iter);
+    }
+  }
+
+  merging_iter_ = NewMergingIterator(&icmp, children.data(),
+                                     static_cast<int>(children.size()));
+}
+
+HotDeltaIterator::~HotDeltaIterator() {
+  if (merging_iter_) {
+    delete merging_iter_;
+  }
+}
+
+// agent
+bool HotDeltaIterator::Valid() const { return merging_iter_->Valid(); }
+void HotDeltaIterator::SeekToFirst() { merging_iter_->SeekToFirst(); }
+void HotDeltaIterator::SeekToLast() { merging_iter_->SeekToLast(); }
+void HotDeltaIterator::Seek(const Slice& target) {
+  merging_iter_->Seek(target);
+}
+void HotDeltaIterator::SeekForPrev(const Slice& target) {
+  merging_iter_->SeekForPrev(target);
+}
+void HotDeltaIterator::Next() { merging_iter_->Next(); }
+void HotDeltaIterator::Prev() { merging_iter_->Prev(); }
+Slice HotDeltaIterator::key() const { return merging_iter_->key(); }
+Slice HotDeltaIterator::value() const { return merging_iter_->value(); }
+Status HotDeltaIterator::status() const { return merging_iter_->status(); }
+uint64_t HotDeltaIterator::GetPhysicalId() {
+  return merging_iter_->GetPhysicalId();
+}
+
+// ====================== HotSnapshotIterator ============================
+
+HotSnapshotIterator::HotSnapshotIterator(
+    const std::vector<DataSegment>& segments, uint64_t cuid,
+    HotspotManager* hotspot_manager, TableCache* table_cache,
+    const ReadOptions& read_options, const FileOptions& file_options,
+    const InternalKeyComparator& icmp,
+    const MutableCFOptions& mutable_cf_options)
+    : segments_(segments),
+      cuid_(cuid),
+      hotspot_manager_(hotspot_manager),
+      table_cache_(table_cache),
+      read_options_(read_options),
+      file_options_(file_options),
+      icmp_(icmp),
+      mutable_cf_options_(mutable_cf_options),
+      current_segment_index_(-1),
+      status_(Status::OK()) {}
+
+HotSnapshotIterator::~HotSnapshotIterator() {
+  // current_iter_ unique_ptr auto released
+}
+
+void HotSnapshotIterator::InitIterForSegment(size_t index) {
+  if (index >= segments_.size()) {
+    current_iter_.reset(nullptr);
+    current_segment_index_ = -1;
+    return;
+  }
+
+  const auto& seg = segments_[index];
+  current_segment_index_ = static_cast<int>(index);
+
+  if (seg.file_number == static_cast<uint64_t>(-1)) {
+    // Case A: 内存 Buffer fileid -1
+    InternalIterator* mem_iter =
+        hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
+    current_iter_.reset(mem_iter);
+  } else {
+    // Case B: 物理 SST
+    FileDescriptor fd(seg.file_number, 0, 0);
+    FileMetaData meta = MakeFileMetaFromSegment(seg);
+
+    current_read_options_ = read_options_;
+    current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
+    current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
+    current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
+    current_lower_bound_slice_ = Slice(current_lower_bound_str_);
+    current_upper_bound_slice_ = Slice(current_upper_bound_str_);
+    current_read_options_.iterate_lower_bound = &current_lower_bound_slice_;
+    current_read_options_.iterate_upper_bound = &current_upper_bound_slice_;
+
+    InternalIterator* iter = table_cache_->NewIterator(
+        current_read_options_, file_options_, icmp_, meta, nullptr,
+        mutable_cf_options_, nullptr, nullptr, TableReaderCaller::kUserIterator,
+        nullptr, false,
+        1,  // L1+
+        0, nullptr, nullptr,
+        false,  // allow_unprepared_value
+        nullptr, nullptr);
+
+    current_iter_.reset(iter);
+  }
+}
+
+void HotSnapshotIterator::Seek(const Slice& target) {
+  if (segments_.empty()) {
+    current_iter_.reset(nullptr);
+    return;
+  }
+
+  // EndKey >= Target 的 Segment
+  auto it = std::lower_bound(
+      segments_.begin(), segments_.end(), target,
+      [&](const DataSegment& seg, const Slice& val) {
+        if (seg.last_key.empty()) {
+          fprintf(
+              stderr,
+              "Warning: Empty last_key in segment. This should not happen.\n");
+          return false;
+        }
+        // 比较 seg.last_key < val
+        return icmp_.user_comparator()->Compare(ExtractUserKey(seg.last_key),
+                                                ExtractUserKey(val)) < 0;
+      });
+
+  size_t index = std::distance(segments_.begin(), it);
+
+  if (it == segments_.end()) {
+    current_iter_.reset(nullptr);
+    current_segment_index_ = -1;
+    return;
+  }
+
+  if (static_cast<int>(index) != current_segment_index_) {
+    InitIterForSegment(index);
+  }
+
+  // segment seek
+  if (current_iter_) {
+    current_iter_->Seek(target);
+
+    if (!Valid()) {
+      SwitchToNextSegment();
+      if (Valid()) {
+        current_iter_->SeekToFirst();
+      }
+    }
+  }
+}
+
+void HotSnapshotIterator::Next() {
+  if (!current_iter_) return;
+
+  current_iter_->Next();
+
+  if (!Valid()) {
+    // 当前 Segment 耗尽(或越界)，切换到下一个
+    SwitchToNextSegment();
+    if (Valid()) {
+      current_iter_->SeekToFirst();
+    }
+  }
+}
+
+void HotSnapshotIterator::SwitchToNextSegment() {
+  InitIterForSegment(current_segment_index_ + 1);
+}
+
+bool HotSnapshotIterator::Valid() const {
+  if (!current_iter_ || !current_iter_->Valid()) {
+    return false;
+  }
+
+  // 边界检查：防止在 Buffer (-1) 场景下越过当前 Segment 范围
+  const auto& seg = segments_[current_segment_index_];
+  if (!seg.last_key.empty()) {
+    if (icmp_.Compare(current_iter_->key(), seg.last_key) > 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Slice HotSnapshotIterator::key() const { return current_iter_->key(); }
+Slice HotSnapshotIterator::value() const { return current_iter_->value(); }
+Status HotSnapshotIterator::status() const {
+  if (!status_.ok()) return status_;
+  if (current_iter_) return current_iter_->status();
+  return Status::OK();
+}
+
+void HotSnapshotIterator::SeekToFirst() {
+  InitIterForSegment(0);
+  if (current_iter_) current_iter_->SeekToFirst();
+}
+
+void HotSnapshotIterator::SeekToLast() {
+  InitIterForSegment(segments_.size() - 1);
+  if (current_iter_) current_iter_->SeekToLast();
+}
+
+void HotSnapshotIterator::Prev() {
+  if (!current_iter_) return;
+  current_iter_->Prev();
+  if (!Valid()) {
+    SwitchToPrevSegment();
+    if (Valid()) current_iter_->SeekToLast();
+  }
+}
+
+void HotSnapshotIterator::SwitchToPrevSegment() {
+  if (current_segment_index_ > 0) {
+    InitIterForSegment(current_segment_index_ - 1);
+  } else {
+    current_iter_.reset(nullptr);
+    current_segment_index_ = -1;
+  }
+}
+
+void HotSnapshotIterator::SeekForPrev(const Slice& target) {
+  // simplified
+  Seek(target);
+  if (!Valid()) {
+    SeekToLast();
+  }
+  while (Valid() && icmp_.Compare(key(), target) > 0) {
+    Prev();
+  }
+}
+
+uint64_t HotSnapshotIterator::GetPhysicalId() {
+  if (current_iter_) return current_iter_->GetPhysicalId();
+  return 0;
+}
+
+// ===================================================================
+// DeltaSwitchingIterator Implementation
+// ===================================================================
+
+DeltaSwitchingIterator::DeltaSwitchingIterator(
+    Version* version, HotspotManager* hotspot_manager,
+    const ReadOptions& read_options, const FileOptions& file_options,
+    const InternalKeyComparator& icmp,
+    const MutableCFOptions& mutable_cf_options, Arena* arena)
+    : version_(version),
+      hotspot_manager_(hotspot_manager),
+      read_options_(read_options),
+      file_options_(file_options),
+      icmp_(icmp),
+      mutable_cf_options_(mutable_cf_options),
+      arena_(arena),
+      current_iter_(nullptr),
+      cold_iter_(nullptr),
+      hot_iter_(nullptr),
+      current_hot_cuid_(0),
+      is_hot_mode_(false) {
+  if (version_) {
+    version_->Ref();
+  }
+}
+
+DeltaSwitchingIterator::~DeltaSwitchingIterator() {
+  if (hot_iter_) {
+    delete hot_iter_;
+  }
+  // rocksdb 会在 arena 中分配内存，不需要手动删除
+  if (cold_iter_) {
+    if (arena_) {
+      cold_iter_->~InternalIterator();
+    } else {
+      delete cold_iter_;
+    }
+  }
+  if (version_) version_->Unref();
+}
+
+void DeltaSwitchingIterator::InitColdIter() {
+  if (cold_iter_) return;
+
+  // L0~Ln 所有文件的 MergingIterator
+  // Arena=nullptr, skip_filters=false
+  MergeIteratorBuilder builder(&icmp_, arena_);
+  version_->AddIterators(read_options_, file_options_, &builder,
+                         /*allow_unprepared*/ false);
+  // get MergingIterator
+  cold_iter_ = builder.Finish();
+
+  if (!cold_iter_) {
+    cold_iter_ = NewEmptyInternalIterator<Slice>(arena_);
+  }
+}
+
+bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
+  if (hot_iter_ && current_hot_cuid_ == cuid) return true;
+
+  if (hot_iter_) {
+    delete hot_iter_;
+    hot_iter_ = nullptr;
+  }
+
+  // 1. 获取元数据
+  HotIndexEntry entry;
+  if (!hotspot_manager_->GetHotIndexEntry(cuid, &entry)) {
+    // hot 但是没有index (可能正在后台执行 Init Scan)
+    return false;
+  }
+
+  // snapshot and delta
+  InternalIterator* snapshot_iter =
+      new HotSnapshotIterator(entry.snapshot_segments, cuid, hotspot_manager_,
+                              version_->cfd()->table_cache(), read_options_,
+                              file_options_, icmp_, mutable_cf_options_);
+
+  InternalIterator* delta_iter = new HotDeltaIterator(
+      entry.deltas, version_->cfd()->table_cache(), read_options_,
+      file_options_, icmp_, mutable_cf_options_, false);
+
+  std::vector<InternalIterator*> children = {delta_iter, snapshot_iter};
+  hot_iter_ = NewMergingIterator(&icmp_, children.data(), 2);
+  current_hot_cuid_ = cuid;
+  return true;
+}
+
+void DeltaSwitchingIterator::Seek(const Slice& target) {
+  uint64_t cuid = hotspot_manager_->ExtractCUID(target);
+
+  // bool use_hot = false;
+  // // hot cuid
+  // if (!read_options_.skip_hot_path && !read_options_.delta_full_scan &&
+  //     cuid != 0 && hotspot_manager_->IsHot(cuid)) {
+  //   use_hot = true;
+  // }
+
+  // if (use_hot) {
+  //   InitHotIter(cuid);
+  //   current_iter_ = hot_iter_;
+  //   is_hot_mode_ = true;
+  // } else {
+  //   InitColdIter();
+  //   current_iter_ = cold_iter_;
+  //   is_hot_mode_ = false;
+  // }
+  // skip_hot_path (eg. Metadata Scan)，强制冷路径
+  if (read_options_.skip_hot_path) {
+    InitColdIter();
+    current_iter_ = cold_iter_;
+    is_hot_mode_ = false;
+  }
+  // 否则，不论是点查还是全扫描(delta_full_scan)，只要是热点，全部走热点路径提供给用户！
+  else if (cuid != 0 && hotspot_manager_->IsHot(cuid)) {
+    if (InitHotIter(cuid)) {
+      current_iter_ = hot_iter_;
+      is_hot_mode_ = true;
+    } else {
+      // 热点索引尚未建立（如 Init Scan 还在进行中），回退到 Cold Path
+      InitColdIter();
+      current_iter_ = cold_iter_;
+      is_hot_mode_ = false;
+    }
+  }
+  // 既不是 skip_hot_path 也不是热点，默认走冷路径
+  else {
+    InitColdIter();
+    current_iter_ = cold_iter_;
+    is_hot_mode_ = false;
+  }
+
+  // fprintf(stderr, "[DEBUG] current_iter_=%p, about to call
+  // current_iter_->Seek()\n", (void*)current_iter_);
+  if (current_iter_) {
+    current_iter_->Seek(target);
+  }
+}
+
+// 全表扫描或未知方向，强制回退到 Cold Mode
+void DeltaSwitchingIterator::SeekToFirst() {
+  if (read_options_.skip_hot_path) {
+    InitColdIter();
+    current_iter_ = cold_iter_;
+    is_hot_mode_ = false;
+  }
+  // InitColdIter();
+  // current_iter_ = cold_iter_;
+  // is_hot_mode_ = false;
+  if (current_iter_) current_iter_->SeekToFirst();
+}
+
+void DeltaSwitchingIterator::SeekToLast() {
+  InitColdIter();
+  current_iter_ = cold_iter_;
+  is_hot_mode_ = false;
+  if (current_iter_) current_iter_->SeekToLast();
+}
+
+bool DeltaSwitchingIterator::Valid() const {
+  return current_iter_ && current_iter_->Valid();
+}
+void DeltaSwitchingIterator::Next() {
+  if (current_iter_) current_iter_->Next();
+}
+void DeltaSwitchingIterator::Prev() {
+  if (current_iter_) current_iter_->Prev();
+}
+void DeltaSwitchingIterator::SeekForPrev(const Slice& target) {
+  // 逻辑同 Seek
+  Seek(target);
+  if (!Valid()) SeekToLast();
+  while (Valid() && icmp_.Compare(key(), target) > 0) Prev();
+}
+
+Slice DeltaSwitchingIterator::key() const { return current_iter_->key(); }
+Slice DeltaSwitchingIterator::value() const { return current_iter_->value(); }
+Status DeltaSwitchingIterator::status() const {
+  if (current_iter_) return current_iter_->status();
+  return Status::OK();
+}
+bool DeltaSwitchingIterator::PrepareValue() {
+  if (current_iter_) return current_iter_->PrepareValue();
+  return false;
+}
+uint64_t DeltaSwitchingIterator::GetPhysicalId() {
+  if (current_iter_) return current_iter_->GetPhysicalId();
+  return 0;
+}
+
+}  // namespace ROCKSDB_NAMESPACE

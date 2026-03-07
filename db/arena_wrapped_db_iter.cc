@@ -52,6 +52,7 @@ void ArenaWrappedDBIter::Init(
     read_options_.async_io = false;
   }
   read_options_.total_order_seek |= ioptions.prefix_seek_opt_in_only;
+  hotspot_manager_ = hotspot_manager;
 
   db_iter_ = DBIter::NewIter(
       env, read_options_, ioptions, mutable_cf_options,
@@ -168,7 +169,7 @@ void ArenaWrappedDBIter::DoRefresh(const Snapshot* snapshot,
   }
   Init(env, read_options_, cfd->ioptions(), sv->mutable_cf_options, sv->current,
        read_seq, sv->version_number, read_callback_, cfh_, expose_blob_index_,
-       allow_refresh_, allow_mark_memtable_for_flush_ ? sv->mem : nullptr);
+       allow_refresh_, allow_mark_memtable_for_flush_ ? sv->mem : nullptr, hotspot_manager_);
 
   InternalIterator* internal_iter = db_impl->NewInternalIterator(
       read_options_, cfd, sv, &arena_, read_seq,

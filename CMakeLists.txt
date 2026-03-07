@@ -773,6 +773,12 @@ set(SOURCES
         db/write_stall_stats.cc
         db/write_thread.cc
         db_stress_tool/db_stress_compression_manager.cc
+        delta/hot_data_buffer.cc
+        delta/hot_index_table.cc
+        delta/hotspot_manager.cc
+        delta/global_delete_count_table.cc
+        delta/scan_frequency_table.cc
+        delta/hot_iterators.cc
         env/composite_env.cc
         env/env.cc
         env/env_chroot.cc
@@ -1449,8 +1455,6 @@ if(WITH_TESTS)
         db/write_batch_test.cc
         db/write_callback_test.cc
         db/write_controller_test.cc
-        delta/hot_data_buffer.cc
-        delta/hot_index_table.cc
         env/env_test.cc
         env/io_posix_test.cc
         env/mock_env_test.cc

@@ -17,6 +17,7 @@
 #include "db/pinned_iterators_manager.h"
 #include "db/range_del_aggregator.h"
 #include "db/snapshot_checker.h"
+#include "delta/hotspot_manager.h"
 #include "options/cf_options.h"
 #include "rocksdb/compaction_filter.h"
 
@@ -58,6 +59,8 @@ class SequenceIterWrapper : public InternalIterator {
   }
   Slice key() const override { return inner_iter_->key(); }
   Slice value() const override { return inner_iter_->value(); }
+  // for delta
+  uint64_t GetPhysicalId() override { return inner_iter_->GetPhysicalId(); }
 
   // Unused InternalIterator methods
   void SeekToFirst() override { assert(false); }
@@ -213,7 +216,9 @@ class CompactionIterator {
       const std::atomic<bool>* shutting_down = nullptr,
       const std::shared_ptr<Logger> info_log = nullptr,
       const std::string* full_history_ts_low = nullptr,
-      std::optional<SequenceNumber> preserve_seqno_min = {});
+      std::optional<SequenceNumber> preserve_seqno_min = {},
+      std::shared_ptr<HotspotManager> hotspot_manager = nullptr,
+      std::vector<uint64_t> input_file_numbers = {});
 
   // Constructor with custom CompactionProxy, used for tests.
   CompactionIterator(InternalIterator* input, const Comparator* cmp,
@@ -235,7 +240,9 @@ class CompactionIterator {
                      const std::atomic<bool>* shutting_down = nullptr,
                      const std::shared_ptr<Logger> info_log = nullptr,
                      const std::string* full_history_ts_low = nullptr,
-                     std::optional<SequenceNumber> preserve_seqno_min = {});
+                     std::optional<SequenceNumber> preserve_seqno_min = {},
+                     std::shared_ptr<HotspotManager> hotspot_manager = nullptr, 
+                     std::vector<uint64_t> input_file_numbers = {});
 
   ~CompactionIterator();
 
@@ -283,6 +290,11 @@ class CompactionIterator {
   Status InputStatus() const { return input_.status(); }
 
   bool IsDeleteRangeSentinelKey() const { return is_range_del_; }
+
+  // for delta
+  void SetInvolvedCuids(std::unordered_set<uint64_t>* cuids) {
+    involved_cuids_ = cuids;
+  }
 
  private:
   // Processes the input stream to find the next output
@@ -521,6 +533,28 @@ class CompactionIterator {
   // Stores whether the current compaction iterator output
   // is a range tombstone start key.
   bool is_range_del_{false};
+  
+
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+  uint64_t current_cuid_ = 0;   // 正在处理的 cuid
+  uint64_t current_file_number_ = 0; // 正在处理的 file number
+  bool skip_current_cuid_ = false; // 缓存当前cuid是否需要被跳过
+  std::vector<uint64_t> input_file_numbers_;
+  std::unordered_set<uint64_t>* involved_cuids_ = nullptr;
+  std::map<uint64_t, std::unordered_set<uint64_t>>* input_map_ = nullptr;
+
+public: 
+  uint64_t input_file_number() {
+      return input_.GetPhysicalId();
+  }
+
+  void SetInputMap(std::map<uint64_t, std::unordered_set<uint64_t>>* map) {
+      input_map_ = map;
+  }
+
+  void CheckHotspotFilters();
+
 };
 
 inline bool CompactionIterator::DefinitelyInSnapshot(SequenceNumber seq,

@@ -16,6 +16,7 @@
 #include "db/version_edit.h"
 #include "logging/log_buffer.h"
 #include "test_util/sync_point.h"
+#include "logging/logging.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -69,6 +70,14 @@ class LevelCompactionBuilder {
         mutable_cf_options_(mutable_cf_options),
         ioptions_(ioptions),
         mutable_db_options_(mutable_db_options) {}
+
+  bool PickMixedL0Compaction();
+
+  void SetupInitialFilesDelta();
+
+  void AcceptStartLevelInputs() {
+    compaction_inputs_.push_back(start_level_inputs_);
+  }
 
   // Pick and return a compaction.
   Compaction* PickCompaction();
@@ -506,13 +515,106 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
   return true;
 }
 
+// for delta
+void LevelCompactionBuilder::SetupInitialFilesDelta() {
+  bool picked = PickMixedL0Compaction();
+
+  if (picked) {
+    return;
+  }
+  start_level_inputs_.clear();
+  return;
+}
+
+// for delta
+// 选取最老的 N 个文件进行 L0->L0 合并
+bool LevelCompactionBuilder::PickMixedL0Compaction() {
+  // 策略阈值
+  const int kL0TriggerCount = 3;      // 触发阈值：SST 数量 >= 20
+  const uint64_t kL0TriggerAge = 3600; // 时间阈值：最老文件超过1h
+  const size_t kFilesToPick = 10;      // 每次合并选取的最大文件数
+
+  // 2. 获取 L0 文件列表
+  // TODO: 检查 seqno 排列顺序
+  const std::vector<FileMetaData*>& l0_files = vstorage_->LevelFiles(0);
+  
+  size_t total_files = l0_files.size();
+  if (total_files < 2) {
+    return false;
+  }
+
+  bool trigger_by_count = (total_files >= kL0TriggerCount);
+  bool trigger_by_time = false;
+
+  // 检查最老文件的时间 l0_files.back()？
+  FileMetaData* oldest_file = l0_files.back();
+  uint64_t creation_time = oldest_file->file_creation_time;
+  uint64_t now_sec = ioptions_.env->NowMicros() / 1000000;
+
+  if (creation_time > 0 && creation_time != kUnknownFileCreationTime) {
+      if (now_sec > creation_time + kL0TriggerAge) {
+          trigger_by_time = true;
+      }
+  }
+  if (!trigger_by_count && !trigger_by_time) {
+    return false;
+  }
+
+  // 选最早生成的 kFilesToPick 个文件
+  // [Size - Pick ... Size - 1]？
+  size_t pick_count = std::min(kFilesToPick, total_files);
+
+  // 超时触发的且文件数不足 10 个
+  if (trigger_by_time && pick_count < kFilesToPick) {
+      pick_count = total_files;
+  }
+
+  size_t start_index = total_files - pick_count;
+  start_level_inputs_.level = 0;
+  start_level_inputs_.files.clear();
+  start_level_ = 0;
+  output_level_ = 0; // L0 -> L0
+
+  for (size_t i = start_index; i < total_files; ++i) {
+    FileMetaData* f = l0_files[i];
+    // 检查并发冲突的逻辑？？
+    if (f->being_compacted) {
+      // TODO：如果最老的数据正在合并，abandon？
+      start_level_inputs_.clear();
+      return false;
+    }
+    start_level_inputs_.files.push_back(f);
+  }
+
+
+  compaction_reason_ = CompactionReason::kLevelL0FilesNum; // 借用Reason
+
+  ROCKS_LOG_BUFFER(log_buffer_, 
+      "[Delta-Opt] Picked Mixed L0 Compaction. Trigger: %s, Files: %zu, OutputLevel: 0", 
+      trigger_by_count ? "Count" : "Time", start_level_inputs_.size());
+
+  return true;
+}
+
 Compaction* LevelCompactionBuilder::PickCompaction() {
   // Pick up the first file to start compaction. It may have been extended
   // to a clean cut.
-  SetupInitialFiles();
+  SetupInitialFilesDelta();
   if (start_level_inputs_.empty()) {
     return nullptr;
   }
+  assert(start_level_ >= 0 && output_level_ >= 0);
+
+  // for delta L0 Compaction
+  if (start_level_ == 0 && output_level_ == 0) {
+      compaction_inputs_.push_back(start_level_inputs_);
+      Compaction* c = GetCompaction();
+      TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
+      return c;
+  }
+
+  // 原来的逻辑
+  SetupInitialFiles();
   assert(start_level_ >= 0 && output_level_ >= 0);
 
   // If it is a L0 -> base level compaction, we need to set up other L0
@@ -981,5 +1083,32 @@ Compaction* LevelCompactionPicker::PickCompaction(
                                  mutable_cf_options, ioptions_,
                                  mutable_db_options);
   return builder.PickCompaction();
+}
+
+Compaction* LevelCompactionPicker::PickCompactionForCompactRange(
+    const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+    const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
+    int input_level, int output_level,
+    const CompactRangeOptions& compact_range_options, const InternalKey* begin,
+    const InternalKey* end, InternalKey** compaction_end, bool* manual_conflict,
+    uint64_t max_file_num_to_ignore, const std::string& trim_ts) {
+  if (input_level == 0) {
+    LogBuffer log_buffer(INFO_LEVEL, ioptions_.info_log.get());
+    LevelCompactionBuilder builder(cf_name, vstorage, this, &log_buffer,
+                                   mutable_cf_options, ioptions_,
+                                   mutable_db_options);
+    if (builder.PickMixedL0Compaction()) {
+      builder.AcceptStartLevelInputs();
+      Compaction* c = builder.GetCompaction();
+      log_buffer.FlushBufferToLog();
+      *compaction_end = nullptr;
+      return c;
+    }
+  }
+
+  return CompactionPicker::PickCompactionForCompactRange(
+      cf_name, mutable_cf_options, mutable_db_options, vstorage, input_level,
+      output_level, compact_range_options, begin, end, compaction_end,
+      manual_conflict, max_file_num_to_ignore, trim_ts);
 }
 }  // namespace ROCKSDB_NAMESPACE

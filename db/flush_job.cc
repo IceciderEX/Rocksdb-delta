@@ -25,6 +25,7 @@
 #include "db/range_tombstone_fragmenter.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
+#include "delta/hotspot_manager.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "logging/event_logger.h"
@@ -937,6 +938,8 @@ Status FlushJob::WriteLevel0Table() {
                          << "flush_reason"
                          << GetFlushReasonString(flush_reason_);
 
+    std::unordered_map<uint64_t, DataSegment> output_segments;
+
     {
       ScopedArenaPtr<InternalIterator> iter(
           NewMergingIterator(&cfd_->internal_comparator(), memtables.data(),
@@ -1005,7 +1008,9 @@ Status FlushJob::WriteLevel0Table() {
           seqno_to_time_mapping_.get(), event_logger_, job_context_->job_id,
           &table_properties_, write_hint, full_history_ts_low, blob_callback_,
           base_, &memtable_payload_bytes, &memtable_garbage_bytes,
-          &flush_stats);
+          &flush_stats,
+          &output_segments, // for delta
+          db_options_.hotspot_manager.get());
       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
@@ -1072,6 +1077,36 @@ Status FlushJob::WriteLevel0Table() {
           DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
     }
     TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table", &mems_);
+
+    // for delta
+    // 注册 Delta 片段到热点索引表
+    // 只有当 Flush 成功且生成了文件时才执行
+    if (s.ok() && meta_.fd.GetFileSize() > 0 && db_options_.hotspot_manager) {
+        uint64_t file_number = meta_.fd.GetNumber();
+        int registered_count = 0;
+
+        for (auto& kv : output_segments) {
+            uint64_t cuid = kv.first;
+            const DataSegment& seg = kv.second;
+
+            // GDCT的更新（暂时不需要，假设最后一次全版本scan之后没有newdata）
+            // if (seg.Valid()) {
+            //   db_options_.hotspot_manager->UpdateFlushRefCount(cuid, file_number);
+            // }
+            
+            // 当 CUID 已经是热点时，才记录索引
+            if (seg.Valid() && db_options_.hotspot_manager->IsHot(cuid)) {
+                db_options_.hotspot_manager->GetIndexTable().AddDelta(cuid, seg);
+                registered_count++;
+            }
+        }
+        
+        if (registered_count > 0) {
+          ROCKS_LOG_INFO(db_options_.info_log, 
+              "[%s] [FlushJob] Registered %d hot delta segments for file #%" PRIu64,
+              cfd_->GetName().c_str(), registered_count, file_number);
+        }
+    }
     db_mutex_->Lock();
   }
   base_->Unref();
