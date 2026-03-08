@@ -69,12 +69,6 @@ uint64_t ExtractRowID(const Slice& key) {
   return r;
 }
 
-std::string FormatKeyDisplay(const Slice& key) {
-  std::string cuid_part = std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
-  std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
-  return cuid_part + "..." + suffix;
-}
-
 void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
   uint64_t next_row_per_cuid[10] = {0};
   WriteOptions wo;
@@ -170,16 +164,8 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
               const auto& seg = diag_entry.snapshot_segments[si];
               std::cerr << "[DIAG]   snap[" << si
                         << "] file=" << (int64_t)seg.file_number
-                        << " first_key=" << FormatKeyDisplay(seg.first_key)
-                        << " last_key=" << FormatKeyDisplay(seg.last_key)
-                        << std::endl;
-            }
-            for (size_t di = 0; di < diag_entry.deltas.size(); di++) {
-              const auto& seg = diag_entry.deltas[di];
-              std::cerr << "[DIAG]   delta[" << di
-                        << "] file=" << (int64_t)seg.file_number
-                        << " first_key=" << FormatKeyDisplay(seg.first_key)
-                        << " last_key=" << FormatKeyDisplay(seg.last_key)
+                        << " first_key=" << FormatKE
+                        << " last_key.size=" << seg.last_key.size()
                         << std::endl;
             }
           } else {

@@ -7206,15 +7206,15 @@ void DBImpl::ProcessPendingPartialMerge() {
                              file_opts, icmp, mutable_cf_opts, false);
     children.push_back(delta_iter);
 
-    for (const auto& delta : overlapping_deltas) {
-      std::cout << "DELTA Seg Start:   " << (delta.first_key.size() >= 24 ? ExtractCUID(delta.first_key) : 0)
-              << "..." << (delta.first_key.size() > 24 ? delta.first_key.substr(24) : "")
-              << std::endl;
+    // for (const auto& delta : overlapping_deltas) {
+    //   std::cout << "DELTA Seg Start:   " << (delta.first_key.size() >= 24 ? ExtractCUID(delta.first_key) : 0)
+    //           << "..." << (delta.first_key.size() > 24 ? delta.first_key.substr(24) : "")
+    //           << std::endl;
 
-      std::cout << "DELTA Seg End:     " << (delta.last_key.size() >= 24 ? ExtractCUID(delta.last_key) : 0)
-              << "..." << (delta.last_key.size() > 24 ? delta.last_key.substr(24) : "")
-              << std::endl;
-    }
+    //   std::cout << "DELTA Seg End:     " << (delta.last_key.size() >= 24 ? ExtractCUID(delta.last_key) : 0)
+    //           << "..." << (delta.last_key.size() > 24 ? delta.last_key.substr(24) : "")
+    //           << std::endl;
+    // }
   }
 
   // 3. Scan Data Iterator (Local to this PartialMerge execution)
@@ -7223,10 +7223,10 @@ void DBImpl::ProcessPendingPartialMerge() {
     scan_data_iter = new ScanDataIterator(task.scan_data);
     children.push_back(scan_data_iter);
 
-    std::cout << "SCAN Data Start:   " << (task.scan_data[0].first.size() >= 24 ? ExtractCUID(task.scan_data[0].first) : 0)
+    std::cout << "Partial Merge SCAN Data Start:   " << (task.scan_data[0].first.size() >= 24 ? ExtractCUID(task.scan_data[0].first) : 0)
             << "..." << (task.scan_data[0].first.size() > 24 ? task.scan_data[0].first.substr(24) : "")
             << std::endl;
-    std::cout << "SCAN Data End:     " << (task.scan_data.back().first.size() >= 24 ? ExtractCUID(task.scan_data.back().first) : 0)
+    std::cout << "Partial Merge SCAN Data End:     " << (task.scan_data.back().first.size() >= 24 ? ExtractCUID(task.scan_data.back().first) : 0)
             << "..." << (task.scan_data.back().first.size() > 24 ? task.scan_data.back().first.substr(24) : "")
             << std::endl;
   }

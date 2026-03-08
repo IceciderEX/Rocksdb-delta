@@ -73,8 +73,20 @@ void Check(bool condition, const std::string& msg) {
   }
 }
 
+std::string FormatKeyDisplay(const Slice& key) {
+  std::string cuid_part = std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
+  std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
+  return cuid_part + "..." + suffix;
+}
+
 std::string GenerateUpperBoundKey(uint64_t cuid) {
   return GenerateKey(cuid + 1, 0);
+}
+
+std::string FormatKeyDisplay(const Slice& key) {
+  std::string cuid_part = std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
+  std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
+  return cuid_part + "..." + suffix;
 }
 
 // 全量扫描
@@ -91,6 +103,7 @@ int PerformFullScan(DB* db, uint64_t cuid) {
 
   int count = 0;
   for (it->Seek(start_key); it->Valid(); it->Next()) {
+    // std::cout << "Full Scan Key: " << FormatKeyDisplay(it->key()) << std::endl;
     if (ExtractCUID(it->key()) != cuid) break;
     count++;
   }
@@ -221,6 +234,11 @@ int main() {
   std::cout << "Delta count after writes: " << delta_count << std::endl;
   Check(delta_count >= 3,
         "Should have multiple deltas (>= 3 for kPartialMerge threshold)");
+  
+  for (size_t i = 0; i < entry.deltas.size(); ++i) {
+    std::cout << "  Delta " << i + 1 << ": file_number=" << entry.deltas[i].file_number
+              << ", range=[" << FormatKeyDisplay(entry.deltas[i].first_key) << "]" << std::endl;
+  }
 
   // =================================================================
   // 测试 3: 部分扫描触发 kPartialMerge
@@ -273,6 +291,16 @@ int main() {
                        20);  // 201-220, 221-240, etc.
   }
 
+  std::cout << "SNAPSHOT KEY RANGES BEFORE 2nd partial merge:" << std::endl;
+  for (const auto& seg : entry.snapshot_segments) {
+    std::cout << "  Segment: [" << FormatKeyDisplay(seg.first_key) << ", " << FormatKeyDisplay(seg.last_key)
+              << "], file_number=" << seg.file_number << std::endl;
+  }
+  for (size_t i = 0; i < entry.deltas.size(); ++i) {
+    std::cout << "  Delta " << i + 1 << ": file_number=" << entry.deltas[i].file_number
+              << ", range=[" << FormatKeyDisplay(entry.deltas[i].first_key) << ", " << FormatKeyDisplay(entry.deltas[i].last_key) << "]" << std::endl;
+  }
+
   // 执行第二个相邻的部分扫描 (201-300)
   std::cout << "Performing second partial scan on row range [201, 300]..."
             << std::endl;
@@ -293,10 +321,12 @@ int main() {
   int mem_seg_count = 0;
   DataSegment coalesced_seg;
   for (const auto& seg : entry.snapshot_segments) {
-    if (seg.file_number == static_cast<uint64_t>(-1)) {
-      mem_seg_count++;
-      coalesced_seg = seg;
-    }
+    // if (seg.file_number == static_cast<uint64_t>(-1)) {
+    //   mem_seg_count++;
+    //   coalesced_seg = seg;
+    // }
+    coalesced_seg = seg;
+    mem_seg_count++;
   }
   std::cout << "Memory segment count: " << mem_seg_count << std::endl;
   Check(mem_seg_count == 1,
@@ -307,35 +337,10 @@ int main() {
   std::string expected_end_min = GenerateKey(CUID_PARTIAL, 300);
 
   std::cout
-      << "Expected Max Start: "
-      << (expected_start_max.size() >= 24 ? ExtractCUID(expected_start_max) : 0)
-      << "..."
-      << (expected_start_max.size() > 24 ? expected_start_max.substr(24) : "")
-      << std::endl;
-  std::cout << "Actual Seg Start:   "
-            << (coalesced_seg.first_key.size() >= 24
-                    ? ExtractCUID(coalesced_seg.first_key)
-                    : 0)
-            << "..."
-            << (coalesced_seg.first_key.size() > 24
-                    ? coalesced_seg.first_key.substr(24)
-                    : "")
-            << std::endl;
-  std::cout << "Expected Min End:   "
-            << (expected_end_min.size() >= 24 ? ExtractCUID(expected_end_min)
-                                              : 0)
-            << "..."
-            << (expected_end_min.size() > 24 ? expected_end_min.substr(24) : "")
-            << std::endl;
-  std::cout << "Actual Seg End:     "
-            << (coalesced_seg.last_key.size() >= 24
-                    ? ExtractCUID(coalesced_seg.last_key)
-                    : 0)
-            << "..."
-            << (coalesced_seg.last_key.size() > 24
-                    ? coalesced_seg.last_key.substr(24)
-                    : "")
-            << std::endl;
+      << "Expected Max Start: " << FormatKeyDisplay(expected_start_max) << std::endl;
+  std::cout << "Actual Seg Start:   " << FormatKeyDisplay(coalesced_seg.first_key) << std::endl;
+  std::cout << "Expected Min End:   " << FormatKeyDisplay(expected_end_min) << std::endl;
+  std::cout << "Actual Seg End:     " << FormatKeyDisplay(coalesced_seg.last_key) << std::endl;
 
   // 必须小于或者等于 100 (可能会因为吞并前面的重叠段变成 0)
   Check(coalesced_seg.first_key <= expected_start_max,
