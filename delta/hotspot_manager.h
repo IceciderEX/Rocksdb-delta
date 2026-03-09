@@ -62,8 +62,8 @@ class HotspotManager {
   void PrepareForFullReplace(uint64_t cuid);
 
   Status FlushBlockToSharedSST(
-      std::unique_ptr<HotDataBlock> block,
-      std::unordered_map<uint64_t, DataSegment>* output_segments);
+    std::shared_ptr<HotDataBlock> block,
+    std::unordered_map<uint64_t, DataSegment>* output_segments);
 
   void TriggerBufferFlush();
 

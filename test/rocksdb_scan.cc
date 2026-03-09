@@ -102,6 +102,8 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
   while (!stop_test) {
     uint64_t cuid = 1003;
     ro.delta_full_scan = (rand() % 2 == 0);
+    std::cout << "[Reader " << id << "] Starting scan for CUID " << cuid
+              << ", delta_full_scan=" << ro.delta_full_scan << std::endl;
 
     std::string start_key = GenerateKey(cuid, 0);
     std::string upper_bound = GenerateKey(cuid + 1, 0);
@@ -198,6 +200,12 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
             std::cerr << "[DIAG] Buffer data count for CUID " << cuid << ": "
                       << buf_count << std::endl;
             delete buf_iter;
+          }
+
+          for (it->Seek(start_key); it->Valid(); it->Next()) {
+            if (ExtractCUID(it->key()) != cuid) break;
+            // std::cout << FormatKeyDisplay(it->key()) << std::endl;
+            found.insert(ExtractRowID(it->key()));
           }
         }
       }

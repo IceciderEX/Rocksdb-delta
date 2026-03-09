@@ -17,7 +17,7 @@ void HotDataBlock::Sort() {
 
 HotDataBuffer::HotDataBuffer(size_t threshold_bytes)
     : threshold_bytes_(threshold_bytes), total_buffered_size_(0) {
-  active_block_ = std::make_unique<HotDataBlock>();
+  active_block_ = std::make_shared<HotDataBlock>();
   active_block_->entries.reserve(10000);
 }
 
@@ -37,26 +37,32 @@ bool HotDataBuffer::RotateBuffer() {
     return false;
   }
 
-  immutable_queue_.push_back(std::move(active_block_));
+  immutable_queue_.push_back(active_block_);
 
   // new Active Block
-  active_block_ = std::make_unique<HotDataBlock>();
+  active_block_ = std::make_shared<HotDataBlock>();
   active_block_->entries.reserve(10000);
   return true;
 }
 
-std::unique_ptr<HotDataBlock> HotDataBuffer::ExtractBlockToFlush() {
+std::shared_ptr<HotDataBlock> HotDataBuffer::GetFrontBlockForFlush() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (immutable_queue_.empty()) {
     return nullptr;
   }
+  return immutable_queue_.front();
+}
 
-  auto block = std::move(immutable_queue_.front());
+void HotDataBuffer::PopFrontBlockAfterFlush() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (immutable_queue_.empty()) {
+    return;
+  }
+
+  auto block = immutable_queue_.front();
   immutable_queue_.pop_front();
 
   total_buffered_size_ -= block->current_size_bytes;
-
-  return block;
 }
 
 // size_t HotDataBuffer::GetTotalSize() const {

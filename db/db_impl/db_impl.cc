@@ -7074,11 +7074,6 @@ void DBImpl::ProcessPendingMetadataScans() {
     if (!iter->status().ok()) {
       fprintf(stderr, "[DBImpl] Metadata scan error for CUID %lu: %s\n", cuid,
               iter->status().ToString().c_str());
-    } else {
-      fprintf(stdout,
-              "[DBImpl] Completed background metadata scan for CUID %lu, %zu "
-              "entries tracked\n",
-              cuid, count);
     }
   }
 }

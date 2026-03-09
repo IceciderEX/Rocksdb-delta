@@ -67,10 +67,8 @@ class HotDataBuffer {
 
   // Active Buffer -> Immutable Queue
   bool RotateBuffer();
-
-  std::unique_ptr<HotDataBlock> ExtractBlockToFlush();
-
-  // std::vector<HotEntry> ExtractAndReset();
+  std::shared_ptr<HotDataBlock> GetFrontBlockForFlush();
+  void PopFrontBlockAfterFlush();
 
   size_t GetTotalBufferedSize() const { return total_buffered_size_; }
 
@@ -87,8 +85,8 @@ class HotDataBuffer {
   std::atomic<size_t> total_buffered_size_;
   mutable std::mutex mutex_;
 
-  std::unique_ptr<HotDataBlock> active_block_;
-  std::deque<std::unique_ptr<HotDataBlock>> immutable_queue_;
+  std::shared_ptr<HotDataBlock> active_block_;
+  std::deque<std::shared_ptr<HotDataBlock>> immutable_queue_;
 };
 
 class HotSstLifecycleManager {

@@ -146,7 +146,7 @@ class VectorIterator {
 };
 
 Status HotspotManager::FlushBlockToSharedSST(
-    std::unique_ptr<HotDataBlock> block,
+    std::shared_ptr<HotDataBlock> block,
     std::unordered_map<uint64_t, DataSegment>* output_segments) {
   if (!block || block->entries.empty()) return Status::OK();
 
@@ -258,8 +258,12 @@ void HotspotManager::TriggerBufferFlush() {
     return;
   }
 
+  std::cout << "[HotspotManager] Buffer rotated. Preparing to flush block." << std::endl;
+
   // 提取待刷盘 Block
-  auto block = buffer_.ExtractBlockToFlush();
+  // 先获取 block 执行刷盘，成功后再从队列移除
+  // 防止 reader 再 flush 过程中看不到数据
+  auto block = buffer_.GetFrontBlockForFlush();
   while (block) {
     std::unordered_map<uint64_t, DataSegment> new_segments;
     // to share SST
@@ -298,7 +302,9 @@ void HotspotManager::TriggerBufferFlush() {
       fprintf(stderr, "[HotspotManager] Failed to flush shared block: %s\n",
               s.ToString().c_str());
     }
-    block = buffer_.ExtractBlockToFlush();
+    // 刷盘和index更新完成之后再移除
+    buffer_.PopFrontBlockAfterFlush();
+    block = buffer_.GetFrontBlockForFlush();
   }
 }
 
