@@ -48,36 +48,59 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   }
 
   auto& entry = it->second;
-  bool found_mem_segment = false;
+  bool found_overlap = false;
+  std::vector<DataSegment> next_segments;
 
-  // 遍历 Snapshot 片段，寻找 file_number 为 -1
-  // 且键范围对应片段，进行一个promote
-  for (auto& seg : entry.snapshot_segments) {
+  std::string new_start = ExtractUserKey(new_segment.first_key).ToString();
+  std::string new_end = ExtractUserKey(new_segment.last_key).ToString();
+
+  // 找到标记为 -1 的内存段，判断是否有重叠，进行 segmentation
+  for (const auto& seg : entry.snapshot_segments) {
     if (seg.file_number == static_cast<uint64_t>(-1)) {
-      // 新生成的 segment 应该属于这个 mem segment (-1)的一部分或全部？
-      // [first, last] -> [seg.first, -1 seg.last] 之间
-      bool is_left = (ExtractUserKey(new_segment.last_key).ToString() <
-                      ExtractUserKey(seg.first_key).ToString());
-      bool is_right = (ExtractUserKey(new_segment.first_key).ToString() >
-                       ExtractUserKey(seg.last_key).ToString());
-      if (!is_left && !is_right) {
-        seg.file_number = new_segment.file_number;
-        seg.first_key = new_segment.first_key;
-        seg.last_key = new_segment.last_key;
-        seg.file_size = new_segment.file_size;
+      std::string seg_start = ExtractUserKey(seg.first_key).ToString();
+      std::string seg_end = ExtractUserKey(seg.last_key).ToString();
 
-        found_mem_segment = true;
-        break;
+      bool is_left = new_end < seg_start;
+      bool is_right = new_start > seg_end;
+
+      if (!is_left && !is_right) {
+        found_overlap = true;
+        // 1. 左侧剩余部分
+        if (seg_start < new_start) {
+          DataSegment left_seg = seg;
+          left_seg.last_key = new_segment.first_key;
+          next_segments.push_back(left_seg);
+        }
+
+        // 2. 右侧剩余部分
+        if (seg_end > new_end) {
+          DataSegment right_seg = seg;
+          right_seg.first_key = new_segment.last_key;
+          next_segments.push_back(right_seg);
+        }
+      } else {
+        next_segments.push_back(seg);
       }
+    } else {
+      next_segments.push_back(seg);
     }
   }
 
-  if (found_mem_segment && lifecycle_manager_) {
-    lifecycle_manager_->Ref(new_segment.file_number);
-    // -1 状态没有 Ref
+  if (found_overlap) {
+    next_segments.push_back(new_segment);
+    // 重新排序
+    std::sort(next_segments.begin(), next_segments.end(),
+              [](const DataSegment& a, const DataSegment& b) {
+                return a.first_key < b.first_key;
+              });
+    entry.snapshot_segments = std::move(next_segments);
+
+    if (lifecycle_manager_) {
+      lifecycle_manager_->Ref(new_segment.file_number);
+    }
   }
 
-  return found_mem_segment;
+  return found_overlap;
 }
 
 void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {

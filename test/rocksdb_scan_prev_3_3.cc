@@ -83,12 +83,6 @@ std::string GenerateUpperBoundKey(uint64_t cuid) {
   return GenerateKey(cuid + 1, 0);
 }
 
-std::string FormatKeyDisplay(const Slice& key) {
-  std::string cuid_part = std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
-  std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
-  return cuid_part + "..." + suffix;
-}
-
 // 全量扫描
 int PerformFullScan(DB* db, uint64_t cuid) {
   ReadOptions ro;

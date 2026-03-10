@@ -7,9 +7,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "db/db_impl/db_impl.h"
-#include "util/extract_cuid.h"
 
 #include <cstdint>
+
+#include "util/extract_cuid.h"
 #ifdef OS_SOLARIS
 #include <alloca.h>
 #endif
@@ -7014,6 +7015,7 @@ void DBImpl::ProcessPendingHotCuids() {
               "[DBImpl] Completed init scan for CUID %lu, %zu entries\n", cuid,
               count);
     }
+    hotspot_manager_->UnlockCuid(cuid);
   }
 }
 
@@ -7155,12 +7157,14 @@ void DBImpl::ProcessPendingPartialMerge() {
     new_segment.last_key = task.scan_last_key;
     hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
         task.cuid, new_segment, std::vector<uint64_t>{});
+    hotspot_manager_->UnlockCuid(task.cuid);
     return;
   }
 
   ColumnFamilyHandle* cfh = DefaultColumnFamily();
   if (!cfh) {
     fprintf(stderr, "[DBImpl] No default column family for partial merge\n");
+    hotspot_manager_->UnlockCuid(task.cuid);
     return;
   }
 
@@ -7168,6 +7172,7 @@ void DBImpl::ProcessPendingPartialMerge() {
   SuperVersion* sv = GetAndRefSuperVersion(cfd);
   if (!sv) {
     fprintf(stderr, "[DBImpl] Failed to get SuperVersion for partial merge\n");
+    hotspot_manager_->UnlockCuid(task.cuid);
     return;
   }
 
@@ -7188,10 +7193,10 @@ void DBImpl::ProcessPendingPartialMerge() {
 
     std::cout << "SNAPSHOT Seg Start:   " << (overlapping_snaps[0].first_key.size() >= 24 ? ExtractCUID(overlapping_snaps[0].first_key) : 0)
             << "..." << (overlapping_snaps[0].first_key.size() > 24 ? overlapping_snaps[0].first_key.substr(24) : "")
-            << std::endl;
+              << std::endl;
     std::cout << "SNAPSHOT[0] Seg End:     " << (overlapping_snaps[0].last_key.size() >= 24 ? ExtractCUID(overlapping_snaps[0].last_key) : 0)
             << "..." << (overlapping_snaps[0].last_key.size() > 24 ? overlapping_snaps[0].last_key.substr(24) : "")
-            << std::endl;
+              << std::endl;
   }
 
   // 2. Delta Iterator
@@ -7220,14 +7225,15 @@ void DBImpl::ProcessPendingPartialMerge() {
 
     std::cout << "Partial Merge SCAN Data Start:   " << (task.scan_data[0].first.size() >= 24 ? ExtractCUID(task.scan_data[0].first) : 0)
             << "..." << (task.scan_data[0].first.size() > 24 ? task.scan_data[0].first.substr(24) : "")
-            << std::endl;
+              << std::endl;
     std::cout << "Partial Merge SCAN Data End:     " << (task.scan_data.back().first.size() >= 24 ? ExtractCUID(task.scan_data.back().first) : 0)
             << "..." << (task.scan_data.back().first.size() > 24 ? task.scan_data.back().first.substr(24) : "")
-            << std::endl;
+              << std::endl;
   }
 
   if (children.empty()) {
     ReturnAndCleanupSuperVersion(cfd, sv);
+    hotspot_manager_->UnlockCuid(task.cuid);
     return;
   }
 
@@ -7273,6 +7279,7 @@ void DBImpl::ProcessPendingPartialMerge() {
   ReturnAndCleanupSuperVersion(cfd, sv);
 
   if (written_count == 0) {
+    hotspot_manager_->UnlockCuid(task.cuid);
     return;
   }
 
@@ -7308,6 +7315,7 @@ void DBImpl::ProcessPendingPartialMerge() {
           "[DBImpl] PartialMerge completed for CUID %lu: merged %zu entries "
           "into HotDataBuffer\n",
           task.cuid, written_count);
+  hotspot_manager_->UnlockCuid(task.cuid);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

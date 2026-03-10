@@ -167,6 +167,10 @@ class HotspotManager {
   // 检查是否有待处理的物理单元计数扫描任务
   bool HasPendingMetadataScans() const;
 
+  // CUID Locking for background tasks (PartialMerge / InitScan)
+  bool TryLockCuid(uint64_t cuid);
+  void UnlockCuid(uint64_t cuid);
+
   void DebugDump(const std::string& label) {
     std::string dump_file =
         "/home/wam/HWKV/rocksdb-delta/build/a_test_db/a_mgr.log";
@@ -200,6 +204,9 @@ class HotspotManager {
   // Partial Merge 处理队列
   std::deque<PartialMergePendingTask> partial_merge_queue_;
   mutable std::mutex partial_merge_mutex_;
+  // 正在进行的 CUID 操作 (防止并发)
+  std::unordered_set<uint64_t> in_progress_cuids_;
+  mutable std::mutex in_progress_mutex_;
 
  public:
   // 加入 Partial Merge 队列 (前台调用，不阻塞)

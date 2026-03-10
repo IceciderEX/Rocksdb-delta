@@ -502,8 +502,16 @@ void HotspotManager::EnqueueForInitScan(uint64_t cuid) {
 
 std::vector<uint64_t> HotspotManager::PopPendingInitCuids() {
   std::lock_guard<std::mutex> lock(pending_init_mutex_);
-  std::vector<uint64_t> result = std::move(pending_init_cuids_);
-  pending_init_cuids_.clear();
+  std::vector<uint64_t> result;
+  for (auto it = pending_init_cuids_.begin();
+       it != pending_init_cuids_.end();) {
+    if (TryLockCuid(*it)) {
+      result.push_back(*it);
+      it = pending_init_cuids_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   return result;
 }
 
@@ -569,9 +577,30 @@ bool HotspotManager::PopPendingPartialMerge(PartialMergePendingTask* task) {
   if (partial_merge_queue_.empty()) {
     return false;
   }
-  *task = std::move(partial_merge_queue_.front());
-  partial_merge_queue_.pop_front();
+
+  for (auto it = partial_merge_queue_.begin(); it != partial_merge_queue_.end();
+       ++it) {
+    if (TryLockCuid(it->cuid)) {
+      *task = std::move(*it);
+      partial_merge_queue_.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool HotspotManager::TryLockCuid(uint64_t cuid) {
+  std::lock_guard<std::mutex> lock(in_progress_mutex_);
+  if (in_progress_cuids_.count(cuid)) {
+    return false;
+  }
+  in_progress_cuids_.insert(cuid);
   return true;
+}
+
+void HotspotManager::UnlockCuid(uint64_t cuid) {
+  std::lock_guard<std::mutex> lock(in_progress_mutex_);
+  in_progress_cuids_.erase(cuid);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

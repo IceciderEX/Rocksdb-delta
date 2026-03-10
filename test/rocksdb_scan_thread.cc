@@ -34,16 +34,22 @@ struct CuidGroundTruth {
 };
 std::map<uint64_t, CuidGroundTruth*> ground_truths;
 
-std::string GenerateKey(uint64_t cuid, uint64_t row_id) {
-  std::string key(40, '\0');
-  unsigned char* p = reinterpret_cast<unsigned char*>(&key[16]);
+std::string GenerateKey(uint64_t cuid, int row_id) {
+  std::string key;
+  key.resize(40);
+  std::memset(&key[0], 0, 40);
+
+  unsigned char* p = reinterpret_cast<unsigned char*>(&key[0]) + 16;
   for (int i = 0; i < 8; ++i) {
     p[i] = (cuid >> (56 - 8 * i)) & 0xFF;
   }
-  unsigned char* q = reinterpret_cast<unsigned char*>(&key[32]);
-  for (int i = 0; i < 8; ++i) {
-    q[i] = (row_id >> (56 - 8 * i)) & 0xFF;
-  }
+
+  // 使用固定10位宽度格式，确保字典序=数字序
+  // "123" -> "0000000123"
+  char row_buf[16];
+  snprintf(row_buf, sizeof(row_buf), "%010d", row_id);
+  std::memcpy(&key[24], row_buf, 10);
+
   return key;
 }
 
@@ -59,14 +65,15 @@ uint64_t ExtractCUID(const Slice& key) {
 }
 
 uint64_t ExtractRowID(const Slice& key) {
-  if (key.size() < 40) return 0;
-  const unsigned char* p =
-      reinterpret_cast<const unsigned char*>(key.data()) + 32;
-  uint64_t r = 0;
-  for (int i = 0; i < 8; ++i) {
-    r = (r << 8) | p[i];
-  }
-  return r;
+  if (key.size() < 34) return 0;
+  std::string row_str = key.ToString().substr(24, 10);
+  return std::stoull(row_str);
+}
+
+std::string FormatKeyDisplay(const Slice& key) {
+  std::string cuid_part = std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
+  std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
+  return cuid_part + "..." + suffix;
 }
 
 void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
@@ -95,6 +102,8 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
   while (!stop_test) {
     uint64_t cuid = 1003;
     ro.delta_full_scan = (rand() % 2 == 0);
+    std::cout << "[Reader " << id << "] Starting scan for CUID " << cuid
+              << ", delta_full_scan=" << ro.delta_full_scan << std::endl;
 
     std::string start_key = GenerateKey(cuid, 0);
     std::string upper_bound = GenerateKey(cuid + 1, 0);
@@ -164,8 +173,16 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
               const auto& seg = diag_entry.snapshot_segments[si];
               std::cerr << "[DIAG]   snap[" << si
                         << "] file=" << (int64_t)seg.file_number
-                        << " first_key=" << FormatKE
-                        << " last_key.size=" << seg.last_key.size()
+                        << " first_key=" << FormatKeyDisplay(seg.first_key)
+                        << " last_key=" << FormatKeyDisplay(seg.last_key)
+                        << std::endl;
+            }
+            for (size_t di = 0; di < diag_entry.deltas.size(); di++) {
+              const auto& seg = diag_entry.deltas[di];
+              std::cerr << "[DIAG]   delta[" << di
+                        << "] file=" << (int64_t)seg.file_number
+                        << " first_key=" << FormatKeyDisplay(seg.first_key)
+                        << " last_key=" << FormatKeyDisplay(seg.last_key)
                         << std::endl;
             }
           } else {
@@ -183,6 +200,12 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
             std::cerr << "[DIAG] Buffer data count for CUID " << cuid << ": "
                       << buf_count << std::endl;
             delete buf_iter;
+          }
+
+          for (it->Seek(start_key); it->Valid(); it->Next()) {
+            if (ExtractCUID(it->key()) != cuid) break;
+            // std::cout << FormatKeyDisplay(it->key()) << std::endl;
+            found.insert(ExtractRowID(it->key()));
           }
         }
       }
