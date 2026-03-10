@@ -282,17 +282,27 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
     wbm_stall_.reset(new WBMStallInterface());
   }
   // for delta
-  std::string hotspot_dir = dbname_ + "/hotspot_data";
-  ColumnFamilyOptions default_cf_opts;
-  Options hotspot_opts(initial_db_options_, default_cf_opts);
+  if (immutable_db_options_.enable_delta) {
+    std::string hotspot_dir = dbname_ + "/hotspot_data";
+    ColumnFamilyOptions default_cf_opts;
+    Options hotspot_opts(initial_db_options_, default_cf_opts);
 
-  hotspot_manager_ =
-      std::make_shared<HotspotManager>(hotspot_opts, hotspot_dir);
-  immutable_db_options_.hotspot_manager = hotspot_manager_;
-  // immutable_db_options_.hotspot_manager = hotspot_manager_;
+    hotspot_manager_ =
+        std::make_shared<HotspotManager>(hotspot_opts, hotspot_dir);
+    immutable_db_options_.hotspot_manager = hotspot_manager_;
 
-  ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                 "HotspotManager initialized at DBImpl%s", hotspot_dir.c_str());
+    std::cout << "HotspotManager initialized at DBImpl " << hotspot_dir << std::endl;
+
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "HotspotManager initialized at DBImpl %s",
+                   hotspot_dir.c_str());
+  } else {
+    hotspot_manager_ = nullptr;
+    immutable_db_options_.hotspot_manager = nullptr;
+    std::cout << "Delta features disabled (enable_delta=false)" << std::endl;
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "Delta features disabled (enable_delta=false)");
+  }
 }
 
 Status DBImpl::Resume() {

@@ -806,6 +806,7 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       calculate_sst_write_lifetime_hint_set(
           options.calculate_sst_write_lifetime_hint_set),
       // for delta
+      enable_delta(options.enable_delta),
       hotspot_manager(options.hotspot_manager) {
   fs = env->GetFileSystem();
   clock = env->GetSystemClock().get();

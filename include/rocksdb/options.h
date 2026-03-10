@@ -1730,6 +1730,7 @@ struct DBOptions {
   // End EXPERIMENTAL
 
   // for delta
+  bool enable_delta = true;
   std::shared_ptr<HotspotManager> hotspot_manager = nullptr;
 };
 

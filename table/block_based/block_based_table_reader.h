@@ -600,7 +600,7 @@ struct BlockBasedTable::Rep {
       const BlockBasedTableOptions& _table_opt,
       const InternalKeyComparator& _internal_comparator, bool skip_filters,
       uint64_t _file_size, int _level, const bool _immortal_table,
-      uint64_t _file_number,
+      uint64_t _file_number, // for delta
       const bool _user_defined_timestamps_persisted = true)
       : ioptions(_ioptions),
         env_options(_env_options),

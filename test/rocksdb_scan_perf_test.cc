@@ -30,10 +30,11 @@
 using namespace ROCKSDB_NAMESPACE;
 
 // 配置常量
-const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_tmp/db_perf_native";
-const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_tmp/db_perf_delta";
-const int kNumCuids = 500;           // 总 CUID 数量
-const int kRowsPerCuid = 50000;        // 每个 CUID 初始行数
+const std::string kNativeDBPath = "db_perf_native";
+const std::string kDeltaDBPath = "db_perf_delta";
+const int kNumCuids = 500;  // 总 CUID 数量 (提高到 2000)
+const int kRowsPerCuid =
+    500000;  // 每个 CUID 初始行数 (提高到 5000，总计 1000w 行)
 const double kHotRatio = 0.15;        // 15% 的热点
 const double kHotAccessRatio = 0.77;  // 77% 的访问集中在热点
 
@@ -113,6 +114,7 @@ class PerfTester {
       }
       db_->Write(WriteOptions(), &batch);
     }
+    db_->Flush(FlushOptions());
     std::cout << "Data prep finished and flushed." << std::endl;
   }
 
@@ -138,20 +140,21 @@ class PerfTester {
     std::cout << "\nRunning Workload A (Ingestion-Heavy, Delta="
               << (use_delta ? "ON" : "OFF") << ")..." << std::endl;
 
-    for (int i = 0; i < 100; ++i) {
+    // 增加循环次数到 500，且每次写入更多数据 (500行)
+    for (int i = 0; i < 50; ++i) {
       uint64_t cuid = hot_cuids_[i % hot_cuids_.size()];
 
-      // Step A: Put 100 rows
+      // Step A: Put 500 rows
       WriteBatch batch;
-      for (int r = 0; r < 100; ++r) {
-        batch.Put(GenerateKey(cuid, kRowsPerCuid + i * 100 + r), "new_val");
+      for (int r = 0; r < 50000; ++r) {
+        batch.Put(GenerateKey(cuid, kRowsPerCuid + i * 500 + r), "new_val");
       }
       db_->Write(WriteOptions(), &batch);
 
       // Step B: Partial Scan
       auto start = std::chrono::high_resolution_clock::now();
-      int rows = ScanCUIDRange(cuid, kRowsPerCuid + i * 100,
-                               kRowsPerCuid + i * 100 + 99, ro);
+      int rows = ScanCUIDRange(cuid, kRowsPerCuid + i * 500,
+                               kRowsPerCuid + i * 500 + 499, ro);
       auto end = std::chrono::high_resolution_clock::now();
 
       stats.total_ops++;
@@ -203,31 +206,31 @@ class PerfTester {
     std::cout << "\nRunning Workload C (Lifecycle Simulation, Delta="
               << (use_delta ? "ON" : "OFF") << ")..." << std::endl;
 
-    for (int i = 0; i < 50; ++i) {
+    // 增加循环次数到 100，模拟更多实体的完整生命周期
+    for (int i = 0; i < 100; ++i) {
       uint64_t cuid = hot_cuids_[i % hot_cuids_.size()];
       auto start = std::chrono::high_resolution_clock::now();
 
-      // Step 1: Put (Append)
+      // Step 1: Put (Append 200 rows)
       WriteBatch batch;
-      for (int r = 0; r < 20000; ++r) {
-        batch.Put(GenerateKey(cuid, kRowsPerCuid + 200 + r), "append_val");
+      for (int r = 0; r < 200; ++r) {
+        batch.Put(GenerateKey(cuid, kRowsPerCuid + 500 + r), "append_val");
       }
       db_->Write(WriteOptions(), &batch);
 
       // Step 2 & 3: Multiple Scans (Triggers Partial Merge)
-      for (int s = 0; s < 30; ++s) {
-        ScanCUIDRange(cuid, kRowsPerCuid, kRowsPerCuid + 219, ro);
+      for (int s = 0; s < 5; ++s) {
+        ScanCUIDRange(cuid, kRowsPerCuid, kRowsPerCuid + 699, ro);
       }
 
       // Step 4: Full Scan
       int rows = ScanCUID(cuid, ro);
 
-      // Step 5: Clean up (Delete rows)
-      WriteBatch del_batch;
-      for (int r = 0; r < kRowsPerCuid + 220; ++r) {
-        del_batch.Delete(GenerateKey(cuid, r));
+      // Step 5: Clean up (Individual Delete per key)
+      // 处理初始行 + 追加行
+      for (int r = 0; r < kRowsPerCuid + 700; ++r) {
+        db_->Delete(WriteOptions(), GenerateKey(cuid, r));
       }
-      db_->Write(WriteOptions(), &del_batch);
 
       auto end = std::chrono::high_resolution_clock::now();
 
@@ -301,7 +304,7 @@ int main() {
   // Native 模式不需要 WarmUp
 
   Stats native_a = native_tester.RunWorkloadA(false);
-  Stats native_b = native_tester.RunWorkloadB(false, 500);
+  Stats native_b = native_tester.RunWorkloadB(false, 5000);
   Stats native_c = native_tester.RunWorkloadC(false);
 
   delete native_db;
@@ -322,7 +325,7 @@ int main() {
   delta_tester.WarmUp();  // 预热以收集热点信息
 
   Stats delta_a = delta_tester.RunWorkloadA(true);
-  Stats delta_b = delta_tester.RunWorkloadB(true, 500);
+  Stats delta_b = delta_tester.RunWorkloadB(true, 5000);
   Stats delta_c = delta_tester.RunWorkloadC(true);
 
   delete delta_db;

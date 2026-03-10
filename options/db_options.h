@@ -115,6 +115,7 @@ struct ImmutableDBOptions {
   // End of convenience/helper objects.
 
   // for delta
+  bool enable_delta = true;
   mutable std::shared_ptr<HotspotManager> hotspot_manager;
 
   bool IsWalDirSameAsDBPath() const;
