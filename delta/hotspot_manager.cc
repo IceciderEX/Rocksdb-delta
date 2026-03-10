@@ -150,8 +150,7 @@ Status HotspotManager::FlushBlockToSharedSST(
     std::unordered_map<uint64_t, DataSegment>* output_segments) {
   if (!block || block->entries.empty()) return Status::OK();
 
-  // keysort
-  block->Sort();
+  // keysort: already in RotateBuffer()
 
   EnvOptions env_options;
   SstFileWriter sst_writer(env_options, db_options_);
@@ -294,6 +293,8 @@ void HotspotManager::TriggerBufferFlush() {
           bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
           if (!promoted) {
             // 既无活跃 Scan 也无 {-1} 段，强制 Append
+            std::cout << "[HotspotManager] No active scan or {-1} segment for CUID " << cuid
+                      << ". Appending snapshot segment directly." << std::endl;
             index_table_.AppendSnapshotSegment(cuid, real_segment);
           }
         }

@@ -37,6 +37,9 @@ bool HotDataBuffer::RotateBuffer() {
     return false;
   }
 
+  // 在这里进行 sort
+  // 避免 Flush 线程在 Sort 时 Reader 线程并发访问导致的数据不一致
+  active_block_->Sort();
   immutable_queue_.push_back(active_block_);
 
   // new Active Block
