@@ -170,7 +170,7 @@ class DBIter final : public Iterator {
         !read_options_.is_metadata_scan) {
       auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
           delta_ctx_.last_cuid, read_options_.delta_full_scan,
-          delta_ctx_.scan_first_key, delta_ctx_.scan_last_key);
+          delta_ctx_.scan_first_key, delta_ctx_.GetScanLastKey());
 
       bool execute = true;
       if (strategy == ScanAsCompactionStrategy::kFullReplace &&
@@ -181,31 +181,23 @@ class DBIter final : public Iterator {
       if (execute) {
         hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
             delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
-            delta_ctx_.scan_last_key, delta_ctx_.visited_units_for_cuid,
+            delta_ctx_.GetScanLastKey(), delta_ctx_.visited_units_for_cuid,
             delta_ctx_.scan_data);
       }
     }
 
     // for delta: 异步补全元数据 (当热路径 Full Scan 结束时入队)
-    // 关键：只有非后台扫描 (!skip_hot_path) 才允许触发下一次扫描，防止无限递归
+    // 非后台扫描 (!skip_hot_path) 才允许触发下一次扫描，防止无限递归
     if (hotspot_manager_ && read_options_.delta_full_scan &&
         delta_ctx_.is_current_hot && !read_options_.skip_hot_path) {
       hotspot_manager_->EnqueueMetadataScan(delta_ctx_.last_cuid);
     }
 
-    // for delta: 在 scan 结束时处理待执行的后台 tasks
+    // for delta: 唤醒后台线程处理待执行的 tasks（condition variable）
     if (cfh_ && hotspot_manager_) {
       auto db_impl = static_cast<DBImpl*>(cfh_->db());
       if (db_impl) {
-        if (hotspot_manager_->HasPendingInitCuids()) {
-          db_impl->ProcessPendingHotCuids();
-        }
-        if (hotspot_manager_->HasPendingMetadataScans()) {
-          db_impl->ProcessPendingMetadataScans();
-        }
-        if (hotspot_manager_->HasPendingPartialMerge()) {
-          db_impl->ProcessPendingPartialMerge();
-        }
+        db_impl->NotifyDeltaBGWork();
       }
     }
   }
@@ -352,6 +344,7 @@ class DBIter final : public Iterator {
   bool FindNextUserEntry(bool skipping_saved_key, const Slice* prefix);
   // Internal implementation of FindNextUserEntry().
   bool FindNextUserEntryInternal(bool skipping_saved_key, const Slice* prefix);
+  bool FindNextUserEntryInternalImpl(bool skipping_saved_key, const Slice* prefix);
   bool ParseKey(ParsedInternalKey* key);
   bool MergeValuesNewToOld();
 
@@ -588,9 +581,19 @@ class DBIter final : public Iterator {
 
     // 当前 Scan 的 key 范围
     std::string scan_first_key;
-    std::string scan_last_key;
+    std::string scan_last_key;  // 仅 Full Scan 路径使用
+    std::string key_encode_buf;  // InternalKey buffer
     // 小 Scan 采集的精确 KV 数据，供后台 PartialMerge 使用
     std::vector<std::pair<std::string, std::string>> scan_data;
+
+    // 缓存当前 CUID 的 deleted 状态，避免每 key 都查询 GDCT
+    bool cached_cuid_is_deleted = false;
+    uint64_t cached_deleted_check_cuid = 0;
+    uint64_t cached_phys_id = 0;
+
+    const std::string& GetScanLastKey() const {
+      return scan_data.empty() ? scan_last_key : scan_data.back().first;
+    }
 
     void Reset() {
       last_cuid = 0;
@@ -599,7 +602,11 @@ class DBIter final : public Iterator {
       trigger_scan_as_compaction = false;
       scan_first_key.clear();
       scan_last_key.clear();
+      key_encode_buf.clear(); 
       scan_data.clear();
+      cached_cuid_is_deleted = false;
+      cached_deleted_check_cuid = 0;
+      cached_phys_id = 0;
     }
   } delta_ctx_;
 

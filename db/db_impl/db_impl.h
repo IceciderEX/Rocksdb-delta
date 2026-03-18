@@ -9,14 +9,17 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <limits>
 #include <list>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -3204,7 +3207,18 @@ class DBImpl : public DB {
 
   // for delta
   std::shared_ptr<HotspotManager> hotspot_manager_;
-  public: std::shared_ptr<HotspotManager> GetHotspotManager() { return hotspot_manager_; }
+  // Delta background worker thread
+  std::thread delta_bg_thread_;
+  std::mutex delta_bg_mutex_;
+  std::condition_variable delta_bg_cv_;
+  std::atomic<bool> delta_bg_stop_{false};
+  void DeltaBGWorkThreadFunc();
+  void InitializeHotspotManager(const Options& options);
+
+ public:
+  std::shared_ptr<HotspotManager> GetHotspotManager() { return hotspot_manager_; }
+  // Wake up delta background thread to drain pending tasks
+  void NotifyDeltaBGWork();
 
   void ProcessPendingHotCuids();
   void ProcessPendingMetadataScans();

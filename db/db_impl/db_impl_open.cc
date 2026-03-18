@@ -2454,6 +2454,11 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                     false /* error_if_data_exists_in_wals */, is_retry,
                     &recovered_seq, &recovery_ctx, can_retry);
   if (s.ok()) {
+    // for delta: initialize hotspot manager
+    if (impl->immutable_db_options_.enable_delta) {
+      Options hotspot_opts(db_options, column_families[0].options);
+      impl->InitializeHotspotManager(hotspot_opts);
+    }
     uint64_t new_log_number = impl->versions_->NewFileNumber();
     log::Writer* new_log = nullptr;
     const size_t preallocate_block_size =

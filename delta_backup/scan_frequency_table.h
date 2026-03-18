@@ -26,27 +26,15 @@ class ScanFrequencyTable {
   bool IsHot(uint64_t cuid) const;
 
  private:
-  static constexpr size_t kNumShards = 128;
-
-  struct Shard {
-    mutable std::mutex mutex;
-    std::unordered_map<uint64_t, FrequencyEntry> table;
-    std::chrono::steady_clock::time_point window_start_time;
-  };
-
-  Shard& GetShard(uint64_t cuid) {
-    return shards_[cuid % kNumShards];
-  }
-
-  const Shard& GetShard(uint64_t cuid) const {
-    return shards_[cuid % kNumShards];
-  }
-
-  void CheckAndRotateWindow(Shard& shard);
+  void CheckAndRotateWindow();
 
   int threshold_;
   int window_sec_;
-  std::array<Shard, kNumShards> shards_;
+  
+  mutable std::mutex mutex_;
+  std::unordered_map<uint64_t, FrequencyEntry> table_;
+  
+  std::chrono::steady_clock::time_point window_start_time_;
 };
 
 } // namespace ROCKSDB_NAMESPACE

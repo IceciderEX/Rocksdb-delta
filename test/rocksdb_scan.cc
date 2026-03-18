@@ -1,45 +1,39 @@
-/**
- * rocksdb_perf_test.cc
- *
- * RocksDB-delta 性能测试工具
- * 用于对比原生 RocksDB 与 Delta 优化方案在 PK 模型下的表现。
- *
- * 场景模拟：
- * 1. 入库负载：顺序写入 + 范围扫描 (Partial Scan)
- * 2. 查询负载：全表扫描 (Scan)，包含 15/77 热点分布
- * 3. 生命周期：Put -> Scan -> Put -> Scan -> ScanAll -> DeleteAll
- */
-
-#include <algorithm>
+#include <atomic>
 #include <chrono>
-#include <cstring>
-#include <iomanip>
 #include <iostream>
 #include <map>
-#include <random>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
+#include "delta/hotspot_manager.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
-#include "rocksdb/slice.h"
-#include "rocksdb/table.h"
 
 using namespace ROCKSDB_NAMESPACE;
 
-// 配置常量
-const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_tmp/db_perf_native";
-const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_tmp/db_perf_delta";
-const int kNumCuids = 500;           // 总 CUID 数量
-const int kRowsPerCuid = 50000;        // 每个 CUID 初始行数
-const double kHotRatio = 0.15;        // 15% 的热点
-const double kHotAccessRatio = 0.77;  // 77% 的访问集中在热点
+const std::string kDBPath = "/home/wam/Rocksdb-delta/db_tmp";
+std::atomic<bool> stop_test{false};
 
-// ==========================================
-// 辅助工具函数
-// ==========================================
+struct TestStats {
+  std::atomic<uint64_t> total_writes{0};
+  std::atomic<uint64_t> total_scans{0};
+  std::atomic<uint64_t> total_merges{0};
+  std::atomic<uint64_t> errors{0};
+};
+
+TestStats global_stats;
+
+// Ground truth per CUID to verify data integrity
+struct CuidGroundTruth {
+  std::mutex mtx;
+  std::set<uint64_t> row_ids;
+};
+std::map<uint64_t, CuidGroundTruth*> ground_truths;
+
 std::string GenerateKey(uint64_t cuid, int row_id) {
   std::string key;
   key.resize(40);
@@ -50,6 +44,8 @@ std::string GenerateKey(uint64_t cuid, int row_id) {
     p[i] = (cuid >> (56 - 8 * i)) & 0xFF;
   }
 
+  // 使用固定10位宽度格式，确保字典序=数字序
+  // "123" -> "0000000123"
   char row_buf[16];
   snprintf(row_buf, sizeof(row_buf), "%010d", row_id);
   std::memcpy(&key[24], row_buf, 10);
@@ -68,277 +64,226 @@ uint64_t ExtractCUID(const Slice& key) {
   return c;
 }
 
-struct Stats {
-  long total_ops = 0;
-  long total_rows = 0;
-  double total_time_ms = 0;
+uint64_t ExtractRowID(const Slice& key) {
+  if (key.size() < 34) return 0;
+  std::string row_str = key.ToString().substr(24, 10);
+  return std::stoull(row_str);
+}
 
-  void Report(const std::string& name) {
-    double avg_latency = total_ops > 0 ? total_time_ms / total_ops : 0;
-    double throughput_rows =
-        total_time_ms > 0 ? (total_rows / (total_time_ms / 1000.0)) : 0;
-    std::cout << std::fixed << std::setprecision(3);
-    std::cout << "[" << name << "] Ops: " << total_ops
-              << ", Avg Latency: " << avg_latency << " ms"
-              << ", Throughput: " << throughput_rows << " rows/s" << std::endl;
-  }
-};
+std::string FormatKeyDisplay(const Slice& key) {
+  std::string cuid_part = std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
+  std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
+  return cuid_part + "..." + suffix;
+}
 
-// ==========================================
-// 核心测试逻辑
-// ==========================================
-
-class PerfTester {
- public:
-  PerfTester(DB* db) : db_(db) {
-    // 初始化热点 CUID 列表
-    int num_hot = static_cast<int>(kNumCuids * kHotRatio);
-    for (int i = 0; i < num_hot; ++i) {
-      hot_cuids_.push_back(i + 1);
-    }
-    for (int i = num_hot; i < kNumCuids; ++i) {
-      cold_cuids_.push_back(i + 1);
-    }
-  }
-
-  // 1. 基准初始化 (冷数据入库)
-  void PrepareData() {
-    std::cout << "Preparing initial data (" << kNumCuids << " CUIDs, "
-              << kRowsPerCuid << " rows each)..." << std::endl;
-    for (int i = 0; i < kNumCuids; ++i) {
-      WriteBatch batch;
-      uint64_t cuid = i + 1;
-      for (int r = 0; r < kRowsPerCuid; ++r) {
-        batch.Put(GenerateKey(cuid, r), "val_" + std::to_string(r));
+void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
+  uint64_t next_row_per_cuid[10] = {0};
+  WriteOptions wo;
+  while (!stop_test) {
+    for (size_t i = 0; i < cuids.size(); ++i) {
+      uint64_t cuid = cuids[i];
+      {
+        std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
+        for (int k = 0; k < 20; ++k) {
+          uint64_t rid = next_row_per_cuid[i]++;
+          db->Put(wo, GenerateKey(cuid, rid), "val");
+          ground_truths[cuid]->row_ids.insert(rid);
+        }
       }
-      db_->Write(WriteOptions(), &batch);
+      db->Flush(FlushOptions());
+      global_stats.total_writes += 20;
     }
-    std::cout << "Data prep finished and flushed." << std::endl;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
+}
 
-  // 2. 预热 (触发 Delta 判定)
-  void WarmUp() {
-    std::cout << "Warming up hot CUIDs to trigger hotspot detection..."
-              << std::endl;
-    ReadOptions ro;
-    ro.delta_full_scan = true;  // 预热阶段必须扫描全表触发判定
-    for (uint64_t cuid : hot_cuids_) {
-      for (int i = 0; i < 5; ++i) {
-        ScanCUID(cuid, ro);
-      }
-    }
-  }
+void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
+  ReadOptions ro;
+  while (!stop_test) {
+    uint64_t cuid = 1003;
+    ro.delta_full_scan = (rand() % 2 == 0);
+    std::cout << "[Reader " << id << "] Starting scan for CUID " << cuid
+              << ", delta_full_scan=" << ro.delta_full_scan << std::endl;
 
-  // 3. 运行工作负载 A: 入库负载 (Write + Sequential Scan)
-  Stats RunWorkloadA(bool use_delta) {
-    Stats stats;
-    ReadOptions ro;
-    ro.delta_full_scan = !use_delta;
-
-    std::cout << "\nRunning Workload A (Ingestion-Heavy, Delta="
-              << (use_delta ? "ON" : "OFF") << ")..." << std::endl;
-
-    for (int i = 0; i < 100; ++i) {
-      uint64_t cuid = hot_cuids_[i % hot_cuids_.size()];
-
-      // Step A: Put 100 rows
-      WriteBatch batch;
-      for (int r = 0; r < 100; ++r) {
-        batch.Put(GenerateKey(cuid, kRowsPerCuid + i * 100 + r), "new_val");
-      }
-      db_->Write(WriteOptions(), &batch);
-
-      // Step B: Partial Scan
-      auto start = std::chrono::high_resolution_clock::now();
-      int rows = ScanCUIDRange(cuid, kRowsPerCuid + i * 100,
-                               kRowsPerCuid + i * 100 + 99, ro);
-      auto end = std::chrono::high_resolution_clock::now();
-
-      stats.total_ops++;
-      stats.total_rows += rows;
-      stats.total_time_ms +=
-          std::chrono::duration<double, std::milli>(end - start).count();
-    }
-    return stats;
-  }
-
-  // 4. 运行工作负载 B: 查询负载 (Point/Range Scans with Skew)
-  Stats RunWorkloadB(bool use_delta, int total_scans) {
-    Stats stats;
-    ReadOptions ro;
-    ro.delta_full_scan = !use_delta;
-
-    std::default_random_engine generator;
-    std::uniform_real_distribution<double> distribution(0.0, 1.0);
-
-    std::cout << "\nRunning Workload B (Query-Heavy/Skewed, Delta="
-              << (use_delta ? "ON" : "OFF") << ")..." << std::endl;
-
-    for (int i = 0; i < total_scans; ++i) {
-      uint64_t cuid;
-      if (distribution(generator) < kHotAccessRatio) {
-        cuid = hot_cuids_[rand() % hot_cuids_.size()];
-      } else {
-        cuid = cold_cuids_[rand() % cold_cuids_.size()];
-      }
-
-      auto start = std::chrono::high_resolution_clock::now();
-      int rows = ScanCUID(cuid, ro);
-      auto end = std::chrono::high_resolution_clock::now();
-
-      stats.total_ops++;
-      stats.total_rows += rows;
-      stats.total_time_ms +=
-          std::chrono::duration<double, std::milli>(end - start).count();
-    }
-    return stats;
-  }
-
-  // 5. 生命周期负载 (Put -> Scan -> Put -> Scan -> ScanAll -> DeleteAll)
-  Stats RunWorkloadC(bool use_delta) {
-    Stats stats;
-    ReadOptions ro;
-    ro.delta_full_scan = !use_delta;
-
-    std::cout << "\nRunning Workload C (Lifecycle Simulation, Delta="
-              << (use_delta ? "ON" : "OFF") << ")..." << std::endl;
-
-    for (int i = 0; i < 50; ++i) {
-      uint64_t cuid = hot_cuids_[i % hot_cuids_.size()];
-      auto start = std::chrono::high_resolution_clock::now();
-
-      // Step 1: Put (Append)
-      WriteBatch batch;
-      for (int r = 0; r < 20000; ++r) {
-        batch.Put(GenerateKey(cuid, kRowsPerCuid + 200 + r), "append_val");
-      }
-      db_->Write(WriteOptions(), &batch);
-
-      // Step 2 & 3: Multiple Scans (Triggers Partial Merge)
-      for (int s = 0; s < 30; ++s) {
-        ScanCUIDRange(cuid, kRowsPerCuid, kRowsPerCuid + 219, ro);
-      }
-
-      // Step 4: Full Scan
-      int rows = ScanCUID(cuid, ro);
-
-      // Step 5: Clean up (Delete rows)
-      WriteBatch del_batch;
-      for (int r = 0; r < kRowsPerCuid + 220; ++r) {
-        del_batch.Delete(GenerateKey(cuid, r));
-      }
-      db_->Write(WriteOptions(), &del_batch);
-
-      auto end = std::chrono::high_resolution_clock::now();
-
-      stats.total_ops++;
-      stats.total_rows += rows;
-      stats.total_time_ms +=
-          std::chrono::duration<double, std::milli>(end - start).count();
-    }
-    return stats;
-  }
-
- private:
-  int ScanCUID(uint64_t cuid, const ReadOptions& ro) {
     std::string start_key = GenerateKey(cuid, 0);
-    std::string end_key = GenerateKey(cuid + 1, 0);
-    Slice upper_bound(end_key);
-    ReadOptions ro_copy = ro;
-    ro_copy.iterate_upper_bound = &upper_bound;
+    std::string upper_bound = GenerateKey(cuid + 1, 0);
+    Slice ub_slice = upper_bound;
+    ro.iterate_upper_bound = &ub_slice;
 
-    Iterator* it = db_->NewIterator(ro_copy);
-    int count = 0;
+    // Take snapshot of expected rows before starting the scan
+    std::set<uint64_t> expected;
+    {
+      std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
+      expected = ground_truths[cuid]->row_ids;
+    }
+
+    std::unique_ptr<Iterator> it(db->NewIterator(ro));
+    std::set<uint64_t> found;
     for (it->Seek(start_key); it->Valid(); it->Next()) {
       if (ExtractCUID(it->key()) != cuid) break;
-      count++;
+      found.insert(ExtractRowID(it->key()));
     }
-    delete it;
-    return count;
-  }
 
-  int ScanCUIDRange(uint64_t cuid, int start_row, int end_row,
-                    const ReadOptions& ro) {
-    std::string start_key = GenerateKey(cuid, start_row);
-    std::string end_key = GenerateKey(cuid, end_row + 1);
-    Slice upper_bound(end_key);
-    ReadOptions ro_copy = ro;
-    ro_copy.iterate_upper_bound = &upper_bound;
+    if (!it->status().ok()) {
+      std::cerr << "Reader " << id << " error: " << it->status().ToString()
+                << std::endl;
+      global_stats.errors++;
+    } else {
+      std::vector<uint64_t> missing;
+      for (uint64_t rid : expected) {
+        if (found.find(rid) == found.end()) {
+          missing.push_back(rid);
+        }
+      }
 
-    Iterator* it = db_->NewIterator(ro_copy);
-    int count = 0;
-    for (it->Seek(start_key); it->Valid(); it->Next()) {
-      if (ExtractCUID(it->key()) != cuid) break;
-      count++;
+      if (!missing.empty()) {
+        if (missing.size() <= 10) {
+          for (uint64_t rid : missing) {
+            std::cerr << "Reader " << id << " error: Missing row " << rid
+                      << " for cuid " << cuid << std::endl;
+          }
+        } else {
+          for (int i = 0; i < 5; i++) {
+            std::cerr << "Reader " << id << " error: Missing row " << missing[i]
+                      << " for cuid " << cuid << std::endl;
+          }
+          std::cerr << "Reader " << id << " error: ... (skipped "
+                    << (missing.size() - 40) << " entries) ..." << std::endl;
+          for (size_t i = missing.size() - 5; i < missing.size(); i++) {
+            std::cerr << "Reader " << id << " error: Missing row " << missing[i]
+                      << " for cuid " << cuid << std::endl;
+          }
+        }
+        std::cerr << "Reader " << id
+                  << " error: Total missing rows: " << missing.size()
+                  << " for cuid " << cuid << ", found=" << found.size()
+                  << ", expected=" << expected.size() << std::endl;
+        global_stats.errors += missing.size();
+
+        // Diagnostic: dump HotIndexEntry state
+        auto hotspot_mgr = dynamic_cast<DBImpl*>(db)->GetHotspotManager();
+        if (hotspot_mgr) {
+          HotIndexEntry diag_entry;
+          if (hotspot_mgr->GetHotIndexEntry(cuid, &diag_entry)) {
+            std::cerr << "[DIAG] CUID " << cuid << " snapshot_segments="
+                      << diag_entry.snapshot_segments.size()
+                      << " deltas=" << diag_entry.deltas.size() << std::endl;
+            for (size_t si = 0; si < diag_entry.snapshot_segments.size();
+                 si++) {
+              const auto& seg = diag_entry.snapshot_segments[si];
+              std::cerr << "[DIAG]   snap[" << si
+                        << "] file=" << (int64_t)seg.file_number
+                        << " first_key=" << FormatKeyDisplay(seg.first_key)
+                        << " last_key=" << FormatKeyDisplay(seg.last_key)
+                        << std::endl;
+            }
+            for (size_t di = 0; di < diag_entry.deltas.size(); di++) {
+              const auto& seg = diag_entry.deltas[di];
+              std::cerr << "[DIAG]   delta[" << di
+                        << "] file=" << (int64_t)seg.file_number
+                        << " first_key=" << FormatKeyDisplay(seg.first_key)
+                        << " last_key=" << FormatKeyDisplay(seg.last_key)
+                        << std::endl;
+            }
+          } else {
+            std::cerr << "[DIAG] CUID " << cuid << " has NO HotIndexEntry!"
+                      << std::endl;
+          }
+
+          // Check buffer data count
+          auto* buf_iter = hotspot_mgr->NewBufferIterator(cuid, nullptr);
+          if (buf_iter) {
+            size_t buf_count = 0;
+            for (buf_iter->SeekToFirst(); buf_iter->Valid(); buf_iter->Next()) {
+              buf_count++;
+            }
+            std::cerr << "[DIAG] Buffer data count for CUID " << cuid << ": "
+                      << buf_count << std::endl;
+            delete buf_iter;
+          }
+
+          for (it->Seek(start_key); it->Valid(); it->Next()) {
+            if (ExtractCUID(it->key()) != cuid) break;
+            // std::cout << FormatKeyDisplay(it->key()) << std::endl;
+            found.insert(ExtractRowID(it->key()));
+          }
+        }
+      }
     }
-    delete it;
-    return count;
+    global_stats.total_scans++;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
+}
 
-  DB* db_;
-  std::vector<uint64_t> hot_cuids_;
-  std::vector<uint64_t> cold_cuids_;
-};
+void ManagerThread(DBImpl* db_impl) {
+  auto hotspot_mgr = db_impl->GetHotspotManager();
+  while (!stop_test) {
+    if (hotspot_mgr->HasPendingInitCuids()) {
+      db_impl->ProcessPendingHotCuids();
+    }
+    if (hotspot_mgr->HasPendingPartialMerge()) {
+      db_impl->ProcessPendingPartialMerge();
+      global_stats.total_merges++;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  }
+}
 
 int main() {
   Options options;
   options.create_if_missing = true;
   options.disable_auto_compactions = true;
+  DestroyDB(kDBPath, options);
 
-  // --- 1. Native 模式测试 (纯净基准) ---
-  std::cout << ">>> STARTING NATIVE MODE BENCHMARK <<<" << std::endl;
-  options.enable_delta = false;  // 彻底禁用 Delta 逻辑
-  DestroyDB(kNativeDBPath, options);
-  DB* native_db;
-  Status s = DB::Open(options, kNativeDBPath, &native_db);
+  DB* db = nullptr;
+  Status s = DB::Open(options, kDBPath, &db);
   if (!s.ok()) {
-    std::cerr << "Open Native DB failed: " << s.ToString() << std::endl;
+    std::cerr << "Open failed: " << s.ToString() << std::endl;
     return 1;
   }
 
-  PerfTester native_tester(native_db);
-  native_tester.PrepareData();
-  // Native 模式不需要 WarmUp
-
-  Stats native_a = native_tester.RunWorkloadA(false);
-  Stats native_b = native_tester.RunWorkloadB(false, 500);
-  Stats native_c = native_tester.RunWorkloadC(false);
-
-  delete native_db;
-
-  // --- 2. Delta 模式测试 (优化方案) ---
-  std::cout << "\n>>> STARTING DELTA MODE BENCHMARK <<<" << std::endl;
-  options.enable_delta = true;  // 开启 Delta 优化
-  DestroyDB(kDeltaDBPath, options);
-  DB* delta_db;
-  s = DB::Open(options, kDeltaDBPath, &delta_db);
-  if (!s.ok()) {
-    std::cerr << "Open Delta DB failed: " << s.ToString() << std::endl;
-    return 1;
+  DBImpl* db_impl = dynamic_cast<DBImpl*>(db);
+  std::vector<uint64_t> cuids = {1001, 1002, 1003, 1004, 1005};
+  for (uint64_t cuid : cuids) {
+    ground_truths[cuid] = new CuidGroundTruth();
   }
 
-  PerfTester delta_tester(delta_db);
-  delta_tester.PrepareData();
-  delta_tester.WarmUp();  // 预热以收集热点信息
+  std::cout << "Starting Deep Stress Test for 30 seconds..." << std::endl;
 
-  Stats delta_a = delta_tester.RunWorkloadA(true);
-  Stats delta_b = delta_tester.RunWorkloadB(true, 500);
-  Stats delta_c = delta_tester.RunWorkloadC(true);
+  std::thread writer(WriterThread, db, cuids);
+  std::thread reader1(ReaderThread, db, cuids, 1);
+  std::thread reader2(ReaderThread, db, cuids, 2);
+  std::thread reader3(ReaderThread, db, cuids, 3);
+  std::thread manager(ManagerThread, db_impl);
 
-  delete delta_db;
+  auto start_time = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - start_time <
+         std::chrono::seconds(90000)) {
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    std::cout << "Stats: Writes=" << global_stats.total_writes
+              << ", Scans=" << global_stats.total_scans
+              << ", Merges=" << global_stats.total_merges
+              << ", Errors=" << global_stats.errors << std::endl;
+  }
 
-  // --- 3. 结果汇总 ---
-  std::cout << "\n================ RESULT SUMMARY ================"
-            << std::endl;
-  native_a.Report("Native Ingestion-Heavy");
-  delta_a.Report("Delta  Ingestion-Heavy");
-  std::cout << "------------------------------------------------" << std::endl;
-  native_b.Report("Native Query-Heavy");
-  delta_b.Report("Delta  Query-Heavy");
-  std::cout << "------------------------------------------------" << std::endl;
-  native_c.Report("Native Lifecycle");
-  delta_c.Report("Delta  Lifecycle");
-  std::cout << "================================================" << std::endl;
+  stop_test = true;
+  writer.join();
+  reader1.join();
+  reader2.join();
+  reader3.join();
+  manager.join();
 
-  return 0;
+  std::cout << "Stress Test Completed." << std::endl;
+  uint64_t final_errors = global_stats.errors;
+  if (final_errors > 0) {
+    std::cout << "Test FAILED with " << final_errors << " errors." << std::endl;
+  } else {
+    std::cout << "Test PASSED." << std::endl;
+  }
+
+  for (auto& pair : ground_truths) {
+    delete pair.second;
+  }
+  delete db;
+  return (final_errors == 0) ? 0 : 1;
 }

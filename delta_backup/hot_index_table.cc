@@ -6,9 +6,8 @@ void HotIndexTable::UpdateSnapshot(
     uint64_t cuid, const std::vector<DataSegment>& new_segments) {
   std::vector<DataSegment> segments_to_unref;
   {
-    Shard& shard = GetShard(cuid);
-    std::unique_lock<std::shared_mutex> lock(shard.mutex);
-    auto& entry = shard.table[cuid];
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto& entry = table_[cuid];
     // Old Snapshot
     if (entry.HasSnapshot()) {
       segments_to_unref.insert(segments_to_unref.end(),
@@ -31,9 +30,8 @@ void HotIndexTable::UpdateSnapshot(
 void HotIndexTable::AppendSnapshotSegment(uint64_t cuid,
                                           const DataSegment& segment) {
   {
-    Shard& shard = GetShard(cuid);
-    std::unique_lock<std::shared_mutex> lock(shard.mutex);
-    shard.table[cuid].snapshot_segments.push_back(segment);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    table_[cuid].snapshot_segments.push_back(segment);
   }
 
   if (lifecycle_manager_) {
@@ -43,10 +41,9 @@ void HotIndexTable::AppendSnapshotSegment(uint64_t cuid,
 
 bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
                                     const DataSegment& new_segment) {
-  Shard& shard = GetShard(cuid);
-  std::unique_lock<std::shared_mutex> lock(shard.mutex);
-  auto it = shard.table.find(cuid);
-  if (it == shard.table.end()) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) {
     return false;
   }
 
@@ -108,9 +105,8 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
 
 void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {
   {
-    Shard& shard = GetShard(cuid);
-    std::unique_lock<std::shared_mutex> lock(shard.mutex);
-    shard.table[cuid].deltas.push_back(delta);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    table_[cuid].deltas.push_back(delta);
   }
 
   // if (lifecycle_manager_) {
@@ -119,10 +115,9 @@ void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {
 }
 
 bool HotIndexTable::GetEntry(uint64_t cuid, HotIndexEntry* entry) const {
-  const Shard& shard = GetShard(cuid);
-  std::shared_lock<std::shared_mutex> lock(shard.mutex);
-  auto it = shard.table.find(cuid);
-  if (it != shard.table.end()) {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it != table_.end()) {
     if (entry) {
       *entry = it->second;
     }
@@ -133,10 +128,9 @@ bool HotIndexTable::GetEntry(uint64_t cuid, HotIndexEntry* entry) const {
 
 void HotIndexTable::MarkDeltasAsObsolete(
     uint64_t cuid, const std::unordered_set<uint64_t>& visited_files) {
-  Shard& shard = GetShard(cuid);
-  std::unique_lock<std::shared_mutex> lock(shard.mutex);
-  auto it = shard.table.find(cuid);
-  if (it == shard.table.end()) return;
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) return;
 
   auto& entry = it->second;
   if (visited_files.empty()) return;
@@ -170,10 +164,9 @@ void HotIndexTable::MarkDeltasAsObsolete(
 // compaction 时直接清理
 bool HotIndexTable::CheckAndRemoveObsoleteDeltas(
     uint64_t cuid, const std::vector<uint64_t>& input_files) {
-  Shard& shard = GetShard(cuid);
-  std::unique_lock<std::shared_mutex> lock(shard.mutex);
-  auto it = shard.table.find(cuid);
-  if (it == shard.table.end()) return false;
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) return false;
 
   auto& entry = it->second;
   if (entry.obsolete_deltas.empty()) return false;
@@ -201,10 +194,9 @@ bool HotIndexTable::CheckAndRemoveObsoleteDeltas(
 
 bool HotIndexTable::IsDeltaObsolete(
     uint64_t cuid, const std::vector<uint64_t>& input_files) const {
-  const Shard& shard = GetShard(cuid);
-  std::shared_lock<std::shared_mutex> lock(shard.mutex);
-  auto it = shard.table.find(cuid);
-  if (it == shard.table.end()) return false;
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) return false;
 
   const auto& entry = it->second;
   if (entry.obsolete_deltas.empty()) return false;
@@ -222,14 +214,14 @@ bool HotIndexTable::IsDeltaObsolete(
 void HotIndexTable::RemoveObsoleteDeltasForCUIDs(
     const std::unordered_set<uint64_t>& cuids,
     const std::vector<uint64_t>& input_files) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+
   std::unordered_set<uint64_t> input_files_set(input_files.begin(),
                                                input_files.end());
 
   for (uint64_t cuid : cuids) {
-    Shard& shard = GetShard(cuid);
-    std::unique_lock<std::shared_mutex> lock(shard.mutex);
-    auto entry_it = shard.table.find(cuid);
-    if (entry_it == shard.table.end()) continue;
+    auto entry_it = table_.find(cuid);
+    if (entry_it == table_.end()) continue;
 
     auto& entry = entry_it->second;
     if (entry.obsolete_deltas.empty()) continue;
@@ -252,9 +244,8 @@ void HotIndexTable::RemoveObsoleteDeltasForCUIDs(
 void HotIndexTable::UpdateDeltaIndex(uint64_t cuid,
                                      const std::vector<uint64_t>& input_files,
                                      const DataSegment& new_delta) {
-  Shard& shard = GetShard(cuid);
-  std::unique_lock<std::shared_mutex> lock(shard.mutex);
-  auto& entry = shard.table[cuid];
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto& entry = table_[cuid];
 
   // 清理本次 Compaction 涉及的文件
   for (auto it = entry.deltas.begin(); it != entry.deltas.end();) {
@@ -297,17 +288,16 @@ void HotIndexTable::UpdateDeltaIndex(uint64_t cuid,
 void HotIndexTable::RemoveCUID(uint64_t cuid) {
   std::vector<DataSegment> segments_to_unref;
   {
-    Shard& shard = GetShard(cuid);
-    std::unique_lock<std::shared_mutex> lock(shard.mutex);
-    auto it = shard.table.find(cuid);
-    if (it != shard.table.end()) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto it = table_.find(cuid);
+    if (it != table_.end()) {
       // Snapshot 片段
       if (it->second.HasSnapshot()) {
         segments_to_unref.insert(segments_to_unref.end(),
                                  it->second.snapshot_segments.begin(),
                                  it->second.snapshot_segments.end());
       }
-      shard.table.erase(it);
+      table_.erase(it);
     }
   }
 
@@ -325,9 +315,8 @@ void HotIndexTable::ReplaceOverlappingSegments(
   std::vector<DataSegment> segments_to_unref;
 
   {
-    Shard& shard = GetShard(cuid);
-    std::unique_lock<std::shared_mutex> lock(shard.mutex);
-    auto& entry = shard.table[cuid];
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto& entry = table_[cuid];
     auto& snapshots = entry.snapshot_segments;
 
     std::vector<DataSegment> next_segments;
@@ -534,10 +523,9 @@ void HotIndexTable::ReplaceOverlappingSegments(
 size_t HotIndexTable::CountOverlappingDeltas(
     uint64_t cuid, const std::string& first_key,
     const std::string& last_key) const {
-  const Shard& shard = GetShard(cuid);
-  std::shared_lock<std::shared_mutex> lock(shard.mutex);
-  auto it = shard.table.find(cuid);
-  if (it == shard.table.end()) return 0;
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) return 0;
 
   const auto& entry = it->second;
   size_t count = 0;
@@ -558,10 +546,9 @@ size_t HotIndexTable::CountOverlappingDeltas(
 void HotIndexTable::ClearAllForCuid(uint64_t cuid) {
   std::vector<DataSegment> segments_to_unref;
   {
-    Shard& shard = GetShard(cuid);
-    std::unique_lock<std::shared_mutex> lock(shard.mutex);
-    auto it = shard.table.find(cuid);
-    if (it == shard.table.end()) return;
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto it = table_.find(cuid);
+    if (it == table_.end()) return;
 
     auto& entry = it->second;
 
@@ -590,10 +577,9 @@ void HotIndexTable::GetOverlappingSegments(
     uint64_t cuid, const std::string& first_key, const std::string& last_key,
     std::vector<DataSegment>* overlapping_snapshots,
     std::vector<DataSegment>* overlapping_deltas) {
-  const Shard& shard = GetShard(cuid);
-  std::shared_lock<std::shared_mutex> lock(shard.mutex);
-  auto it = shard.table.find(cuid);
-  if (it == shard.table.end()) return;
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end()) return;
 
   const auto& entry = it->second;
 
@@ -623,6 +609,9 @@ void HotIndexTable::GetOverlappingSegments(
 
 void HotIndexTable::DumpToFile(const std::string& filename,
                                const std::string& phase_label) {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+
+  // 使用追加模式打开文件
   std::ofstream outfile;
   outfile.open(filename, std::ios_base::app);
 
@@ -633,55 +622,49 @@ void HotIndexTable::DumpToFile(const std::string& filename,
 
   outfile << "========================================" << std::endl;
   outfile << "DUMP PHASE: " << phase_label << std::endl;
+  outfile << "Total Tracked CUIDs: " << table_.size() << std::endl;
 
-  size_t total_cuids = 0;
-  for (size_t i = 0; i < kNumShards; ++i) {
-    std::shared_lock<std::shared_mutex> lock(shards_[i].mutex);
-    total_cuids += shards_[i].table.size();
-  }
-  outfile << "Total Tracked CUIDs: " << total_cuids << std::endl;
+  for (const auto& kv : table_) {
+    uint64_t cuid = kv.first;
+    const HotIndexEntry& entry = kv.second;
 
-  for (size_t i = 0; i < kNumShards; ++i) {
-    std::shared_lock<std::shared_mutex> lock(shards_[i].mutex);
-    for (const auto& kv : shards_[i].table) {
-      uint64_t cuid = kv.first;
-      const HotIndexEntry& entry = kv.second;
+    outfile << "CUID: " << cuid << std::endl;
 
-      outfile << "CUID: " << cuid << std::endl;
-
-      if (entry.snapshot_segments.empty()) {
-        outfile << "  [Snapshot]: None" << std::endl;
-      } else {
-        outfile << "  [Snapshot]: " << entry.snapshot_segments.size()
-                << " segments" << std::endl;
-        for (const auto& seg : entry.snapshot_segments) {
-          outfile << "    -> FileID: " << (int64_t)seg.file_number
-                  << " | FirstKey: " << seg.first_key
-                  << " | LastKey: " << seg.last_key;
-          if (seg.file_number == (uint64_t)-1) outfile << " (Mem)";
-          outfile << std::endl;
-        }
+    // 1. Snapshot 信息
+    if (entry.snapshot_segments.empty()) {
+      outfile << "  [Snapshot]: None" << std::endl;
+    } else {
+      outfile << "  [Snapshot]: " << entry.snapshot_segments.size()
+              << " segments" << std::endl;
+      for (const auto& seg : entry.snapshot_segments) {
+        outfile << "    -> FileID: " << (int64_t)seg.file_number
+                << " | FirstKey: " << seg.first_key
+                << " | LastKey: " << seg.last_key;
+        if (seg.file_number == (uint64_t)-1) outfile << " (Mem)";
+        outfile << std::endl;
       }
+    }
 
-      if (entry.deltas.empty()) {
-        outfile << "  [Deltas]: None" << std::endl;
-      } else {
-        outfile << "  [Deltas]: " << entry.deltas.size() << " segments"
+    // 2. Deltas 信息
+    if (entry.deltas.empty()) {
+      outfile << "  [Deltas]: None" << std::endl;
+    } else {
+      outfile << "  [Deltas]: " << entry.deltas.size() << " segments"
+              << std::endl;
+      for (const auto& seg : entry.deltas) {
+        outfile << "    -> FileID: " << seg.file_number
+                << " | FirstKey: " << seg.first_key
+                << " | LastKey: " << seg.last_key << std::endl;
+      }
+    }
+
+    // 3. Obsolete Deltas 信息
+    if (!entry.obsolete_deltas.empty()) {
+      outfile << "  [Obsolete]: " << entry.obsolete_deltas.size()
+              << " pending cleanup" << std::endl;
+      for (const auto& seg : entry.obsolete_deltas) {
+        outfile << "    -> FileID: " << seg.file_number << " (Obs)"
                 << std::endl;
-        for (const auto& seg : entry.deltas) {
-          outfile << "    -> FileID: " << seg.file_number
-                  << " | FirstKey: " << seg.first_key
-                  << " | LastKey: " << seg.last_key << std::endl;
-        }
-      }
-
-      if (!entry.obsolete_deltas.empty()) {
-        outfile << "  [Obsolete]: " << entry.obsolete_deltas.size()
-                << " pending cleanup" << std::endl;
-        for (const auto& seg : entry.obsolete_deltas) {
-          outfile << "    -> FileID: " << seg.file_number << " (Obs)"
-                  << std::endl;
-        }
       }
     }
   }

@@ -251,8 +251,8 @@ int main() {
   std::cout << "Starting Deep Stress Test for 30 seconds..." << std::endl;
 
   std::thread writer(WriterThread, db, cuids);
-  // std::thread reader1(ReaderThread, db, cuids, 1);
-  // std::thread reader2(ReaderThread, db, cuids, 2);
+  std::thread reader1(ReaderThread, db, cuids, 1);
+  std::thread reader2(ReaderThread, db, cuids, 2);
   std::thread reader3(ReaderThread, db, cuids, 3);
   std::thread manager(ManagerThread, db_impl);
 
@@ -268,8 +268,8 @@ int main() {
 
   stop_test = true;
   writer.join();
-  // reader1.join();
-  // reader2.join();
+  reader1.join();
+  reader2.join();
   reader3.join();
   manager.join();
 

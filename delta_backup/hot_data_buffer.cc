@@ -38,50 +38,37 @@ bool HotDataBuffer::Append(uint64_t cuid, const Slice& key,
 }
 
 bool HotDataBuffer::RotateBuffer(const InternalKeyComparator* icmp) {
+  // 合并所有分片的 active_block 为一个待刷盘的块
+  auto combined_block = std::make_shared<HotDataBlock>();
   bool has_data = false;
 
-  // phase 1：将 active_block 替换为 new block，并转入暂存队列
   for (size_t i = 0; i < kNumShards; ++i) {
-    std::lock_guard<std::mutex> lock(shards_[i].mutex);
-    if (shards_[i].active_block->buckets.empty()) continue;
-    
-    has_data = true;
-    auto old_block = shards_[i].active_block;
-    shards_[i].active_block = std::make_shared<HotDataBlock>();
-    shards_[i].buffered_size = 0;
-
-    shards_[i].immutable_queue.push_back(old_block);
-  }
-
-  if (!has_data) return false;
-
-  // phase 2：stack combined_block，在双重锁的保护下，防止读取数据缺失
-  auto combined_block = std::make_shared<HotDataBlock>();
-  
-  std::lock_guard<std::mutex> global_lock(global_queue_mutex_);
-  
-  for (size_t i = 0; i < kNumShards; ++i) {
-    std::lock_guard<std::mutex> shard_lock(shards_[i].mutex);
-    
-    while (!shards_[i].immutable_queue.empty()) {
-      auto old_block = shards_[i].immutable_queue.front();
-      shards_[i].immutable_queue.pop_front();
+    std::shared_ptr<HotDataBlock> old_block;
+    {
+      std::lock_guard<std::mutex> lock(shards_[i].mutex);
+      if (shards_[i].active_block->buckets.empty()) continue;
       
+      old_block = shards_[i].active_block;
+      shards_[i].active_block = std::make_shared<HotDataBlock>();
+      shards_[i].buffered_size = 0;
+
+      // 将旧块暂存到该分片的队列中，使其对 Reader 依然可见
+      shards_[i].immutable_queue.push_back(old_block);
+    }
+    
+    if (old_block) {
+      has_data = true;
+      size_t block_size = old_block->current_size_bytes;
+      // 将分片数据合并到 combined
       for (auto& pair : old_block->buckets) {
         uint64_t cuid = pair.first;
+        auto& bucket = pair.second;
         auto& target_bucket = combined_block->buckets[cuid];
+        target_bucket.insert(target_bucket.end(), 
+                             bucket.begin(), 
+                             bucket.end());
         
-        if (target_bucket.empty()) {
-          // Zero-Copy
-          target_bucket = std::move(pair.second);
-        } else {
-          // 其他情况极低概率的合并补偿
-          target_bucket.insert(target_bucket.end(), 
-                               std::make_move_iterator(pair.second.begin()), 
-                               std::make_move_iterator(pair.second.end()));
-        }
-        
-        // 合并边界信息
+        // 合并边界信息 (这里合并时先不考虑 icmp 顺序，后续由 Sort 最终校准)
         auto b_it = old_block->bounds.find(cuid);
         if (b_it != old_block->bounds.end()) {
           auto& target_bounds = combined_block->bounds[cuid];
@@ -93,15 +80,26 @@ bool HotDataBuffer::RotateBuffer(const InternalKeyComparator* icmp) {
           }
         }
       }
-      combined_block->current_size_bytes += old_block->current_size_bytes;
-      total_active_size_.fetch_sub(old_block->current_size_bytes);
+      combined_block->current_size_bytes += block_size;
+      // 从活跃计数器中减去即将进入不可变队列的大小
+      total_active_size_.fetch_sub(block_size);
     }
   }
 
-  // sort 确保 Reader 有序
-  combined_block->Sort(icmp);
-  immutable_queue_.push_back(combined_block);
-  return true;
+  if (has_data) {
+    combined_block->Sort(icmp);
+    
+    std::lock_guard<std::mutex> lock(global_queue_mutex_);
+    immutable_queue_.push_back(combined_block);
+
+    // 数据已进入全局队列，可以清理各分片的暂存列表
+    for (size_t i = 0; i < kNumShards; ++i) {
+      std::lock_guard<std::mutex> shard_lock(shards_[i].mutex);
+      shards_[i].immutable_queue.clear();
+    }
+    return true;
+  }
+  return false;
 }
 
 std::shared_ptr<HotDataBlock> HotDataBuffer::GetFrontBlockForFlush() {
@@ -142,22 +140,23 @@ bool HotDataBuffer::GetBoundaryKeys(uint64_t cuid, std::string* min_key,
     }
   };
 
-  Shard& shard = GetShard(cuid);
-
-  // 先 global 后 shard
-  std::unique_lock<std::mutex> global_lock(global_queue_mutex_);
-  std::unique_lock<std::mutex> shard_lock(shard.mutex);
-
   // 1. 检查全局不可变队列
-  for (const auto& block : immutable_queue_) {
-    merge_bounds(block.get());
+  {
+    std::lock_guard<std::mutex> lock(global_queue_mutex_);
+    for (const auto& block : immutable_queue_) {
+      merge_bounds(block.get());
+    }
   }
 
   // 2. 检查特定分片的活跃块及其暂存队列
-  for (const auto& block : shard.immutable_queue) {
-    merge_bounds(block.get());
+  Shard& shard = GetShard(cuid);
+  {
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    for (const auto& block : shard.immutable_queue) {
+      merge_bounds(block.get());
+    }
+    merge_bounds(shard.active_block.get());
   }
-  merge_bounds(shard.active_block.get());
 
   return found;
 }
@@ -211,21 +210,23 @@ InternalIterator* HotDataBuffer::NewIterator(
     uint64_t cuid, const InternalKeyComparator* icmp) {
   
   std::vector<HotEntry> filtered_entries;
-  Shard& shard = GetShard(cuid);
 
+  // 1. Immutable
   {
-    std::unique_lock<std::mutex> global_lock(global_queue_mutex_);
-    std::unique_lock<std::mutex> shard_lock(shard.mutex);
-
-    // 1. Immutable
+    std::lock_guard<std::mutex> lock(global_queue_mutex_);
     for (const auto& block : immutable_queue_) {
       auto it = block->buckets.find(cuid);
       if (it != block->buckets.end()) {
         filtered_entries.insert(filtered_entries.end(), it->second.begin(), it->second.end());
       }
     }
+  }
 
-    // 2. active + rotating 中的暂存块
+  // 2. active + rotating 中的暂存块
+  Shard& shard = GetShard(cuid);
+  {
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    // Rotate 过程中的暂存块
     for (const auto& block : shard.immutable_queue) {
        auto it = block->buckets.find(cuid);
        if (it != block->buckets.end()) {
@@ -236,9 +237,9 @@ InternalIterator* HotDataBuffer::NewIterator(
     if (it != shard.active_block->buckets.end()) {
       filtered_entries.insert(filtered_entries.end(), it->second.begin(), it->second.end());
     }
-  } // two lock ends
+  }
 
-  // 不同 block 之间可能重叠？
+  // 虽然 bucket 内部有序，但不同 block 之间可能重叠？
   std::sort(filtered_entries.begin(), filtered_entries.end(),
             [icmp](const HotEntry& a, const HotEntry& b) {
               return icmp->Compare(Slice(a.key), Slice(b.key)) < 0;

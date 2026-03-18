@@ -281,27 +281,25 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   if (write_buffer_manager_) {
     wbm_stall_.reset(new WBMStallInterface());
   }
-  // for delta
-  if (immutable_db_options_.enable_delta) {
-    std::string hotspot_dir = dbname_ + "/hotspot_data";
-    ColumnFamilyOptions default_cf_opts;
-    Options hotspot_opts(initial_db_options_, default_cf_opts);
+}
 
-    hotspot_manager_ =
-        std::make_shared<HotspotManager>(hotspot_opts, hotspot_dir);
+// for delta: only initialize when enable_delta is set
+void DBImpl::InitializeHotspotManager(const Options& options) {
+  if (immutable_db_options_.enable_delta) {
+    if (hotspot_manager_) {
+      return; // Already initialized
+    }
+    std::string hotspot_dir = dbname_ + "/hotspot_data";
+    auto* internal_comparator = &versions_->GetColumnFamilySet()->GetDefault()->internal_comparator();
+    hotspot_manager_ = std::make_shared<HotspotManager>(
+        options, hotspot_dir, internal_comparator);
     immutable_db_options_.hotspot_manager = hotspot_manager_;
 
-    std::cout << "HotspotManager initialized at DBImpl " << hotspot_dir << std::endl;
+    std::cout << "HotspotManager initialized at DBImpl " << hotspot_dir.c_str() << std::endl;
 
-    ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                   "HotspotManager initialized at DBImpl %s",
-                   hotspot_dir.c_str());
-  } else {
-    hotspot_manager_ = nullptr;
-    immutable_db_options_.hotspot_manager = nullptr;
-    std::cout << "Delta features disabled (enable_delta=false)" << std::endl;
-    ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                   "Delta features disabled (enable_delta=false)");
+    // Start dedicated delta background worker thread
+    delta_bg_stop_.store(false, std::memory_order_relaxed);
+    delta_bg_thread_ = std::thread(&DBImpl::DeltaBGWorkThreadFunc, this);
   }
 }
 
@@ -554,6 +552,13 @@ Status DBImpl::CloseHelper() {
   // marker. After this we do a variant of the waiting and unschedule work
   // (to consider: moving all the waiting into CancelAllBackgroundWork(true))
   CancelAllBackgroundWork(false);
+  // for delta
+  // Stop delta background thread before other cleanup
+  delta_bg_stop_.store(true, std::memory_order_release);
+  delta_bg_cv_.notify_all();
+  if (delta_bg_thread_.joinable()) {
+    delta_bg_thread_.join();
+  }
 
   // Cancel manual compaction if there's any
   if (HasPendingManualCompaction()) {
@@ -6978,9 +6983,9 @@ void DBImpl::ProcessPendingHotCuids() {
     return;
   }
 
-  fprintf(stdout,
-          "[DBImpl] Processing %zu pending hot CUIDs for initial scan\n",
-          pending_cuids.size());
+  ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                 "[DBImpl] Processing %zu pending hot CUIDs for initial scan",
+                 pending_cuids.size());
 
   for (uint64_t cuid : pending_cuids) {
     // 构造 start_key
@@ -7005,7 +7010,8 @@ void DBImpl::ProcessPendingHotCuids() {
     read_opts.iterate_upper_bound = &upper_bound_slice;
     ColumnFamilyHandle* cfh = DefaultColumnFamily();
     if (!cfh) {
-      fprintf(stderr, "[DBImpl] No default column family for init scan\n");
+      ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                      "[DBImpl] No default column family for init scan");
       continue;
     }
 
@@ -7018,12 +7024,14 @@ void DBImpl::ProcessPendingHotCuids() {
     }
 
     if (!iter->status().ok()) {
-      fprintf(stderr, "[DBImpl] Init scan error for CUID %lu: %s\n", cuid,
-              iter->status().ToString().c_str());
+      ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                      "[DBImpl] Init scan error for CUID %" PRIu64 ": %s",
+                      cuid, iter->status().ToString().c_str());
     } else {
-      fprintf(stdout,
-              "[DBImpl] Completed init scan for CUID %lu, %zu entries\n", cuid,
-              count);
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "[DBImpl] Completed init scan for CUID %" PRIu64
+                     ", %zu entries",
+                     cuid, count);
     }
     hotspot_manager_->UnlockCuid(cuid);
   }
@@ -7042,11 +7050,6 @@ void DBImpl::ProcessPendingMetadataScans() {
   if (pending_cuids.empty()) {
     return;
   }
-
-  // fprintf(
-  //     stdout,
-  //     "[DBImpl] Processing %zu pending CUIDs for background metadata scan\n",
-  //     pending_cuids.size());
 
   for (uint64_t cuid : pending_cuids) {
     // 构造扫描范围
@@ -7084,8 +7087,9 @@ void DBImpl::ProcessPendingMetadataScans() {
     }
 
     if (!iter->status().ok()) {
-      fprintf(stderr, "[DBImpl] Metadata scan error for CUID %lu: %s\n", cuid,
-              iter->status().ToString().c_str());
+      ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                      "[DBImpl] Metadata scan error for CUID %" PRIu64 ": %s",
+                      cuid, iter->status().ToString().c_str());
     }
   }
 }
@@ -7151,7 +7155,9 @@ void DBImpl::ProcessPendingPartialMerge() {
     return;
   }
 
-  fprintf(stdout, "[DBImpl] Processing PartialMerge for CUID %lu\n", task.cuid);
+  ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                 "[DBImpl] Processing PartialMerge for CUID %" PRIu64,
+                 task.cuid);
 
   // 获取重叠的 segments
   std::vector<DataSegment> overlapping_snaps, overlapping_deltas;
@@ -7173,7 +7179,8 @@ void DBImpl::ProcessPendingPartialMerge() {
 
   ColumnFamilyHandle* cfh = DefaultColumnFamily();
   if (!cfh) {
-    fprintf(stderr, "[DBImpl] No default column family for partial merge\n");
+    ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                    "[DBImpl] No default column family for partial merge");
     hotspot_manager_->UnlockCuid(task.cuid);
     return;
   }
@@ -7181,7 +7188,8 @@ void DBImpl::ProcessPendingPartialMerge() {
   auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(cfh)->cfd();
   SuperVersion* sv = GetAndRefSuperVersion(cfd);
   if (!sv) {
-    fprintf(stderr, "[DBImpl] Failed to get SuperVersion for partial merge\n");
+    ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                    "[DBImpl] Failed to get SuperVersion for partial merge");
     hotspot_manager_->UnlockCuid(task.cuid);
     return;
   }
@@ -7200,13 +7208,6 @@ void DBImpl::ProcessPendingPartialMerge() {
         overlapping_snaps, task.cuid, hotspot_manager_.get(),
         cfd->table_cache(), read_opts, file_opts, icmp, mutable_cf_opts);
     children.push_back(snap_iter);
-
-    std::cout << "SNAPSHOT Seg Start:   " << (overlapping_snaps[0].first_key.size() >= 24 ? ExtractCUID(overlapping_snaps[0].first_key) : 0)
-            << "..." << (overlapping_snaps[0].first_key.size() > 24 ? overlapping_snaps[0].first_key.substr(24) : "")
-              << std::endl;
-    std::cout << "SNAPSHOT[0] Seg End:     " << (overlapping_snaps[0].last_key.size() >= 24 ? ExtractCUID(overlapping_snaps[0].last_key) : 0)
-            << "..." << (overlapping_snaps[0].last_key.size() > 24 ? overlapping_snaps[0].last_key.substr(24) : "")
-              << std::endl;
   }
 
   // 2. Delta Iterator
@@ -7215,16 +7216,6 @@ void DBImpl::ProcessPendingPartialMerge() {
         new HotDeltaIterator(overlapping_deltas, cfd->table_cache(), read_opts,
                              file_opts, icmp, mutable_cf_opts, false);
     children.push_back(delta_iter);
-
-    // for (const auto& delta : overlapping_deltas) {
-    //   std::cout << "DELTA Seg Start:   " << (delta.first_key.size() >= 24 ? ExtractCUID(delta.first_key) : 0)
-    //           << "..." << (delta.first_key.size() > 24 ? delta.first_key.substr(24) : "")
-    //           << std::endl;
-
-    //   std::cout << "DELTA Seg End:     " << (delta.last_key.size() >= 24 ? ExtractCUID(delta.last_key) : 0)
-    //           << "..." << (delta.last_key.size() > 24 ? delta.last_key.substr(24) : "")
-    //           << std::endl;
-    // }
   }
 
   // 3. Scan Data Iterator (Local to this PartialMerge execution)
@@ -7232,13 +7223,6 @@ void DBImpl::ProcessPendingPartialMerge() {
   if (!task.scan_data.empty()) {
     scan_data_iter = new ScanDataIterator(task.scan_data);
     children.push_back(scan_data_iter);
-
-    std::cout << "Partial Merge SCAN Data Start:   " << (task.scan_data[0].first.size() >= 24 ? ExtractCUID(task.scan_data[0].first) : 0)
-            << "..." << (task.scan_data[0].first.size() > 24 ? task.scan_data[0].first.substr(24) : "")
-              << std::endl;
-    std::cout << "Partial Merge SCAN Data End:     " << (task.scan_data.back().first.size() >= 24 ? ExtractCUID(task.scan_data.back().first) : 0)
-            << "..." << (task.scan_data.back().first.size() > 24 ? task.scan_data.back().first.substr(24) : "")
-              << std::endl;
   }
 
   if (children.empty()) {
@@ -7268,10 +7252,6 @@ void DBImpl::ProcessPendingPartialMerge() {
       continue;
     }
     last_user_key = user_key.ToString();
-
-    // std::cout << "This key: " << (key.size() >= 24 ? ExtractCUID(key) : 0)
-    //         << "..." << (key.size() > 24 ? key.ToString().substr(24) : "")
-    //         << std::endl;
 
     // 写入 Buffer
     if (hotspot_manager_->BufferHotData(task.cuid, key, value)) {
@@ -7321,11 +7301,36 @@ void DBImpl::ProcessPendingPartialMerge() {
     hotspot_manager_->TriggerBufferFlush();
   }
 
-  fprintf(stdout,
-          "[DBImpl] PartialMerge completed for CUID %lu: merged %zu entries "
-          "into HotDataBuffer\n",
-          task.cuid, written_count);
+  ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                 "[DBImpl] PartialMerge completed for CUID %" PRIu64
+                 ": merged %zu entries into HotDataBuffer",
+                 task.cuid, written_count);
   hotspot_manager_->UnlockCuid(task.cuid);
+}
+
+void DBImpl::NotifyDeltaBGWork() {
+  delta_bg_cv_.notify_one();
+}
+
+void DBImpl::DeltaBGWorkThreadFunc() {
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(delta_bg_mutex_);
+      delta_bg_cv_.wait(lock, [this] {
+        return delta_bg_stop_.load(std::memory_order_acquire) ||
+               (hotspot_manager_ &&
+                (hotspot_manager_->HasPendingInitCuids() ||
+                 hotspot_manager_->HasPendingMetadataScans() ||
+                 hotspot_manager_->HasPendingPartialMerge()));
+      });
+    }
+    if (delta_bg_stop_.load(std::memory_order_acquire)) {
+      break;
+    }
+    ProcessPendingHotCuids();
+    ProcessPendingMetadataScans();
+    ProcessPendingPartialMerge();
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

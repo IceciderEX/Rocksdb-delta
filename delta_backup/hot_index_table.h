@@ -92,22 +92,8 @@ class HotIndexTable {
   void DumpToFile(const std::string& filename, const std::string& phase_label);
 
  private:
-  static constexpr size_t kNumShards = 128;
-  
-  struct Shard {
-    mutable std::shared_mutex mutex;
-    std::unordered_map<uint64_t, HotIndexEntry> table;
-  };
-
-  Shard& GetShard(uint64_t cuid) {
-    return shards_[cuid % kNumShards];
-  }
-
-  const Shard& GetShard(uint64_t cuid) const {
-    return shards_[cuid % kNumShards];
-  }
-
-  std::array<Shard, kNumShards> shards_;
+  mutable std::shared_mutex mutex_;
+  std::unordered_map<uint64_t, HotIndexEntry> table_;
   std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
 };
 

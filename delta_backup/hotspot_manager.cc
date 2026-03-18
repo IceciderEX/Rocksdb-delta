@@ -13,23 +13,18 @@
 #include "port/port.h"
 #include "rocksdb/env.h"
 #include "rocksdb/sst_file_writer.h"
-#include "db/dbformat.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 HotspotManager::HotspotManager(const Options& db_options,
-                               const std::string& data_dir,
-                               const InternalKeyComparator* internal_comparator)
+                               const std::string& data_dir)
     : db_options_(db_options),
       data_dir_(data_dir),
-      internal_comparator_(internal_comparator),
       lifecycle_manager_(std::make_shared<HotSstLifecycleManager>(db_options)),
       index_table_(lifecycle_manager_),
       frequency_table_(4, 600) {
   db_options_.env->CreateDirIfMissing(data_dir_);
 }
-
-
 
 uint64_t HotspotManager::ExtractCUID(const Slice& key) {
   // TODO: 根据实际的 Key Schema提取 cuid，这里先假设一波
@@ -137,11 +132,25 @@ bool HotspotManager::ShouldTriggerScanAsCompaction(uint64_t cuid) {
   return false;
 }
 
+class VectorIterator {
+ public:
+  VectorIterator(const std::vector<HotEntry>& data) : data_(data), idx_(0) {}
+
+  bool Valid() const { return idx_ < data_.size(); }
+  void Next() { idx_++; }
+  const Slice Key() const { return data_[idx_].key; }
+  const Slice Value() const { return data_[idx_].value; }
+  uint64_t Cuid() const { return data_[idx_].cuid; }
+
+ private:
+  const std::vector<HotEntry>& data_;
+  size_t idx_;
+};
 
 Status HotspotManager::FlushBlockToSharedSST(
     std::shared_ptr<HotDataBlock> block,
     std::unordered_map<uint64_t, DataSegment>* output_segments) {
-  if (!block || block->buckets.empty()) return Status::OK();
+  if (!block || block->entries.empty()) return Status::OK();
 
   // keysort: already in RotateBuffer()
 
@@ -179,44 +188,43 @@ Status HotspotManager::FlushBlockToSharedSST(
 
   lifecycle_manager_->RegisterFile(file_number, file_path, link_path);
 
-  // 3. 按 CUID 顺序写入数据
-  // DataBlock 内部已经按 Bucket 组织，按 CUID 升序遍历 Bucket
-  std::vector<uint64_t> cuids;
-  for (const auto& pair : block->buckets) {
-    cuids.push_back(pair.first);
-  }
-  std::sort(cuids.begin(), cuids.end());
-
-  for (uint64_t current_cuid : cuids) {
-    const auto& bucket_entries = block->buckets[current_cuid];
-    if (bucket_entries.empty()) continue;
-
-    const HotEntry& first_entry = bucket_entries[0];
-    std::string segment_first_key = first_entry.key;
+  // 3. 遍历写入并记录 Segment
+  auto& entries = block->entries;
+  size_t i = 0;
+  while (i < entries.size()) {
+    uint64_t current_cuid = entries[i].cuid;
+    std::string segment_first_key = entries[i].key;  // 记录 First Key
     std::string segment_last_key;
+
     std::string last_written_key_in_segment;
     bool is_first_entry_in_segment = true;
+
+    uint64_t logical_size = 0;
     int written_count = 0;
 
-    for (const HotEntry& entry : bucket_entries) {
-      Slice entry_key(entry.key);
-      Slice current_user_key_slice = ExtractUserKey(entry_key);
+    // 当前 CUID 的所有 Entry
+    while (i < entries.size() && entries[i].cuid == current_cuid) {
+      const std::string& current_internal_key = entries[i].key;
+      Slice current_user_key_slice = ExtractUserKey(current_internal_key);
       std::string current_user_key = current_user_key_slice.ToString();
 
       // 去重
       if (!is_first_entry_in_segment &&
           current_user_key == last_written_key_in_segment) {
+        i++;
         continue;
       }
-      
-      Slice entry_value(entry.value);
-      s = sst_writer.Put(current_user_key_slice, entry_value);
+      // TODO:这里待确定的问题：
+      // sst writer 期望写入 user key，并为它们统一赋 seq = 0, type = value
+      // 对于 snapshot 数据 + append-only 情形下，可以吗？
+      s = sst_writer.Put(current_user_key_slice, entries[i].value);
       if (!s.ok()) return s;
 
       last_written_key_in_segment = current_user_key;
-      segment_last_key = entry_key.ToString();
+      segment_last_key = current_internal_key;  // 实时更新 Segment Last Key
       written_count++;
       is_first_entry_in_segment = false;
+      i++;
     }
 
     if (written_count > 0) {
@@ -224,6 +232,7 @@ Status HotspotManager::FlushBlockToSharedSST(
       segment.file_number = file_number;
       segment.first_key = segment_first_key;
       segment.last_key = segment_last_key;
+
       (*output_segments)[current_cuid] = segment;
     }
   }
@@ -248,8 +257,8 @@ Status HotspotManager::FlushBlockToSharedSST(
 }
 
 void HotspotManager::TriggerBufferFlush() {
-  // 轮转 Buffer，传入 InternalKeyComparator 保证排序严格有序
-  if (!buffer_.RotateBuffer(internal_comparator_)) {
+  // 轮转 Buffer
+  if (!buffer_.RotateBuffer()) {
     return;
   }
 
@@ -347,7 +356,7 @@ void HotspotManager::FinalizeScanAsCompaction(
 
   // tail segment, PromoteSnapshot()填充具体值
   std::string min_key, max_key;
-  if (buffer_.GetBoundaryKeys(cuid, &min_key, &max_key, internal_comparator_)) {
+  if (buffer_.GetBoundaryKeys(cuid, &min_key, &max_key)) {
     DataSegment tail_segment;
     tail_segment.file_number = static_cast<uint64_t>(-1);  // 标记为内存段
     tail_segment.first_key = min_key;
@@ -560,7 +569,8 @@ void HotspotManager::EnqueuePartialMerge(
   // 避免重复添加相同 cuid 的任务?
   for (auto& task : partial_merge_queue_) {
     if (task.cuid == cuid) {
-      // 已经有一个队列了，暂时忽略本次小的 scan触发，或者也可以用更大的 range更新
+      // 已经有一个队列了，暂时忽略本次小的 scan触发，或者也可以用更大的 range
+      // 更新
       return;
     }
   }

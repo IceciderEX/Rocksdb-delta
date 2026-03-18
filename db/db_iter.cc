@@ -10,7 +10,24 @@
 #include "db/db_iter.h"
 
 #include <limits>
+#include <iostream>
+#include <chrono>
 #include <string>
+
+namespace ROCKSDB_NAMESPACE {
+extern thread_local double tl_hot_next_extract_ms;
+extern thread_local double tl_hot_next_advance_ms;
+extern thread_local double tl_hot_next_compare_ms;
+extern thread_local double tl_hot_child_next_ms;
+extern thread_local double tl_hot_switch_seg_ms;
+extern thread_local double tl_hot_dedup_loop_ms;
+extern thread_local double tl_hot_next_cpu_ms;
+extern thread_local double tl_hot_valid_ms;
+extern thread_local double tl_hot_db_iter_total_ms;
+extern thread_local double tl_hot_db_iter_logic_ms;
+extern thread_local double tl_hot_extract_cuid_ms;
+extern thread_local double tl_hot_snapshot_self_ms;
+}
 
 #include "db/dbformat.h"
 #include "db/merge_context.h"
@@ -379,6 +396,11 @@ bool DBIter::FindNextUserEntry(bool skipping_saved_key, const Slice* prefix) {
 // Actual implementation of DBIter::FindNextUserEntry()
 bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                                        const Slice* prefix) {
+  return FindNextUserEntryInternalImpl(skipping_saved_key, prefix);
+}
+
+bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
+                                           const Slice* prefix) {
   // Loop until we hit an acceptable entry to yield
   assert(iter_.Valid());
   assert(status_.ok());
@@ -527,7 +549,13 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   hotspot_manager_->ExtractCUID(saved_key_.GetUserKey());
               if (cuid != 0) {
                 // 如果 CUID 已被删除，跳过
-                if (hotspot_manager_->IsCuidDeleted(cuid)) {
+                // 缓存 deleted 状态：同一 CUID optimization
+                if (delta_ctx_.cached_deleted_check_cuid != cuid) {
+                  // cuid change，查询 GDCT 一次
+                  delta_ctx_.cached_cuid_is_deleted = hotspot_manager_->IsCuidDeleted(cuid);
+                  delta_ctx_.cached_deleted_check_cuid = cuid;
+                }
+                if (delta_ctx_.cached_cuid_is_deleted) {
                   valid_ = false;
                   ResetValueAndColumns();  // 这个函数用于清理 value_
                   // RecordTick(statistics_, DELTA_LOGICAL_DELETE_SKIPPED);
@@ -545,7 +573,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                         hotspot_manager_->EvaluateScanAsCompactionStrategy(
                             delta_ctx_.last_cuid, read_options_.delta_full_scan,
                             delta_ctx_.scan_first_key,
-                            delta_ctx_.scan_last_key);
+                            delta_ctx_.GetScanLastKey());
 
                     // 如果决定要 kFullReplace，但其实并未发生缓冲
                     bool execute = true;
@@ -557,7 +585,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                     if (execute) {
                       hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
                           delta_ctx_.last_cuid, strategy,
-                          delta_ctx_.scan_first_key, delta_ctx_.scan_last_key,
+                          delta_ctx_.scan_first_key, delta_ctx_.GetScanLastKey(),
                           delta_ctx_.visited_units_for_cuid,
                           delta_ctx_.scan_data);  // 本次 scan 的数据(for partial merge)
                     }
@@ -574,7 +602,9 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   delta_ctx_.scan_first_key.clear();
                   delta_ctx_.scan_last_key.clear();
                   delta_ctx_.scan_data.clear();  // 清除上个 CUID 的 scan 数据
-
+                  delta_ctx_.cached_deleted_check_cuid = 0;  // 清空 deleted 缓存，下次会重新查询
+                  delta_ctx_.cached_phys_id = 0; // 重置 phys_id 缓存
+    
                   // 对这个 cuid 进行一次访问计数，用于判断是否为热点
                   bool became_hot = false;
                   delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(
@@ -611,40 +641,49 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                 // 维护引用计数
                 if (read_options_.delta_full_scan) {
                   uint64_t phys_id = GetCurrentPhysUnitId(iter_.iter());
-                  // 排除：phys_id=0（热点存储区的数据）+重复scan
-                  if (phys_id != 0 &&
-                      delta_ctx_.visited_units_for_cuid.find(phys_id) ==
-                          delta_ctx_.visited_units_for_cuid.end()) {
-                    // 仅在 Full Scan 时更新
-                    hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(
-                        cuid, phys_id);
-                    delta_ctx_.visited_units_for_cuid.insert(phys_id);
+                  // 排除：phys_id=0（热点存储区的数据）+ 重复scan
+                  // [OPTIMIZATION] 只有当 unit ID 发生真正变化时才请求 GDCT 锁
+                  if (phys_id != 0 && delta_ctx_.cached_phys_id != phys_id) {
+                    if (delta_ctx_.visited_units_for_cuid.find(phys_id) ==
+                        delta_ctx_.visited_units_for_cuid.end()) {
+                      // 仅在 Full Scan 时更新
+                      hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(
+                          cuid, phys_id);
+                      delta_ctx_.visited_units_for_cuid.insert(phys_id);
+                    }
+                    delta_ctx_.cached_phys_id = phys_id;
                   }
                 }
 
-                InternalKey temp_internal_key(saved_key_.GetUserKey(), ikey_.sequence, ikey_.type);
-                std::string key_str = temp_internal_key.Encode().ToString();
-
-                // 记录 scan 的 key 范围（始终记录，用于后续 Finalize
-                // 时定位范围）
-                if (delta_ctx_.scan_first_key.empty()) {
-                  delta_ctx_.scan_first_key = key_str;
+                // [OPTIMIZATION] 只有当真正需要内部 Key 编码用于后续操作时才进行一次编码
+                bool need_internal_key = (delta_ctx_.scan_first_key.empty() || 
+                                          delta_ctx_.trigger_scan_as_compaction || 
+                                          (!read_options_.is_metadata_scan && !read_options_.delta_full_scan));
+                
+                if (need_internal_key) {
+                  delta_ctx_.key_encode_buf.clear();
+                  AppendInternalKey(&delta_ctx_.key_encode_buf,
+                      ParsedInternalKey(saved_key_.GetUserKey(), ikey_.sequence, ikey_.type));
                 }
-                delta_ctx_.scan_last_key = key_str;
-
+    
+                // 记录 scan 的 key 范围（finalize 定位）
+                if (delta_ctx_.scan_first_key.empty()) {
+                  delta_ctx_.scan_first_key = delta_ctx_.key_encode_buf;
+                }
+    
                 if (delta_ctx_.trigger_scan_as_compaction) {
-                  // Full Scan / Init Scan: 缓冲数据进全局 HotDataBuffer
+                  // Full Scan / Init Scan: 缓冲数据
+                  delta_ctx_.scan_last_key = delta_ctx_.key_encode_buf;
                   bool buffer_full = hotspot_manager_->BufferHotData(
-                      cuid, temp_internal_key.Encode(), value());
+                      cuid, Slice(delta_ctx_.key_encode_buf), value());
                   if (buffer_full) {
                     hotspot_manager_->TriggerBufferFlush();
                   }
                 } else if (!read_options_.is_metadata_scan &&
                            !read_options_.delta_full_scan) {
-                  // 小 Scan（非 Full Scan，非 Metadata Scan）：
-                  // 收集精准 KV 数据，供后台 PartialMerge 使用
-                  // 【可考虑优化点】
-                  delta_ctx_.scan_data.push_back({key_str, value().ToString()});
+                  // 小 Scan：not full/metadata -> partial merge
+                  delta_ctx_.scan_data.emplace_back(delta_ctx_.key_encode_buf,
+                                                    value().ToString());
                 }
               }
             }
@@ -762,7 +801,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
     if (delta_ctx_.last_cuid != 0 && !read_options_.is_metadata_scan) {
       auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
           delta_ctx_.last_cuid, read_options_.delta_full_scan,
-          delta_ctx_.scan_first_key, delta_ctx_.scan_last_key);
+          delta_ctx_.scan_first_key, delta_ctx_.GetScanLastKey());
 
       bool execute = true;
       if (strategy == ScanAsCompactionStrategy::kFullReplace &&
@@ -773,7 +812,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
       if (execute) {
         hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
             delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
-            delta_ctx_.scan_last_key, delta_ctx_.visited_units_for_cuid,
+            delta_ctx_.GetScanLastKey(), delta_ctx_.visited_units_for_cuid,
             delta_ctx_.scan_data);
       }
     }

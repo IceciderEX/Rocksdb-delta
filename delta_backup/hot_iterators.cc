@@ -5,11 +5,11 @@
 #include "util/extract_cuid.h"
 
 #include <chrono>
-#include <time.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
+// Global thread_local accumulators for deep profiling. 
+// Defined at global scope to avoid namespace issues during cross-file linking in tests.
+thread_local double tl_hot_next_extract_ms = 0;
+thread_local double tl_hot_next_advance_ms = 0;
+thread_local double tl_hot_next_compare_ms = 0;
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -256,14 +256,15 @@ bool HotSnapshotIterator::Valid() const {
 
   // 边界检查：需要在 Segment 范围内
   const auto& seg = segments_[current_segment_index_];
-  bool ret = true;
   if (!seg.last_key.empty()) {
+    // 使用 UserKey 比较
+    // because SST 中的 InternalKey Sequence = 0
     if (icmp_.user_comparator()->Compare(ExtractUserKey(current_iter_->key()),
                                          ExtractUserKey(seg.last_key)) > 0) {
-      ret = false;
+      return false;
     }
   }
-  return ret;
+  return true;
 }
 
 Slice HotSnapshotIterator::key() const { return current_iter_->key(); }
@@ -494,28 +495,25 @@ void DeltaSwitchingIterator::Next() {
   if (!current_iter_) return;
 
   if (is_hot_mode_ && current_iter_->Valid()) {
-    Slice cur_key = current_iter_->key();
-    Slice prev_user_key = ExtractUserKey(cur_key);
+    // 缓存当前的 UserKey 以便跳过重复项
+    Slice prev_user_key = ExtractUserKey(current_iter_->key());
     prev_user_key_buf_.assign(prev_user_key.data(), prev_user_key.size());
-
+    
     current_iter_->Next();
     
     // 跳过与上一条相同 UserKey 的所有条目
     while (current_iter_->Valid()) {
       Slice cur_user_key = ExtractUserKey(current_iter_->key());
-      int cmp = icmp_.user_comparator()->Compare(cur_user_key, Slice(prev_user_key_buf_));
-
-      if (cmp != 0) {
+      // 使用 user_comparator 进行比较（无视 timestamp）
+      if (icmp_.user_comparator()->Compare(cur_user_key, Slice(prev_user_key_buf_)) != 0) {
         break;
       }
-
       current_iter_->Next();
     }
   } else {
     current_iter_->Next();
   }
 }
-
 void DeltaSwitchingIterator::Prev() {
   if (current_iter_) current_iter_->Prev();
 }

@@ -6,46 +6,42 @@ namespace ROCKSDB_NAMESPACE {
 
 ScanFrequencyTable::ScanFrequencyTable(int threshold, int window_sec)
     : threshold_(threshold), window_sec_(window_sec) {
-  auto now = std::chrono::steady_clock::now();
-  for (size_t i = 0; i < kNumShards; ++i) {
-    shards_[i].window_start_time = now;
-  }
+  window_start_time_ = std::chrono::steady_clock::now();
 }
 
-void ScanFrequencyTable::CheckAndRotateWindow(Shard& shard) {
+void ScanFrequencyTable::CheckAndRotateWindow() {
   auto now = std::chrono::steady_clock::now();
   auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-      now - shard.window_start_time).count();
+      now - window_start_time_).count();
 
   // 窗口轮转时，重置
   if (elapsed >= window_sec_) {
-    shard.table.clear();
-    shard.window_start_time = now;
+    // 先进行一个简单的实现：直接清空整个表
+    table_.clear();
+    window_start_time_ = now;
   }
 }
 
 bool ScanFrequencyTable::IsHot(uint64_t cuid) const {
-  const Shard& shard = GetShard(cuid);
-  std::lock_guard<std::mutex> lock(shard.mutex);
-  auto it = shard.table.find(cuid);
-  if (it != shard.table.end()) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it != table_.end()) {
     return it->second.is_hot;
   }
   return false;
 }
 
 bool ScanFrequencyTable::RecordAndCheckHot(uint64_t cuid, bool* became_hot) {
-  Shard& shard = GetShard(cuid);
-  std::lock_guard<std::mutex> lock(shard.mutex);
+  std::lock_guard<std::mutex> lock(mutex_);
   
   // 初始化输出参数
   if (became_hot) {
     *became_hot = false;
   }
   
-  CheckAndRotateWindow(shard);
+  CheckAndRotateWindow();
 
-  FrequencyEntry& entry = shard.table[cuid];
+  FrequencyEntry& entry = table_[cuid];
 
   // 如果该CUid已经被标记为热点CUid，认为不需要再统计频率
   if (entry.is_hot) {
@@ -67,8 +63,7 @@ bool ScanFrequencyTable::RecordAndCheckHot(uint64_t cuid, bool* became_hot) {
 }
 
 void ScanFrequencyTable::RemoveCUID(uint64_t cuid) {
-  Shard& shard = GetShard(cuid);
-  std::lock_guard<std::mutex> lock(shard.mutex);
-  shard.table.erase(cuid);
+  std::lock_guard<std::mutex> lock(mutex_);
+  table_.erase(cuid);
 }
 } // namespace ROCKSDB_NAMESPACE

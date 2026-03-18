@@ -46,7 +46,7 @@ class HotspotManager {
  public:
   // db_options: 用于初始化 SstFileWriter
   // data_dir: 生成 SST 文件存放的目录路径
-  HotspotManager(const Options& db_options, const std::string& data_dir, const InternalKeyComparator* internal_comparator);
+  HotspotManager(const Options& db_options, const std::string& data_dir);
 
   ~HotspotManager() = default;
 
@@ -180,7 +180,6 @@ class HotspotManager {
  private:
   Options db_options_;
   std::string data_dir_;
-  const InternalKeyComparator* internal_comparator_;
 
   std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
   HotDataBuffer buffer_;
