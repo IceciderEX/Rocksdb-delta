@@ -25,7 +25,7 @@ HotspotManager::HotspotManager(const Options& db_options,
       internal_comparator_(internal_comparator),
       lifecycle_manager_(std::make_shared<HotSstLifecycleManager>(db_options)),
       index_table_(lifecycle_manager_),
-      frequency_table_(4, 600) {
+      frequency_table_(200, 600) { // count set
   db_options_.env->CreateDirIfMissing(data_dir_);
 }
 

@@ -505,7 +505,7 @@ void CompactionIterator::NextFromInput() {
          !IsShuttingDown()) {
     
     // for delta
-    if (hotspot_manager_) {
+    if (hotspot_manager_) { // 防止 flush 调用这个函数导致问题
         CheckHotspotFilters();
         // 当前 cuid 是否跳过
         if (skip_current_cuid_) {

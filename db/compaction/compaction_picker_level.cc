@@ -530,12 +530,12 @@ void LevelCompactionBuilder::SetupInitialFilesDelta() {
 // 选取最老的 N 个文件进行 L0->L0 合并
 bool LevelCompactionBuilder::PickMixedL0Compaction() {
   // 策略阈值
-  const int kL0TriggerCount = 3;      // 触发阈值：SST 数量 >= 20
+  const int kL0TriggerCount = 10;      // 触发阈值：SST 数量 >= 20
   const uint64_t kL0TriggerAge = 3600; // 时间阈值：最老文件超过1h
-  const size_t kFilesToPick = 10;      // 每次合并选取的最大文件数
+  const size_t kFilesToPick = 5;      // 每次合并选取的最大文件数
 
   // 2. 获取 L0 文件列表
-  // TODO: 检查 seqno 排列顺序
+  // TODO: 检查 seqno 排列顺序?
   const std::vector<FileMetaData*>& l0_files = vstorage_->LevelFiles(0);
   
   size_t total_files = l0_files.size();
@@ -579,7 +579,7 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
     FileMetaData* f = l0_files[i];
     // 检查并发冲突的逻辑？？
     if (f->being_compacted) {
-      // TODO：如果最老的数据正在合并，abandon？
+      // TODO：如果最老的数据正在合并，直接abandon这次compaction？
       start_level_inputs_.clear();
       return false;
     }

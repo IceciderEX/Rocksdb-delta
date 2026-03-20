@@ -144,11 +144,11 @@ HotSnapshotIterator::~HotSnapshotIterator() {
   // current_iter_ unique_ptr auto released
 }
 
-void HotSnapshotIterator::InitIterForSegment(size_t index) {
+bool HotSnapshotIterator::InitIterForSegment(size_t index) {
   if (index >= segments_.size()) {
     current_iter_.reset(nullptr);
     current_segment_index_ = -1;
-    return;
+    return false;
   }
 
   const auto& seg = segments_[index];
@@ -158,7 +158,20 @@ void HotSnapshotIterator::InitIterForSegment(size_t index) {
     // Case A: 内存 Buffer fileid -1
     InternalIterator* mem_iter =
         hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
+    
+    // 防止buffer data在线程调度时清空，再检查一次
+    mem_iter->SeekToFirst();
+    if (!mem_iter->Valid()) {
+      HotIndexEntry latest_entry;
+      if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry) && latest_entry.HasSnapshot()) {
+        segments_ = latest_entry.snapshot_segments;
+        delete mem_iter;
+        return true;  // index again
+      }
+    }
+
     current_iter_.reset(mem_iter);
+    return false;
   } else {
     // Case B: 物理 SST
     FileMetaData meta = MakeFileMetaFromSegment(seg, false);
@@ -182,6 +195,7 @@ void HotSnapshotIterator::InitIterForSegment(size_t index) {
         nullptr, nullptr);
 
     current_iter_.reset(iter);
+    return false;
   }
 }
 
@@ -191,31 +205,38 @@ void HotSnapshotIterator::Seek(const Slice& target) {
     return;
   }
 
-  // EndKey >= Target 的 Segment
-  auto it = std::lower_bound(
-      segments_.begin(), segments_.end(), target,
-      [&](const DataSegment& seg, const Slice& val) {
-        if (seg.last_key.empty()) {
-          fprintf(
-              stderr,
-              "Warning: Empty last_key in segment. This should not happen.\n");
-          return false;
-        }
-        // 比较 seg.last_key < val
-        return icmp_.user_comparator()->Compare(ExtractUserKey(seg.last_key),
-                                                ExtractUserKey(val)) < 0;
-      });
+  while (true) {
+    // EndKey >= Target 的 Segment
+    auto it = std::lower_bound(
+        segments_.begin(), segments_.end(), target,
+        [&](const DataSegment& seg, const Slice& val) {
+          if (seg.last_key.empty()) {
+            fprintf(
+                stderr,
+                "Warning: Empty last_key in segment. This should not happen.\n");
+            return false;
+          }
+          // 比较 seg.last_key < val
+          return icmp_.user_comparator()->Compare(ExtractUserKey(seg.last_key),
+                                                  ExtractUserKey(val)) < 0;
+        });
 
-  size_t index = std::distance(segments_.begin(), it);
+    size_t index = std::distance(segments_.begin(), it);
 
-  if (it == segments_.end()) {
-    current_iter_.reset(nullptr);
-    current_segment_index_ = -1;
-    return;
-  }
+    if (it == segments_.end()) {
+      current_iter_.reset(nullptr);
+      current_segment_index_ = -1;
+      return;
+    }
 
-  if (static_cast<int>(index) != current_segment_index_) {
-    InitIterForSegment(index);
+    if (static_cast<int>(index) != current_segment_index_) {
+      if (InitIterForSegment(index)) { // if true, index again
+        current_segment_index_ = -1; // 必须重置，否则下一轮循环中若 index 碰巧相同则会跳过 Init
+        continue;
+      }
+    }
+    
+    break;
   }
 
   // segment seek
@@ -246,7 +267,9 @@ void HotSnapshotIterator::Next() {
 }
 
 void HotSnapshotIterator::SwitchToNextSegment() {
-  InitIterForSegment(current_segment_index_ + 1);
+  int target_index = current_segment_index_ + 1;
+  while (InitIterForSegment(target_index)) {
+  }
 }
 
 bool HotSnapshotIterator::Valid() const {
@@ -275,12 +298,14 @@ Status HotSnapshotIterator::status() const {
 }
 
 void HotSnapshotIterator::SeekToFirst() {
-  InitIterForSegment(0);
+  while (InitIterForSegment(0)) {
+  }
   if (current_iter_) current_iter_->Seek(segments_[current_segment_index_].first_key);
 }
 
 void HotSnapshotIterator::SeekToLast() {
-  InitIterForSegment(segments_.size() - 1);
+  while (InitIterForSegment(segments_.size() - 1)) {
+  }
   if (current_iter_) {
     if (segments_[current_segment_index_].file_number == static_cast<uint64_t>(-1)) {
       current_iter_->SeekForPrev(segments_[current_segment_index_].last_key);
@@ -307,7 +332,9 @@ void HotSnapshotIterator::Prev() {
 
 void HotSnapshotIterator::SwitchToPrevSegment() {
   if (current_segment_index_ > 0) {
-    InitIterForSegment(current_segment_index_ - 1);
+    int target_index = current_segment_index_ - 1;
+    while (InitIterForSegment(target_index)) {
+    }
   } else {
     current_iter_.reset(nullptr);
     current_segment_index_ = -1;

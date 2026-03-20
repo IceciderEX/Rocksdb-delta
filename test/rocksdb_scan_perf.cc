@@ -30,7 +30,7 @@
 const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_native";
 const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_delta";
 const int kNumThreads = 16;
-const int kTestDurationSec = 480;       // 8 分钟
+const int kTestDurationSec = 240;       // 8 分钟
 const int kNumCuids = 100000;           // 10W CUID 总库
 const int kBatchSize = 128;             // 每次 Put 128 行
 const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (约 25,600 行)
@@ -157,9 +157,9 @@ class PerfRunner {
       DoScan(cuid, final_rows, true, read_opts, stats);
       DoDelete(cuid, final_rows, stats);
 
-      std::cout << "[Thread " << thread_id << "] Completed CUID " << cuid
-                << " (Rows: " << final_rows << ", Scans: " << scans_done
-                << ", Hot: " << is_hot << ")" << std::endl;
+      // std::cout << "[Thread " << thread_id << "] Completed CUID " << cuid
+      //           << " (Rows: " << final_rows << ", Scans: " << scans_done
+      //           << ", Hot: " << is_hot << ")" << std::endl;
     }
   }
 

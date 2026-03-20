@@ -76,8 +76,8 @@ class HotSnapshotIterator : public InternalIterator {
   uint64_t GetPhysicalId() override;
 
  private:
-  // 初始化特定 index 的 segment iterator
-  void InitIterForSegment(size_t segment_index);
+  // 初始化特定 index 的 segment iterator，返回是否由于底层 Segments 被重定位而导致 index 失效
+  bool InitIterForSegment(size_t segment_index);
 
   // 切换到下一个 Segment
   void SwitchToNextSegment();

@@ -153,8 +153,8 @@ struct DeltaCompactionContext {
             for (auto fid : current_input_files) {
                 input_str += std::to_string(fid) + " ";
             }
-            fprintf(stdout, "[Compaction] CUID %lu generated Output File %lu from Input Files: [%s]\n",
-                current_cuid, actual_file_number, input_str.c_str());
+            // fprintf(stdout, "[Compaction] CUID %lu generated Output File %lu from Input Files: [%s]\n",
+            //     current_cuid, actual_file_number, input_str.c_str());
 
             pending_outputs->push_back({
                 current_cuid,
