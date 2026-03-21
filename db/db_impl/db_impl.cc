@@ -7313,7 +7313,8 @@ void DBImpl::DeltaBGWorkThreadFunc() {
   while (true) {
     {
       std::unique_lock<std::mutex> lock(delta_bg_mutex_);
-      delta_bg_cv_.wait(lock, [this] {
+      // 使用 wait_for 周期性唤醒以检查刷写异步 gdct 日志任务
+      delta_bg_cv_.wait_for(lock, std::chrono::seconds(600), [this] {
         return delta_bg_stop_.load(std::memory_order_acquire) ||
                (hotspot_manager_ &&
                 (hotspot_manager_->HasPendingInitCuids() ||
@@ -7324,6 +7325,12 @@ void DBImpl::DeltaBGWorkThreadFunc() {
     if (delta_bg_stop_.load(std::memory_order_acquire)) {
       break;
     }
+
+    // 周期性异步刷盘并尝试对长日志执行收缩重写
+    if (hotspot_manager_) {
+      hotspot_manager_->CompactAndFlushGDCTLogIfNeeded();
+    }
+
     ProcessPendingHotCuids();
     ProcessPendingMetadataScans();
     ProcessPendingPartialMerge();

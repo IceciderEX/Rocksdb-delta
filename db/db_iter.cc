@@ -551,8 +551,8 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                 // 如果 CUID 已被删除，跳过
                 // 缓存 deleted 状态：同一 CUID optimization
                 if (delta_ctx_.cached_deleted_check_cuid != cuid) {
-                  // cuid change，查询 GDCT 一次
-                  delta_ctx_.cached_cuid_is_deleted = hotspot_manager_->IsCuidDeleted(cuid);
+                  // cuid change，查询 GDCT 一次，引入 sequence_ -> mvcc
+                  delta_ctx_.cached_cuid_is_deleted = hotspot_manager_->IsCuidDeleted(cuid, sequence_);
                   delta_ctx_.cached_deleted_check_cuid = cuid;
                 }
                 if (delta_ctx_.cached_cuid_is_deleted) {

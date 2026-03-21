@@ -79,7 +79,7 @@ void GlobalDeleteCountTable::UntrackFiles(uint64_t cuid, const std::vector<uint6
   }
 
   // 检查是否需要清理条目 (引用归零 且 标记删除)
-  if (entry.ref_count <= 0 && entry.is_deleted) {
+  if (entry.ref_count <= 0 && entry.deleted_at_seqno.load(std::memory_order_relaxed) != kMaxSequenceNumber) {
       shard.table.erase(it);
   }
 }
@@ -131,7 +131,7 @@ void GlobalDeleteCountTable::ApplyCompactionChange(
   // assert(entry.ref_count == (int32_t)entry.tracked_phys_ids.size());
 
   // 2.3 检查清理条件：无文件引用 且 标记为删除
-  if (entry.ref_count <= 0 && entry.is_deleted) {
+  if (entry.ref_count <= 0 && entry.deleted_at_seqno.load(std::memory_order_relaxed) != kMaxSequenceNumber) {
       shard.table.erase(it);
   }
 }
@@ -160,25 +160,44 @@ void GlobalDeleteCountTable::ApplyFlushChange(uint64_t cuid,
   }
 }
 
-bool GlobalDeleteCountTable::MarkDeleted(uint64_t cuid) {
-  auto& shard = GetShard(cuid);
-  std::unique_lock<std::shared_mutex> lock(shard.mutex);
+bool GlobalDeleteCountTable::MarkDeleted(uint64_t cuid, SequenceNumber seq, bool* newly_deleted) {
+  const auto& shard = GetShard(cuid);
+  // atomic deleted_at_seqno shared_lock
+  std::shared_lock<std::shared_mutex> lock(shard.mutex);
   auto it = shard.table.find(cuid);
   if (it != shard.table.end()) {
-    it->second.is_deleted = true;
+    SequenceNumber expected = kMaxSequenceNumber;
+    bool exchanged = it->second.deleted_at_seqno.compare_exchange_strong(expected, seq, std::memory_order_acq_rel);
+    if (newly_deleted) *newly_deleted = exchanged;
     return true; 
   }
+  if (newly_deleted) *newly_deleted = false;
   return false;
 }
 
-bool GlobalDeleteCountTable::IsDeleted(uint64_t cuid) const {
+bool GlobalDeleteCountTable::IsDeleted(uint64_t cuid, SequenceNumber read_seqno) const {
   const auto& shard = GetShard(cuid);
   std::shared_lock<std::shared_mutex> lock(shard.mutex);
   auto it = shard.table.find(cuid);  
   if (it != shard.table.end()) {
-    return it->second.is_deleted;
+    return it->second.deleted_at_seqno.load(std::memory_order_acquire) <= read_seqno;
   }
   return false;
+}
+
+std::vector<std::pair<uint64_t, SequenceNumber>> GlobalDeleteCountTable::GetAllDeletedCuids() const {
+  std::vector<std::pair<uint64_t, SequenceNumber>> result;
+  for (size_t i = 0; i < kNumShards; ++i) {
+    const auto& shard = shards_[i];
+    std::shared_lock<std::shared_mutex> lock(shard.mutex);
+    for (const auto& kv : shard.table) {
+      SequenceNumber seq = kv.second.deleted_at_seqno.load(std::memory_order_acquire);
+      if (seq != kMaxSequenceNumber) {
+        result.push_back({kv.first, seq});
+      }
+    }
+  }
+  return result;
 }
 
 int GlobalDeleteCountTable::GetRefCount(uint64_t cuid) const {

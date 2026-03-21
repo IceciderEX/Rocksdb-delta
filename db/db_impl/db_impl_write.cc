@@ -92,11 +92,20 @@ Status DBImpl::Delete(const WriteOptions& write_options,
     return s;
   }
   // for delta
-  // 问题：没有 WAL, seqno 等等的记录
-  if (hotspot_manager_ && hotspot_manager_->InterceptDelete(key)) {
-    return Status::OK();
+  if (hotspot_manager_) {
+    uint64_t cuid = hotspot_manager_->ExtractCUID(key);
+    if (cuid != 0 && hotspot_manager_->GetDeleteTable().IsTracked(cuid)) {
+        SequenceNumber seq = versions_->FetchAddLastAllocatedSequence(1) + 1;
+        Status ds = hotspot_manager_->InterceptDelete(key, seq, write_options.sync);
+        if (!ds.IsNotSupported()) {
+          if (ds.ok()) {
+            versions_->SetLastSequence(seq);
+            versions_->SetLastPublishedSequence(seq);
+          }
+          return ds;
+        }
+    }
   }
-
   return DB::Delete(write_options, column_family, key);
 }
 
@@ -108,10 +117,20 @@ Status DBImpl::Delete(const WriteOptions& write_options,
     return s;
   }
   // for delta
-  if (hotspot_manager_ && hotspot_manager_->InterceptDelete(key)) {
-    return Status::OK();
+  if (hotspot_manager_) {
+    uint64_t cuid = hotspot_manager_->ExtractCUID(key);
+    if (cuid != 0 && hotspot_manager_->GetDeleteTable().IsTracked(cuid)) {
+        SequenceNumber seq = versions_->FetchAddLastAllocatedSequence(1) + 1;
+        Status ds = hotspot_manager_->InterceptDelete(key, seq, write_options.sync);
+        if (!ds.IsNotSupported()) {
+          if (ds.ok()) {
+            versions_->SetLastSequence(seq);
+            versions_->SetLastPublishedSequence(seq);
+          }
+          return ds;
+        }
+    }
   }
-
   return DB::Delete(write_options, column_family, key, ts);
 }
 

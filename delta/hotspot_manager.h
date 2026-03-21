@@ -92,12 +92,21 @@ class HotspotManager {
       const std::unordered_set<uint64_t>& visited_files = {},
       const std::vector<std::pair<std::string, std::string>>& scan_data = {});
 
-  bool IsCuidDeleted(uint64_t cuid) { return delete_table_.IsDeleted(cuid); }
+  bool IsCuidDeleted(uint64_t cuid, SequenceNumber read_seqno) { return delete_table_.IsDeleted(cuid, read_seqno); }
 
   bool IsHot(uint64_t cuid);
 
-  // 拦截 Delete 操作?
-  bool InterceptDelete(const Slice& key);
+  // 拦截 Delete 操作并持久化
+  Status InterceptDelete(const Slice& key, SequenceNumber seq, bool sync);
+
+  // 持久化 GDCT
+  Status PersistDelete(uint64_t cuid, SequenceNumber seq, bool sync);
+
+  // 恢复 GDCT
+  void RecoverGDCT();
+
+  // 定期合并与刷盘 gdct.log 文件 (背景线程调用)
+  void CompactAndFlushGDCTLogIfNeeded();
 
   uint64_t ExtractCUID(const Slice& key);
 
@@ -178,6 +187,10 @@ class HotspotManager {
   }
 
  private:
+  Status InitGDCTLog();
+  Status FlushGDCTLogBuffer();
+
+ private:
   Options db_options_;
   std::string data_dir_;
   const InternalKeyComparator* internal_comparator_;
@@ -188,6 +201,13 @@ class HotspotManager {
 
   ScanFrequencyTable frequency_table_;
   GlobalDeleteCountTable delete_table_;
+
+  std::unique_ptr<WritableFile> gdct_log_writer_;
+  std::mutex gdct_log_mutex_;
+  
+  // Asynchronous extreme performance buffer for deletions
+  std::vector<std::pair<uint64_t, SequenceNumber>> gdct_append_buffer_;
+  std::mutex gdct_append_mutex_;
 
   // 暂存正在进行的 Scan 所生成的 SST 片段
   // FinalizeScanAsCompaction -> IndexTable

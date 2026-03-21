@@ -5,8 +5,8 @@
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
-#include <vector>
 #include <array>
+#include <atomic>
 
 #include "rocksdb/rocksdb_namespace.h"
 
@@ -15,7 +15,8 @@ namespace ROCKSDB_NAMESPACE {
 struct GDCTEntry {
   std::vector<uint64_t> tracked_phys_ids;
   int32_t ref_count = 0;
-  bool is_deleted = false;
+  // Use atomic 
+  std::atomic<SequenceNumber> deleted_at_seqno{kMaxSequenceNumber};
 
   int GetRefCount() const { return ref_count; }
 };
@@ -35,12 +36,15 @@ class GlobalDeleteCountTable {
   bool IsTracked(uint64_t cuid) const;
 
   // 【Delete 阶段调用】
-  // 直接在表中标记为 True，避免写 Tombstone
-  bool MarkDeleted(uint64_t cuid);
+  // 使用 compare_exchange 实现极速标记。通过 newly_deleted 避免重复落盘。
+  bool MarkDeleted(uint64_t cuid, SequenceNumber seq, bool* newly_deleted = nullptr);
 
   // 【Compaction/Read 阶段调用】
-  // 检查是否已删除 (用于过滤数据)
-  bool IsDeleted(uint64_t cuid) const;
+  // 检查是否已删除 (用于 MVCC 数据过滤)
+  bool IsDeleted(uint64_t cuid, SequenceNumber read_seqno) const;
+
+  // 获取所有已经被标记删除的记录（用于日志收缩）
+  std::vector<std::pair<uint64_t, SequenceNumber>> GetAllDeletedCuids() const;
 
   int GetRefCount(uint64_t cuid) const;
 

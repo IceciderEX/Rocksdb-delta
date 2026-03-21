@@ -12,8 +12,8 @@
 #include "logging/logging.h"
 #include "port/port.h"
 #include "rocksdb/env.h"
-#include "rocksdb/sst_file_writer.h"
 #include "db/dbformat.h"
+#include "util/coding.h"
 #include "util/extract_cuid.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -28,6 +28,11 @@ HotspotManager::HotspotManager(const Options& db_options,
       index_table_(lifecycle_manager_),
       frequency_table_(200, 600) { // count set
   db_options_.env->CreateDirIfMissing(data_dir_);
+
+  // 恢复之前因为宕机等原因遗留的 GDCT 逻辑删除记录
+  RecoverGDCT();
+  // 初始化持久化日志 AppendableWriter
+  InitGDCTLog();
 }
 
 
@@ -97,21 +102,184 @@ void HotspotManager::PrepareForFullReplace(uint64_t cuid) {
   }
 }
 
-bool HotspotManager::InterceptDelete(const Slice& key) {
+Status HotspotManager::InterceptDelete(const Slice& key, SequenceNumber seq, bool sync) {
   uint64_t cuid = ExtractCUID(key);
-  if (cuid == 0) return false;
+  if (cuid == 0) return Status::NotSupported("CUID not found");
 
-  // 在 GDCT 中查询是否该 cuid 被标记为删除
-  bool marked = delete_table_.MarkDeleted(cuid);
+  bool newly_deleted = false;
+  // 在 GDCT 中查询是否该 cuid 已经被追踪为热点
+  bool tracked = delete_table_.MarkDeleted(cuid, seq, &newly_deleted);
 
-  if (marked) {
-    // fprintf(stderr, "[HotspotManager] Intercepted Delete for CUID: %lu\n",
-    // cuid);
-    return true;
+  if (tracked) {
+    if (newly_deleted) {
+      // 第一次 delete
+      return PersistDelete(cuid, seq, sync);
+    }
+    // 已经删除过
+    return Status::OK();
   }
 
   // CUID 不在热点管理范围内
-  return false;
+  return Status::NotSupported("Not a hot CUID");
+}
+
+Status HotspotManager::InitGDCTLog() {
+  std::lock_guard<std::mutex> lock(gdct_log_mutex_);
+  if (gdct_log_writer_) return Status::OK();
+
+  std::string log_dir = data_dir_ + "/hot_shared_";
+  db_options_.env->CreateDirIfMissing(log_dir);
+  std::string log_path = log_dir + "/gdct.log";
+
+  EnvOptions env_options;
+  Status s = db_options_.env->ReopenWritableFile(log_path, &gdct_log_writer_, env_options);
+  if (s.IsNotSupported()) {
+      std::cout << "[HotspotManager] ReopenWritableFile is not supported, using NewWritableFile" << std::endl;
+      // In a real environment fallback would go here depending on FS
+  }
+  if (!s.ok()) {
+    ROCKS_LOG_ERROR(db_options_.info_log, 
+                    "[HotspotManager] Failed to open GDCT log file: %s", s.ToString().c_str());
+  }
+  return s;
+}
+
+Status HotspotManager::FlushGDCTLogBuffer() {
+  std::vector<std::pair<uint64_t, SequenceNumber>> local_buffer;
+  {
+    std::lock_guard<std::mutex> lock(gdct_append_mutex_);
+    if (gdct_append_buffer_.empty()) return Status::OK();
+    local_buffer = std::move(gdct_append_buffer_);
+  }
+
+  std::lock_guard<std::mutex> lock(gdct_log_mutex_);
+  if (!gdct_log_writer_) {
+    InitGDCTLog();
+    if (!gdct_log_writer_) return Status::IOError("No GDCT log writer");
+  }
+
+  Status s;
+  for (const auto& record : local_buffer) {
+    char buffer[16];
+    EncodeFixed64(buffer, record.first);
+    EncodeFixed64(buffer + 8, record.second);
+    s = gdct_log_writer_->Append(Slice(buffer, 16));
+    if (!s.ok()) break;
+  }
+  
+  if (s.ok()) {
+    s = gdct_log_writer_->Sync();
+  }
+  return s;
+}
+
+Status HotspotManager::PersistDelete(uint64_t cuid, SequenceNumber seq, bool sync) {
+  if (sync) {
+    // 同步写
+    FlushGDCTLogBuffer(); // 先刷掉积压的
+    std::lock_guard<std::mutex> lock(gdct_log_mutex_);
+    if (!gdct_log_writer_) InitGDCTLog();
+    if (!gdct_log_writer_) return Status::IOError("No GDCT log writer");
+    
+    char buffer[16];
+    EncodeFixed64(buffer, cuid);
+    EncodeFixed64(buffer + 8, seq);
+    Status s = gdct_log_writer_->Append(Slice(buffer, 16));
+    if (s.ok()) s = gdct_log_writer_->Sync();
+    return s;
+  } else {
+    // 异步写 加到内存缓冲，后续由后台线程或定量触发
+    std::lock_guard<std::mutex> lock(gdct_append_mutex_);
+    gdct_append_buffer_.push_back({cuid, seq});
+    return Status::OK();
+  }
+}
+
+void HotspotManager::RecoverGDCT() {
+  std::string log_dir = data_dir_ + "/hot_shared_";
+  std::string log_path = log_dir + "/gdct.log";
+  std::unique_ptr<SequentialFile> file;
+  EnvOptions env_options;
+  
+  Status s = db_options_.env->NewSequentialFile(log_path, &file, env_options);
+  if (!s.ok()) {
+    if (s.IsNotFound()) {
+      return; // 没有日志文件是正常的
+    }
+    ROCKS_LOG_WARN(db_options_.info_log, 
+                   "[HotspotManager] Failed to open GDCT log for recovery: %s", s.ToString().c_str());
+    return;
+  }
+
+  size_t recovered_count = 0;
+  char buffer[16];
+  Slice result;
+
+  while (true) {
+    s = file->Read(16, &result, buffer);
+    if (!s.ok() || result.size() < 16) {
+      break; 
+    }
+
+    uint64_t cuid = DecodeFixed64(result.data());
+    SequenceNumber seq = DecodeFixed64(result.data() + 8);
+
+    delete_table_.MarkDeleted(cuid, seq);
+    recovered_count++;
+  }
+
+  ROCKS_LOG_INFO(db_options_.info_log, 
+                 "[HotspotManager] Recovered %zu CUID delete records from GDCT log.", recovered_count);
+}
+
+void HotspotManager::CompactAndFlushGDCTLogIfNeeded() {
+  // 1. 先把没写入文件的缓存冲下去
+  FlushGDCTLogBuffer();
+
+  // 2. 检查文件大小进行重写
+  std::string log_dir = data_dir_ + "/hot_shared_";
+  std::string log_path = log_dir + "/gdct.log";
+
+  uint64_t file_size = 0;
+  Status s = db_options_.env->GetFileSize(log_path, &file_size);
+  if (!s.ok() || file_size < 32 * 1024 * 1024) { // 32 MB
+    return;
+  }
+
+  ROCKS_LOG_INFO(db_options_.info_log, 
+                 "[HotspotManager] GDCT log size %" PRIu64 " bytes, starting compaction.", file_size);
+
+  std::string new_log_path = log_dir + "/gdct.log.new";
+  std::unique_ptr<WritableFile> new_writer;
+  EnvOptions env_options;
+  s = db_options_.env->NewWritableFile(new_log_path, &new_writer, env_options);
+  if (!s.ok()) return;
+
+  auto deleted_cuids = delete_table_.GetAllDeletedCuids();
+  
+  for (const auto& pair : deleted_cuids) {
+    char buffer[16];
+    EncodeFixed64(buffer, pair.first);
+    EncodeFixed64(buffer + 8, pair.second);
+    s = new_writer->Append(Slice(buffer, 16));
+    if (!s.ok()) break;
+  }
+
+  if (s.ok()) s = new_writer->Sync();
+  if (s.ok()) s = new_writer->Close(); else new_writer->Close();
+
+  if (s.ok()) {
+    std::lock_guard<std::mutex> lock(gdct_log_mutex_);
+    if (gdct_log_writer_) {
+      gdct_log_writer_->Close();
+      gdct_log_writer_.reset(); 
+    }
+    s = db_options_.env->RenameFile(new_log_path, log_path);
+    if (s.ok()) {
+      db_options_.env->ReopenWritableFile(log_path, &gdct_log_writer_, env_options);
+      ROCKS_LOG_INFO(db_options_.info_log, "[HotspotManager] Successfully compacted GDCT log.");
+    }
+  }
 }
 
 std::string HotspotManager::GenerateSstFileName(uint64_t cuid) {
