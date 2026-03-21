@@ -14,6 +14,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/sst_file_writer.h"
 #include "db/dbformat.h"
+#include "util/extract_cuid.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -309,6 +310,7 @@ void HotspotManager::TriggerBufferFlush() {
   }
 }
 
+
 void HotspotManager::FinalizeScanAsCompaction(
     uint64_t cuid, const std::unordered_set<uint64_t>& visited_files) {
   if (cuid == 0) return;
@@ -345,6 +347,8 @@ void HotspotManager::FinalizeScanAsCompaction(
     return;
   }
 
+  // 这次 scan 可能存在数据还在 buffer 没刷新
+  // 如果 buffer 中有数据，尝试获取边界 key 作为待 promote 的内存段的 key 范围，插入到 final_segments 中，等待 PromoteSnapshot 替换
   // tail segment, PromoteSnapshot()填充具体值
   std::string min_key, max_key;
   if (buffer_.GetBoundaryKeys(cuid, &min_key, &max_key, internal_comparator_)) {
@@ -376,6 +380,23 @@ void HotspotManager::FinalizeScanAsCompaction(
                    PRIu64 " skipped: final_segments is empty.",
                    cuid);
     return;
+  }
+
+  // 验证拼接出来的 final_segments 是不是重叠的
+  if (final_segments.size() > 1) {
+    for (size_t i = 0; i < final_segments.size() - 1; ++i) {
+      if (final_segments[i].file_number == static_cast<uint64_t>(-1) ||
+          final_segments[i+1].file_number == static_cast<uint64_t>(-1)) {
+          
+        std::string s1_end = FormatKeyDisplay(final_segments[i].last_key);
+        std::string s2_start = FormatKeyDisplay(final_segments[i+1].first_key);
+        
+        if (s1_end >= s2_start) {
+          fprintf(stderr, "\n[FATAL] FinalizeScanAsCompaction overlapping! SST Ends: %s, Buffer Starts: %s\n", 
+                  s1_end.c_str(), s2_start.c_str());
+        }
+      }
+    }
   }
 
   ROCKS_LOG_INFO(db_options_.info_log,

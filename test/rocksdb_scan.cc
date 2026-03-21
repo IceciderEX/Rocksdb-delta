@@ -32,7 +32,7 @@
 const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_native";
 const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_delta";
 const int kNumThreads = 16;
-const int kTestDurationSec = 300;       // s
+const int kTestDurationSec = 240;       // s
 const int kNumCuids = 100000;           // 10W CUID 总库
 const int kBatchSize = 128;             // 每次 Put 128 行
 const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (约 25,600 行)
@@ -123,11 +123,12 @@ class PerfRunner {
     std::vector<CuidState> active_cuids;
     std::deque<std::pair<uint64_t, int>> pending_deletes;
     
-    // === 极限拉长生命周期 ===
-    // 50个交替活跃 + 50个延迟删除 = 单线程维持100个存活CUID。
-    // 16线程全局共有 1600 个未死亡 CUID 撑爆内存和L0，强制推入 L2/L3。
-    const size_t kMaxActiveCuids = 50;   
-    const size_t kDeleteWindowSize = 50; 
+    // === 调整生命周期参数 ===
+    // 之前设置了 50+50 导致240秒内根本填不满滑动窗口，没触发删除
+    // 现在调整为：并发25个活跃 + 10个等待删除 = 35个/线程
+    // 16线程全局共有约 560 个 CUID，超过 1GB 数据，足以压入 L1/L2
+    const size_t kMaxActiveCuids = 25;   
+    const size_t kDeleteWindowSize = 10; 
 
     auto add_new_cuid = [&]() {
       uint64_t cuid = next_cuid_->fetch_add(1);
@@ -203,11 +204,15 @@ class PerfRunner {
       }
     }
 
-    // 线程退出前清理剩余
-    while (!pending_deletes.empty()) {
-      auto oldest = pending_deletes.front();
-      pending_deletes.pop_front();
-      DoDelete(oldest.first, oldest.second, stats);
+    // 线程退出前，如果时间已经到了 (stop->load() 为 true)
+    // 那么直接放弃收尾清理 pending_deletes，以避免测试停滞无法结束。
+    // 在真实应用中系统退出也不需要把全部数据删掉。
+    if (!stop->load()) {
+      while (!pending_deletes.empty()) {
+        auto oldest = pending_deletes.front();
+        pending_deletes.pop_front();
+        DoDelete(oldest.first, oldest.second, stats);
+      }
     }
   }
 
@@ -372,6 +377,7 @@ int main() {
   };
 
   run_benchmark(kDeltaDBPath, true, "DELTA MODE");
+  // 70w
   run_benchmark(kNativeDBPath, false, "NATIVE MODE");
 
   return 0;

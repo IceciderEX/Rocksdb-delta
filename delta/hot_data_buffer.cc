@@ -243,6 +243,12 @@ InternalIterator* HotDataBuffer::NewIterator(
             [icmp](const HotEntry& a, const HotEntry& b) {
               return icmp->Compare(Slice(a.key), Slice(b.key)) < 0;
             });
+  // // 需要进行重复检查，防止 dbiter 报错
+  // auto last = std::unique(filtered_entries.begin(), filtered_entries.end(),
+  //                         [icmp](const HotEntry& a, const HotEntry& b) {
+  //                           return icmp->Compare(Slice(a.key), Slice(b.key)) == 0;
+  //                         });
+  // filtered_entries.erase(last, filtered_entries.end());
 
   return new HotDataBufferIterator(std::move(filtered_entries), icmp);
 }

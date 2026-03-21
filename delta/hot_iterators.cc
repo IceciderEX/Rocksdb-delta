@@ -12,14 +12,7 @@
 #endif
 
 namespace ROCKSDB_NAMESPACE {
-
-std::string FormatKeyDisplay(const Slice& key) {
-  std::string cuid_part =
-      std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
-  std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
-  return cuid_part + "..." + suffix;
-}
-
+  
 static FileMetaData MakeFileMetaFromSegment(const DataSegment& seg, bool is_delta = true) {
   FileMetaData meta;
   // file_number, path_id=0, file_size
@@ -164,9 +157,22 @@ bool HotSnapshotIterator::InitIterForSegment(size_t index) {
     if (!mem_iter->Valid()) {
       HotIndexEntry latest_entry;
       if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry) && latest_entry.HasSnapshot()) {
-        segments_ = latest_entry.snapshot_segments;
-        delete mem_iter;
-        return true;  // index again
+        bool snapshot_changed = false;
+        if (segments_.size() != latest_entry.snapshot_segments.size()) {
+           snapshot_changed = true;
+        } else {
+           for (size_t i = 0; i < segments_.size(); ++i) {
+               if (segments_[i].file_number != latest_entry.snapshot_segments[i].file_number) {
+                   snapshot_changed = true;
+                   break;
+               }
+           }
+        }
+        if (snapshot_changed) {
+          segments_ = latest_entry.snapshot_segments;
+          delete mem_iter;
+          return true;  // index again
+        }
       }
     }
 
@@ -255,14 +261,42 @@ void HotSnapshotIterator::Seek(const Slice& target) {
 void HotSnapshotIterator::Next() {
   if (!current_iter_) return;
 
+  std::string prev_key_debug = key().ToString();
+
   current_iter_->Next();
 
   if (!Valid()) {
     // 当前 Segment 耗尽(或越界)，切换到下一个
+    int old_segment = current_segment_index_;
     SwitchToNextSegment();
     if (Valid()) {
       current_iter_->Seek(segments_[current_segment_index_].first_key);
     }
+    
+    // // Debug 打印跨段情况，捕捉跨段回退
+    // if (Valid() && icmp_.Compare(Slice(prev_key_debug), key()) > 0) {
+    //   fprintf(stderr, "[FATAL] HotSnapshotIterator Regression across segment!\n");
+    //   fprintf(stderr, "Prev: %s", FormatKeyDisplay(prev_key_debug).c_str());
+    //   fprintf(stderr, "Curr: %s", FormatKeyDisplay(key()).c_str());
+    //   fprintf(stderr, "Old Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
+    //           segments_[old_segment].file_number,
+    //           FormatKeyDisplay(segments_[old_segment].first_key).c_str(),
+    //           FormatKeyDisplay(segments_[old_segment].last_key).c_str());
+    //   fprintf(stderr, "New Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
+    //           segments_[current_segment_index_].file_number,
+    //           FormatKeyDisplay(segments_[current_segment_index_].first_key).c_str(),
+    //           FormatKeyDisplay(segments_[current_segment_index_].last_key).c_str());
+    //   fprintf(stderr, "Old Segment: %d, New Segment: %d\n", old_segment, current_segment_index_);
+    //   assert(true);
+    // }
+  } else {
+    // Debug 打印同段情况，捕捉同段回退
+    // if (icmp_.Compare(Slice(prev_key_debug), key()) >= 0) {
+    //   fprintf(stderr, "Prev: %s", FormatKeyDisplay(prev_key_debug).c_str());
+    //   fprintf(stderr, "Curr: %s", FormatKeyDisplay(key()).c_str());
+    //   fprintf(stderr, "[FATAL] HotSnapshotIterator Regression within segment %d!\n", current_segment_index_);
+    //   assert(true);
+    // }
   }
 }
 

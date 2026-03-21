@@ -82,7 +82,7 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
           next_segments.push_back(right_seg);
         }
       } else {
-        next_segments.push_back(seg);
+        next_segments.push_back(seg); // 
       }
     } else {
       next_segments.push_back(seg);
@@ -336,6 +336,7 @@ void HotIndexTable::ReplaceOverlappingSegments(
     std::string new_end = ExtractUserKey(new_segment.last_key).ToString();
 
     // 判定与new snapshot相关的snapshot -> !(End < New.Start || Start > New.End)
+    // 先将原先的 snapshots 进行分割+排序
     for (auto it = snapshots.begin(); it != snapshots.end(); ++it) {
       std::string seg_start = ExtractUserKey(it->first_key).ToString();
       std::string seg_end = ExtractUserKey(it->last_key).ToString();
@@ -384,7 +385,7 @@ void HotIndexTable::ReplaceOverlappingSegments(
 
     snapshots = std::move(next_segments);
 
-    // 重新寻找插入位置进行合并相邻的内存段 (-1)
+    // 插入这个新的 buffer snapshot，重新寻找插入位置进行合并相邻的内存段 (-1)
     auto insert_pos = std::find_if(snapshots.begin(), snapshots.end(),
                                    [&](const DataSegment& s) {
                                      return s.first_key == new_segment.first_key &&
@@ -392,7 +393,9 @@ void HotIndexTable::ReplaceOverlappingSegments(
                                             s.file_number == static_cast<uint64_t>(-1);
                                    });
 
-    // 合并相邻的内存段 (-1)
+    // 合并相邻的内存段 (-1)，因为之前切分+排序插入过了
+    // 直接检查前后buffer segment，如果存在就合并成一个更大的 segment
+    // MARK：多个 buffer segment 的情况？
     if (insert_pos != snapshots.end() && insert_pos->file_number == static_cast<uint64_t>(-1)) {
       // 检查后一个
       auto next = std::next(insert_pos);
@@ -402,7 +405,7 @@ void HotIndexTable::ReplaceOverlappingSegments(
           snapshots.erase(next);
         }
       }
-      // 检查前一个 (注意 insert_pos 必须不是 begin)
+      // 检查前一个
       if (insert_pos != snapshots.begin()) {
         auto prev = std::prev(insert_pos);
         if (prev->file_number == static_cast<uint64_t>(-1)) {
