@@ -143,12 +143,22 @@ Status HotspotManager::InitGDCTLog() {
 }
 
 Status HotspotManager::FlushGDCTLogBuffer() {
+  if (pending_gdct_records_.load(std::memory_order_relaxed) == 0) {
+    return Status::OK();
+  }
+
   std::vector<std::pair<uint64_t, SequenceNumber>> local_buffer;
   {
     std::lock_guard<std::mutex> lock(gdct_append_mutex_);
-    if (gdct_append_buffer_.empty()) return Status::OK();
+    if (gdct_append_buffer_.empty()) {
+      pending_gdct_records_.store(0, std::memory_order_relaxed);
+      return Status::OK();
+    }
     local_buffer = std::move(gdct_append_buffer_);
+    pending_gdct_records_.store(0, std::memory_order_relaxed);
   }
+
+  last_gdct_flush_time_us_.store(db_options_.env->NowMicros(), std::memory_order_relaxed);
 
   std::lock_guard<std::mutex> lock(gdct_log_mutex_);
   if (!gdct_log_writer_) {
@@ -186,9 +196,10 @@ Status HotspotManager::PersistDelete(uint64_t cuid, SequenceNumber seq, bool syn
     if (s.ok()) s = gdct_log_writer_->Sync();
     return s;
   } else {
-    // 异步写 加到内存缓冲，后续由后台线程或定量触发
+    // 异步写 加到内存缓冲
     std::lock_guard<std::mutex> lock(gdct_append_mutex_);
     gdct_append_buffer_.push_back({cuid, seq});
+    pending_gdct_records_.fetch_add(1, std::memory_order_relaxed);
     return Status::OK();
   }
 }
@@ -231,8 +242,20 @@ void HotspotManager::RecoverGDCT() {
 }
 
 void HotspotManager::CompactAndFlushGDCTLogIfNeeded() {
-  // 1. 先把没写入文件的缓存冲下去
+  uint64_t now = db_options_.env->NowMicros();
+  
+  // 没有积压数据 && time interval >= 30s
+  if (pending_gdct_records_.load(std::memory_order_relaxed) == 0 && 
+      now - last_gdct_flush_time_us_.load(std::memory_order_relaxed) < 1000000) {
+    return;
+  }
   FlushGDCTLogBuffer();
+  // 检查日志重写 (Compact) && time interval >= 600s
+  if (now - last_gdct_compact_time_us_.load(std::memory_order_relaxed) < 60000000) {
+    return;
+  }
+  last_gdct_compact_time_us_.store(now, std::memory_order_relaxed);
+
   std::string log_dir = data_dir_ + "/hot_shared_";
   std::string log_path = log_dir + "/gdct.log";
 

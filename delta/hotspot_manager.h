@@ -208,6 +208,9 @@ class HotspotManager {
   // Asynchronous extreme performance buffer for deletions
   std::vector<std::pair<uint64_t, SequenceNumber>> gdct_append_buffer_;
   std::mutex gdct_append_mutex_;
+  std::atomic<uint64_t> pending_gdct_records_{0};
+  std::atomic<uint64_t> last_gdct_flush_time_us_{0};
+  std::atomic<uint64_t> last_gdct_compact_time_us_{0};
 
   // 暂存正在进行的 Scan 所生成的 SST 片段
   // FinalizeScanAsCompaction -> IndexTable
@@ -238,6 +241,11 @@ class HotspotManager {
 
   // 检查是否有待处理的 Partial Merge 任务
   bool HasPendingPartialMerge() const;
+
+  // 检查是否有待刷盘的 GDCT 日志 (轻量级原子检查)
+  bool HasPendingGDCTFlush() const {
+    return pending_gdct_records_.load(std::memory_order_relaxed) > 0;
+  }
 
   // 取出一个待处理的 Partial Merge 任务 (供 db_impl 调用)
   bool PopPendingPartialMerge(PartialMergePendingTask* task);
