@@ -2,6 +2,7 @@ make_config.mk
 rocksdb.pc
 db_tmp/
 .agents
+.github
 
 *.a
 *.arc

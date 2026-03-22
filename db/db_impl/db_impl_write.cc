@@ -95,15 +95,13 @@ Status DBImpl::Delete(const WriteOptions& write_options,
   if (hotspot_manager_) {
     uint64_t cuid = hotspot_manager_->ExtractCUID(key);
     if (cuid != 0 && hotspot_manager_->GetDeleteTable().IsTracked(cuid)) {
-        SequenceNumber seq = versions_->FetchAddLastAllocatedSequence(1) + 1;
-        Status ds = hotspot_manager_->InterceptDelete(key, seq, write_options.sync);
-        if (!ds.IsNotSupported()) {
-          if (ds.ok()) {
-            versions_->SetLastSequence(seq);
-            versions_->SetLastPublishedSequence(seq);
-          }
-          return ds;
-        }
+      // 因为 delta merge 操作之前都不会再有 scan/put
+      // 这里直接取当前最新的 seq 号作为 delete 的 seq 号作为标记  
+      SequenceNumber seq = versions_->LastSequence();
+      Status ds = hotspot_manager_->InterceptDelete(key, seq, write_options.sync);
+      if (!ds.IsNotSupported()) {
+        return ds;
+      }
     }
   }
   return DB::Delete(write_options, column_family, key);
@@ -120,13 +118,11 @@ Status DBImpl::Delete(const WriteOptions& write_options,
   if (hotspot_manager_) {
     uint64_t cuid = hotspot_manager_->ExtractCUID(key);
     if (cuid != 0 && hotspot_manager_->GetDeleteTable().IsTracked(cuid)) {
-        SequenceNumber seq = versions_->FetchAddLastAllocatedSequence(1) + 1;
+        // 因为 delta merge 操作之前都不会再有 scan/put
+        // 这里直接取当前最新的 seq 号作为 delete 的 seq 号作为标记
+        SequenceNumber seq = versions_->LastSequence();
         Status ds = hotspot_manager_->InterceptDelete(key, seq, write_options.sync);
         if (!ds.IsNotSupported()) {
-          if (ds.ok()) {
-            versions_->SetLastSequence(seq);
-            versions_->SetLastPublishedSequence(seq);
-          }
           return ds;
         }
     }

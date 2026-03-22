@@ -7,8 +7,12 @@
 #include <unordered_set>
 #include <array>
 #include <atomic>
+#include <vector>
 
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/types.h"
+#include "db/dbformat.h"
+
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -16,7 +20,7 @@ struct GDCTEntry {
   std::vector<uint64_t> tracked_phys_ids;
   int32_t ref_count = 0;
   // Use atomic 
-  std::atomic<SequenceNumber> deleted_at_seqno{kMaxSequenceNumber};
+  mutable std::atomic<SequenceNumber> deleted_at_seqno{kMaxSequenceNumber};
 
   int GetRefCount() const { return ref_count; }
 };

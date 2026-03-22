@@ -180,7 +180,8 @@ bool GlobalDeleteCountTable::IsDeleted(uint64_t cuid, SequenceNumber read_seqno)
   std::shared_lock<std::shared_mutex> lock(shard.mutex);
   auto it = shard.table.find(cuid);  
   if (it != shard.table.end()) {
-    return it->second.deleted_at_seqno.load(std::memory_order_acquire) <= read_seqno;
+    SequenceNumber at_seq = it->second.deleted_at_seqno.load(std::memory_order_acquire);
+    return at_seq != kMaxSequenceNumber && at_seq <= read_seqno;
   }
   return false;
 }

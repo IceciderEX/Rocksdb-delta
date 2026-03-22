@@ -482,7 +482,8 @@ void CompactionIterator::CheckHotspotFilters() {
       // c)
       // 当读取到某个CUid的数据时，检查全局CUid删除计数表，若该CUid已被标记为删除，
       // 则直接跳过该段数据，不写入新文件，并减去一次该CUid在计数表中的引用计数
-      if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid)) {
+      // update：MVCC 如果该 CUID 的逻辑删除早于系统当前最老的快照再标记删除？
+      if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid, earliest_snapshot_)) {
         skip_current_cuid_ = true;
       } 
       // d) 检查热点索引表（仅判断当前文件 id）

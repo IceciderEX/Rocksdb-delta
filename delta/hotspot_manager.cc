@@ -26,7 +26,7 @@ HotspotManager::HotspotManager(const Options& db_options,
       internal_comparator_(internal_comparator),
       lifecycle_manager_(std::make_shared<HotSstLifecycleManager>(db_options)),
       index_table_(lifecycle_manager_),
-      frequency_table_(200, 600) { // count set
+      frequency_table_(3, 600) { // count set
   db_options_.env->CreateDirIfMissing(data_dir_);
 
   // 恢复之前因为宕机等原因遗留的 GDCT 逻辑删除记录
@@ -115,10 +115,8 @@ Status HotspotManager::InterceptDelete(const Slice& key, SequenceNumber seq, boo
       // 第一次 delete
       return PersistDelete(cuid, seq, sync);
     }
-    // 已经删除过
     return Status::OK();
   }
-
   // CUID 不在热点管理范围内
   return Status::NotSupported("Not a hot CUID");
 }
@@ -235,8 +233,6 @@ void HotspotManager::RecoverGDCT() {
 void HotspotManager::CompactAndFlushGDCTLogIfNeeded() {
   // 1. 先把没写入文件的缓存冲下去
   FlushGDCTLogBuffer();
-
-  // 2. 检查文件大小进行重写
   std::string log_dir = data_dir_ + "/hot_shared_";
   std::string log_path = log_dir + "/gdct.log";
 

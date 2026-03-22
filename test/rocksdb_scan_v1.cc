@@ -10,7 +10,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
-#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -24,7 +23,6 @@
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/write_batch.h"
-#include "rocksdb/statistics.h"
 
 // ==========================================
 // 配置常量
@@ -32,7 +30,7 @@
 const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_native";
 const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_delta";
 const int kNumThreads = 16;
-const int kTestDurationSec = 240;       // s
+const int kTestDurationSec = 240;       // 8 分钟
 const int kNumCuids = 100000;           // 10W CUID 总库
 const int kBatchSize = 128;             // 每次 Put 128 行
 const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (约 25,600 行)
@@ -111,8 +109,6 @@ class PerfRunner {
     std::default_random_engine gen(thread_id + static_cast<int>(time(0)));
     std::uniform_real_distribution<double> dist(0.0, 1.0);
     rocksdb::ReadOptions read_opts;
-    std::deque<std::pair<uint64_t, int>> pending_deletes;
-    const size_t kDeleteWindowSize = 15; // 维持15个CUID不释放
 
     while (!stop->load()) {
       // 1. 领取一个全新的 CUID
@@ -158,28 +154,12 @@ class PerfRunner {
 
       // 4. 终结清理：最后一次 Full Scan -> 逐一物理删除
       int final_rows = puts_done * kBatchSize;
-      int final_scan_count = DoScan(cuid, final_rows, true, read_opts, stats);
-      if (final_scan_count != final_rows) {
-        std::cerr << "[ERROR] Thread " << thread_id << " - CUID " << cuid 
-                  << " final full scan mismatch! Expected: " << final_rows 
-                  << ", Actual: " << final_scan_count << std::endl;
-      }
-      
-      // === 核心修改：滑动窗口延迟删除 ===
-      // 把 CUID 放入等待队列，而不是立刻删除，保证它有寿命被刷入 L1、L2
-      pending_deletes.push_back({cuid, final_rows});
-      if (pending_deletes.size() > kDeleteWindowSize) {
-        auto oldest = pending_deletes.front();
-        pending_deletes.pop_front();
-        DoDelete(oldest.first, oldest.second, stats);
-      }
-    }
+      DoScan(cuid, final_rows, true, read_opts, stats);
+      DoDelete(cuid, final_rows, stats);
 
-    // 线程退出前，清空排队等待删除的 CUID
-    while (!pending_deletes.empty()) {
-      auto oldest = pending_deletes.front();
-      pending_deletes.pop_front();
-      DoDelete(oldest.first, oldest.second, stats);
+      // std::cout << "[Thread " << thread_id << "] Completed CUID " << cuid
+      //           << " (Rows: " << final_rows << ", Scans: " << scans_done
+      //           << ", Hot: " << is_hot << ")" << std::endl;
     }
   }
 
@@ -187,7 +167,7 @@ class PerfRunner {
   void DoPut(uint64_t cuid, int start_row, ThreadStats* stats) {
     rocksdb::WriteBatch batch;
     for (int i = 0; i < kBatchSize; ++i) {
-      batch.Put(GenerateKey(cuid, start_row + i), "value_data_payload_xxxxxxxxxxxxxxxxxxxx");
+      batch.Put(GenerateKey(cuid, start_row + i), "value_data_payload_xxxxxxx");
     }
     auto start = std::chrono::high_resolution_clock::now();
     rocksdb::Status s = db_->Write(rocksdb::WriteOptions(), &batch);
@@ -285,11 +265,10 @@ int main() {
   auto run_benchmark = [&](const std::string& path, bool delta_enabled, const std::string& label) {
     rocksdb::Options options;
     options.create_if_missing = true;
-    options.statistics = rocksdb::CreateDBStatistics();
     
     if (delta_enabled) {
       options.enable_delta = true;
-      // options.disable_auto_compactions = true;
+      options.disable_auto_compactions = true;
       options.num_levels = 1;
       options.level0_file_num_compaction_trigger = 20;
       options.level_compaction_dynamic_level_bytes = false;
@@ -323,23 +302,6 @@ int main() {
     for (auto& t : workers) t.join();
 
     ReportStats(label, all_thread_stats);
-    
-    // Output comprehensive DB statistics
-    std::string stats;
-    if (db->GetProperty(rocksdb::DB::Properties::kStats, &stats)) {
-      std::cout << "\n=== DB Statistics for " << label << " ===\n";
-      std::cout << stats << std::endl;
-      std::cout << "=====================================\n";
-    }
-
-    // Output Level Stats clearly
-    std::string level_stats;
-    if (db->GetProperty(rocksdb::DB::Properties::kLevelStats, &level_stats)) {
-      std::cout << "\n=== Level File Count Statistics (" << label << ") ===\n";
-      std::cout << level_stats << std::endl;
-      std::cout << "=====================================\n";
-    }
-
     delete db;
   };
 
