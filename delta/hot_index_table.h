@@ -37,7 +37,7 @@ class HotIndexTable {
  public:
   explicit HotIndexTable(
       std::shared_ptr<HotSstLifecycleManager> lifecycle_manager,
-      Logger* info_log = nullptr)
+      std::shared_ptr<Logger> info_log = nullptr)
       : lifecycle_manager_(lifecycle_manager), info_log_(info_log) {}
 
   void UpdateSnapshot(uint64_t cuid,
@@ -111,7 +111,7 @@ class HotIndexTable {
 
   std::array<Shard, kNumShards> shards_;
   std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
-  Logger* info_log_;
+  std::shared_ptr<Logger> info_log_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

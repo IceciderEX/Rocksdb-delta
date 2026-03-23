@@ -457,7 +457,7 @@ Status HotspotManager::FlushBlockToSharedSST(
 
 void HotspotManager::TriggerBufferFlush() {
   // 防止多次 flush 
-  std::lock_guard<std::mutex> lock(flush_mutex_);
+  std::lock_guard<std::mutex> flush_lock(flush_mutex_);
   // 轮转 Buffer，传入 InternalKeyComparator 保证排序严格有序
   if (!buffer_.RotateBuffer(internal_comparator_)) {
     return;
@@ -631,7 +631,7 @@ void HotspotManager::FinalizeScanAsCompaction(
         std::string s2_start =
             FormatKeyDisplay(final_segments[i + 1].first_key);
 
-        if (s1_end >= s2_start) {
+        if (s1_end > s2_start) {
           fprintf(stderr,
                   "\n[FATAL] FinalizeScanAsCompaction overlapping! SST Ends: "
                   "%s, Buffer Starts: %s\n",
