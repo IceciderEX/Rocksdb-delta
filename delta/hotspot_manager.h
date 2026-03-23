@@ -204,7 +204,8 @@ class HotspotManager {
   GlobalDeleteCountTable delete_table_;
 
   std::unique_ptr<WritableFile> gdct_log_writer_;
-  std::mutex gdct_log_mutex_;
+  mutable std::mutex gdct_log_mutex_;
+  mutable std::mutex flush_mutex_;  // 新增：保证 TriggerBufferFlush 线程安全
   
   // Asynchronous extreme performance buffer for deletions
   std::vector<std::pair<uint64_t, SequenceNumber>> gdct_append_buffer_;

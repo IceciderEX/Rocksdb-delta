@@ -6,13 +6,13 @@
 #include "delta/hotspot_manager.h"
 
 #include <chrono>
-#include <sstream>
 #include <cinttypes>
+#include <sstream>
 
+#include "db/dbformat.h"
 #include "logging/logging.h"
 #include "port/port.h"
 #include "rocksdb/env.h"
-#include "db/dbformat.h"
 #include "util/coding.h"
 #include "util/extract_cuid.h"
 
@@ -26,7 +26,7 @@ HotspotManager::HotspotManager(const Options& db_options,
       internal_comparator_(internal_comparator),
       lifecycle_manager_(std::make_shared<HotSstLifecycleManager>(db_options)),
       index_table_(lifecycle_manager_, db_options_.info_log),
-      frequency_table_(3, 600) { // count set
+      frequency_table_(3, 600) {  // count set
   db_options_.env->CreateDirIfMissing(data_dir_);
 
   // 恢复之前因为宕机等原因遗留的 GDCT 逻辑删除记录
@@ -34,8 +34,6 @@ HotspotManager::HotspotManager(const Options& db_options,
   // 初始化持久化日志 AppendableWriter
   InitGDCTLog();
 }
-
-
 
 uint64_t HotspotManager::ExtractCUID(const Slice& key) {
   // TODO: 根据实际的 Key Schema提取 cuid，这里先假设一波
@@ -107,7 +105,8 @@ bool HotspotManager::PrepareForFullReplace(uint64_t cuid) {
   return true;
 }
 
-Status HotspotManager::InterceptDelete(const Slice& key, SequenceNumber seq, bool sync) {
+Status HotspotManager::InterceptDelete(const Slice& key, SequenceNumber seq,
+                                       bool sync) {
   uint64_t cuid = ExtractCUID(key);
   if (cuid == 0) return Status::NotSupported("CUID not found");
 
@@ -135,14 +134,18 @@ Status HotspotManager::InitGDCTLog() {
   std::string log_path = log_dir + "/gdct.log";
 
   EnvOptions env_options;
-  Status s = db_options_.env->ReopenWritableFile(log_path, &gdct_log_writer_, env_options);
+  Status s = db_options_.env->ReopenWritableFile(log_path, &gdct_log_writer_,
+                                                 env_options);
   if (s.IsNotSupported()) {
-      std::cout << "[HotspotManager] ReopenWritableFile is not supported, using NewWritableFile" << std::endl;
-      // In a real environment fallback would go here depending on FS
+    std::cout << "[HotspotManager] ReopenWritableFile is not supported, using "
+                 "NewWritableFile"
+              << std::endl;
+    // In a real environment fallback would go here depending on FS
   }
   if (!s.ok()) {
-    ROCKS_LOG_ERROR(db_options_.info_log, 
-                    "[HotspotManager] Failed to open GDCT log file: %s", s.ToString().c_str());
+    ROCKS_LOG_ERROR(db_options_.info_log,
+                    "[HotspotManager] Failed to open GDCT log file: %s",
+                    s.ToString().c_str());
   }
   return s;
 }
@@ -163,7 +166,8 @@ Status HotspotManager::FlushGDCTLogBuffer() {
     pending_gdct_records_.store(0, std::memory_order_relaxed);
   }
 
-  last_gdct_flush_time_us_.store(db_options_.env->NowMicros(), std::memory_order_relaxed);
+  last_gdct_flush_time_us_.store(db_options_.env->NowMicros(),
+                                 std::memory_order_relaxed);
 
   std::lock_guard<std::mutex> lock(gdct_log_mutex_);
   if (!gdct_log_writer_) {
@@ -179,21 +183,22 @@ Status HotspotManager::FlushGDCTLogBuffer() {
     s = gdct_log_writer_->Append(Slice(buffer, 16));
     if (!s.ok()) break;
   }
-  
+
   if (s.ok()) {
     s = gdct_log_writer_->Sync();
   }
   return s;
 }
 
-Status HotspotManager::PersistDelete(uint64_t cuid, SequenceNumber seq, bool sync) {
+Status HotspotManager::PersistDelete(uint64_t cuid, SequenceNumber seq,
+                                     bool sync) {
   if (sync) {
     // 同步写
-    FlushGDCTLogBuffer(); // 先刷掉积压的
+    FlushGDCTLogBuffer();  // 先刷掉积压的
     std::lock_guard<std::mutex> lock(gdct_log_mutex_);
     if (!gdct_log_writer_) InitGDCTLog();
     if (!gdct_log_writer_) return Status::IOError("No GDCT log writer");
-    
+
     char buffer[16];
     EncodeFixed64(buffer, cuid);
     EncodeFixed64(buffer + 8, seq);
@@ -214,14 +219,15 @@ void HotspotManager::RecoverGDCT() {
   std::string log_path = log_dir + "/gdct.log";
   std::unique_ptr<SequentialFile> file;
   EnvOptions env_options;
-  
+
   Status s = db_options_.env->NewSequentialFile(log_path, &file, env_options);
   if (!s.ok()) {
     if (s.IsNotFound()) {
-      return; // 没有日志文件是正常的
+      return;  // 没有日志文件是正常的
     }
-    ROCKS_LOG_WARN(db_options_.info_log, 
-                   "[HotspotManager] Failed to open GDCT log for recovery: %s", s.ToString().c_str());
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "[HotspotManager] Failed to open GDCT log for recovery: %s",
+                   s.ToString().c_str());
     return;
   }
 
@@ -232,7 +238,7 @@ void HotspotManager::RecoverGDCT() {
   while (true) {
     s = file->Read(16, &result, buffer);
     if (!s.ok() || result.size() < 16) {
-      break; 
+      break;
     }
 
     uint64_t cuid = DecodeFixed64(result.data());
@@ -242,21 +248,25 @@ void HotspotManager::RecoverGDCT() {
     recovered_count++;
   }
 
-  ROCKS_LOG_INFO(db_options_.info_log, 
-                 "[HotspotManager] Recovered %zu CUID delete records from GDCT log.", recovered_count);
+  ROCKS_LOG_INFO(
+      db_options_.info_log,
+      "[HotspotManager] Recovered %zu CUID delete records from GDCT log.",
+      recovered_count);
 }
 
 void HotspotManager::CompactAndFlushGDCTLogIfNeeded() {
-  uint64_t now = db_options_.env->NowMicros(); 
-  
+  uint64_t now = db_options_.env->NowMicros();
+
   // 没有积压数据 && time interval >= 30s
-  if (pending_gdct_records_.load(std::memory_order_relaxed) == 0 && 
-      now - last_gdct_flush_time_us_.load(std::memory_order_relaxed) < 1000000) {
+  if (pending_gdct_records_.load(std::memory_order_relaxed) == 0 &&
+      now - last_gdct_flush_time_us_.load(std::memory_order_relaxed) <
+          1000000) {
     return;
   }
   FlushGDCTLogBuffer();
   // 检查日志重写 (Compact) && time interval >= 600s
-  if (now - last_gdct_compact_time_us_.load(std::memory_order_relaxed) < 60000000) {
+  if (now - last_gdct_compact_time_us_.load(std::memory_order_relaxed) <
+      60000000) {
     return;
   }
   last_gdct_compact_time_us_.store(now, std::memory_order_relaxed);
@@ -266,12 +276,14 @@ void HotspotManager::CompactAndFlushGDCTLogIfNeeded() {
 
   uint64_t file_size = 0;
   Status s = db_options_.env->GetFileSize(log_path, &file_size);
-  if (!s.ok() || file_size < 32 * 1024 * 1024) { // 32 MB
+  if (!s.ok() || file_size < 32 * 1024 * 1024) {  // 32 MB
     return;
   }
 
-  ROCKS_LOG_INFO(db_options_.info_log, 
-                 "[HotspotManager] GDCT log size %" PRIu64 " bytes, starting compaction.", file_size);
+  ROCKS_LOG_INFO(db_options_.info_log,
+                 "[HotspotManager] GDCT log size %" PRIu64
+                 " bytes, starting compaction.",
+                 file_size);
 
   std::string new_log_path = log_dir + "/gdct.log.new";
   std::unique_ptr<WritableFile> new_writer;
@@ -280,7 +292,7 @@ void HotspotManager::CompactAndFlushGDCTLogIfNeeded() {
   if (!s.ok()) return;
 
   auto deleted_cuids = delete_table_.GetAllDeletedCuids();
-  
+
   for (const auto& pair : deleted_cuids) {
     char buffer[16];
     EncodeFixed64(buffer, pair.first);
@@ -290,18 +302,23 @@ void HotspotManager::CompactAndFlushGDCTLogIfNeeded() {
   }
 
   if (s.ok()) s = new_writer->Sync();
-  if (s.ok()) s = new_writer->Close(); else new_writer->Close();
+  if (s.ok())
+    s = new_writer->Close();
+  else
+    new_writer->Close();
 
   if (s.ok()) {
     std::lock_guard<std::mutex> lock(gdct_log_mutex_);
     if (gdct_log_writer_) {
       gdct_log_writer_->Close();
-      gdct_log_writer_.reset(); 
+      gdct_log_writer_.reset();
     }
     s = db_options_.env->RenameFile(new_log_path, log_path);
     if (s.ok()) {
-      db_options_.env->ReopenWritableFile(log_path, &gdct_log_writer_, env_options);
-      ROCKS_LOG_INFO(db_options_.info_log, "[HotspotManager] Successfully compacted GDCT log.");
+      db_options_.env->ReopenWritableFile(log_path, &gdct_log_writer_,
+                                          env_options);
+      ROCKS_LOG_INFO(db_options_.info_log,
+                     "[HotspotManager] Successfully compacted GDCT log.");
     }
   }
 }
@@ -329,7 +346,6 @@ bool HotspotManager::ShouldTriggerScanAsCompaction(uint64_t cuid) {
   }
   return false;
 }
-
 
 Status HotspotManager::FlushBlockToSharedSST(
     std::shared_ptr<HotDataBlock> block,
@@ -366,8 +382,7 @@ Status HotspotManager::FlushBlockToSharedSST(
   if (!s.ok()) {
     ROCKS_LOG_ERROR(db_options_.info_log,
                     "[HotspotManager] Failed to create link %s -> %s: %s",
-                    file_path.c_str(), link_path.c_str(),
-                    s.ToString().c_str());
+                    file_path.c_str(), link_path.c_str(), s.ToString().c_str());
   }
 
   lifecycle_manager_->RegisterFile(file_number, file_path, link_path);
@@ -401,7 +416,7 @@ Status HotspotManager::FlushBlockToSharedSST(
           current_user_key == last_written_key_in_segment) {
         continue;
       }
-      
+
       Slice entry_value(entry.value);
       s = sst_writer.Put(current_user_key_slice, entry_value);
       if (!s.ok()) return s;
@@ -441,6 +456,8 @@ Status HotspotManager::FlushBlockToSharedSST(
 }
 
 void HotspotManager::TriggerBufferFlush() {
+  // 防止多次 flush 
+  std::lock_guard<std::mutex> lock(flush_mutex_);
   // 轮转 Buffer，传入 InternalKeyComparator 保证排序严格有序
   if (!buffer_.RotateBuffer(internal_comparator_)) {
     return;
@@ -479,7 +496,8 @@ void HotspotManager::TriggerBufferFlush() {
           // 无活跃 Scan，尝试 PromoteSnapshot（将 {-1} 内存段替换为真实 SST）
           // 但是 partialMerge 是后台任务，不会进行
           // FinalizeScanAsCompaction，需要考虑
-          bool promoted = index_table_.PromoteSnapshot(cuid, real_segment, &buffer_, internal_comparator_);
+          bool promoted = index_table_.PromoteSnapshot(
+              cuid, real_segment, &buffer_, internal_comparator_);
           if (!promoted) {
             // 既无活跃 Scan 也无 {-1} 段，强制 Append
             ROCKS_LOG_WARN(db_options_.info_log,
@@ -502,14 +520,12 @@ void HotspotManager::TriggerBufferFlush() {
   }
 }
 
-
 void HotspotManager::FinalizeScanAsCompaction(
     uint64_t cuid, const std::unordered_set<uint64_t>& visited_files,
     const std::string& scan_first_key, const std::string& scan_last_key) {
   if (cuid == 0) return;
-  auto unlock_guard = std::shared_ptr<void>(nullptr, [this, cuid](void*) {
-    this->UnlockCuid(cuid);
-  });
+  auto unlock_guard = std::shared_ptr<void>(
+      nullptr, [this, cuid](void*) { this->UnlockCuid(cuid); });
 
   std::vector<DataSegment> final_segments;
 
@@ -520,19 +536,23 @@ void HotspotManager::FinalizeScanAsCompaction(
     if (it != pending_snapshots_.end()) {
       final_segments = std::move(it->second);
       pending_snapshots_.erase(it);
-      
+
       // 处理由于并发或历史 bufferdata 残留的 SST seg 范围重叠问题
-      for (auto seg_it = final_segments.begin(); seg_it != final_segments.end(); ) {
+      for (auto seg_it = final_segments.begin();
+           seg_it != final_segments.end();) {
         // 只以这次 full scan 的 keyrange 为准
-        if (internal_comparator_->Compare(seg_it->first_key, scan_first_key) < 0) {
+        if (internal_comparator_->Compare(seg_it->first_key, scan_first_key) <
+            0) {
           seg_it->first_key = scan_first_key;
         }
-        if (internal_comparator_->Compare(seg_it->last_key, scan_last_key) > 0) {
+        if (internal_comparator_->Compare(seg_it->last_key, scan_last_key) >
+            0) {
           seg_it->last_key = scan_last_key;
         }
-        
+
         // 如果裁剪后发现 seg first >= last，这段 segment 无效
-        if (internal_comparator_->Compare(seg_it->first_key, seg_it->last_key) >= 0) {
+        if (internal_comparator_->Compare(seg_it->first_key,
+                                          seg_it->last_key) >= 0) {
           seg_it = final_segments.erase(seg_it);
         } else {
           ++seg_it;
@@ -554,8 +574,8 @@ void HotspotManager::FinalizeScanAsCompaction(
   // 防止空scan写入snapshot的情况
   if (final_segments.empty() && !has_buffered_data) {
     ROCKS_LOG_INFO(db_options_.info_log,
-                   "[HotspotManager] FinalizeScanAsCompaction for CUID %"
-                   PRIu64 " skipped: no pending SSTs and no buffered data."
+                   "[HotspotManager] FinalizeScanAsCompaction for CUID %" PRIu64
+                   " skipped: no pending SSTs and no buffered data."
                    " (Expected for Metadata Scans)",
                    cuid);
     return;
@@ -571,7 +591,8 @@ void HotspotManager::FinalizeScanAsCompaction(
   }
 
   // 确保拼接逻辑不会发生区间倒置
-  bool has_valid_tail = internal_comparator_->Compare(tail_min, scan_last_key) <= 0;
+  bool has_valid_tail =
+      internal_comparator_->Compare(tail_min, scan_last_key) <= 0;
   if (has_buffered_data && has_valid_tail) {
     DataSegment tail_segment;
     tail_segment.file_number = static_cast<uint64_t>(-1);  // 标记为内存段
@@ -580,11 +601,12 @@ void HotspotManager::FinalizeScanAsCompaction(
 
     final_segments.push_back(tail_segment);
   } else if (!has_valid_tail || !has_buffered_data) {
-    ROCKS_LOG_WARN(db_options_.info_log,
-                   "[HotspotManager] Skipped creating tail segment for CUID %"
-                   PRIu64 ". Has buffered data: %d, valid_tail: %d, Pending SSTs: %zu",
-                   cuid, has_buffered_data ? 1 : 0, has_valid_tail ? 1 : 0,
-                   final_segments.size());
+    ROCKS_LOG_WARN(
+        db_options_.info_log,
+        "[HotspotManager] Skipped creating tail segment for CUID %" PRIu64
+        ". Has buffered data: %d, valid_tail: %d, Pending SSTs: %zu",
+        cuid, has_buffered_data ? 1 : 0, has_valid_tail ? 1 : 0,
+        final_segments.size());
 
     if (final_segments.empty()) {
       return;
@@ -594,8 +616,8 @@ void HotspotManager::FinalizeScanAsCompaction(
   // Only update snapshot if we actually have segments to update with
   if (final_segments.empty()) {
     ROCKS_LOG_INFO(db_options_.info_log,
-                   "[HotspotManager] FinalizeScanAsCompaction for CUID %"
-                   PRIu64 " skipped: final_segments is empty.",
+                   "[HotspotManager] FinalizeScanAsCompaction for CUID %" PRIu64
+                   " skipped: final_segments is empty.",
                    cuid);
     return;
   }
@@ -604,13 +626,15 @@ void HotspotManager::FinalizeScanAsCompaction(
   if (final_segments.size() > 1) {
     for (size_t i = 0; i < final_segments.size() - 1; ++i) {
       if (final_segments[i].file_number == static_cast<uint64_t>(-1) ||
-          final_segments[i+1].file_number == static_cast<uint64_t>(-1)) {
-          
+          final_segments[i + 1].file_number == static_cast<uint64_t>(-1)) {
         std::string s1_end = FormatKeyDisplay(final_segments[i].last_key);
-        std::string s2_start = FormatKeyDisplay(final_segments[i+1].first_key);
-        
+        std::string s2_start =
+            FormatKeyDisplay(final_segments[i + 1].first_key);
+
         if (s1_end >= s2_start) {
-          fprintf(stderr, "\n[FATAL] FinalizeScanAsCompaction overlapping! SST Ends: %s, Buffer Starts: %s\n", 
+          fprintf(stderr,
+                  "\n[FATAL] FinalizeScanAsCompaction overlapping! SST Ends: "
+                  "%s, Buffer Starts: %s\n",
                   s1_end.c_str(), s2_start.c_str());
         }
       }
@@ -618,8 +642,8 @@ void HotspotManager::FinalizeScanAsCompaction(
   }
 
   ROCKS_LOG_INFO(db_options_.info_log,
-                 "[HotspotManager] FinalizeScanAsCompaction for CUID %"
-                 PRIu64 " updating snapshot with %zu segments.",
+                 "[HotspotManager] FinalizeScanAsCompaction for CUID %" PRIu64
+                 " updating snapshot with %zu segments.",
                  cuid, final_segments.size());
 
   // 更新这个 cuid 的 Snapshot
@@ -674,7 +698,8 @@ void HotspotManager::FinalizeScanAsCompactionWithStrategy(
     case ScanAsCompactionStrategy::kNoAction:
       return;
     case ScanAsCompactionStrategy::kFullReplace:
-      FinalizeScanAsCompaction(cuid, visited_files, scan_first_key, scan_last_key);
+      FinalizeScanAsCompaction(cuid, visited_files, scan_first_key,
+                               scan_last_key);
       // std::cout << "[HotspotManager] Finalized CUID " << cuid
       //           << " with FullReplace strategy." << std::endl;
       break;
@@ -739,10 +764,9 @@ void HotspotManager::EnqueueForInitScan(uint64_t cuid) {
     if (c == cuid) return;
   }
   pending_init_cuids_.push_back(cuid);
-  ROCKS_LOG_INFO(db_options_.info_log,
-                 "[HotspotManager] Enqueued CUID %" PRIu64
-                 " for initial full scan",
-                 cuid);
+  ROCKS_LOG_INFO(
+      db_options_.info_log,
+      "[HotspotManager] Enqueued CUID %" PRIu64 " for initial full scan", cuid);
 }
 
 std::vector<uint64_t> HotspotManager::PopPendingInitCuids() {
@@ -799,7 +823,8 @@ void HotspotManager::EnqueuePartialMerge(
   // 避免重复添加相同 cuid 的任务?
   for (auto& task : partial_merge_queue_) {
     if (task.cuid == cuid) {
-      // 已经有一个队列了，暂时忽略本次小的 scan触发，或者也可以用更大的 range更新
+      // 已经有一个队列了，暂时忽略本次小的 scan触发，或者也可以用更大的
+      // range更新
       return;
     }
   }

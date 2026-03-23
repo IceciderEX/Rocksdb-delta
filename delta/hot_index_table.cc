@@ -78,49 +78,37 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   std::string new_start = ExtractUserKey(new_segment.first_key).ToString();
   std::string new_end = ExtractUserKey(new_segment.last_key).ToString();
 
-  // 找到标记为 -1 的内存段，判断是否有重叠，进行 segmentation
   for (const auto& seg : entry.snapshot_segments) {
-    if (seg.file_number == static_cast<uint64_t>(-1)) {
-      std::string seg_start = ExtractUserKey(seg.first_key).ToString();
-      std::string seg_end = ExtractUserKey(seg.last_key).ToString();
+    std::string seg_start_user = ExtractUserKey(seg.first_key).ToString();
+    std::string seg_end_user = ExtractUserKey(seg.last_key).ToString();
 
-      bool is_left = new_end < seg_start;
-      bool is_right = new_start > seg_end;
+    // 检查区间重叠 (UserKey)
+    bool overlaps = !(new_end < seg_start_user || new_start > seg_end_user);
 
-      if (!is_left && !is_right) {
-        found_overlap = true;
-        // buffer segment 比 sst segment 更大的情况
-        // 1. 左侧剩余部分
-        if (icmp->Compare(seg_start, new_start) < 0) {
-          DataSegment left_seg = seg;
-          left_seg.last_key = new_segment.first_key;
-          // 如果 buffer 左侧数据实际存在，加入这个 seg
-          if (HasActualDataInBuffer(cuid, left_seg.first_key, left_seg.last_key, buffer, icmp)) {
-            next_segments.push_back(left_seg);
+    if (overlaps) {
+      found_overlap = true;
+      if (seg.file_number == static_cast<uint64_t>(-1)) {
+        // 内存段：切分并保留剩余部分
+        // 1. 左侧剩余
+        if (icmp->Compare(seg.first_key, new_segment.first_key) < 0) {
+          if (HasActualDataInBuffer(cuid, seg.first_key, new_segment.first_key, buffer, icmp)) {
+            DataSegment left = seg;
+            left.last_key = new_segment.first_key;
+            next_segments.push_back(left);
           }
         }
-
-        // 2. 右侧剩余部分
-        if (icmp->Compare(seg_end, new_end) > 0) {
-          DataSegment right_seg = seg;
-          right_seg.first_key = new_segment.last_key;
-          // 如果 buffer 右侧数据实际存在，加入这个 seg
-          if (HasActualDataInBuffer(cuid, right_seg.first_key, right_seg.last_key, buffer, icmp)) {
-            next_segments.push_back(right_seg);
+        // 2. 右侧剩余
+        if (icmp->Compare(seg.last_key, new_segment.last_key) > 0) {
+          if (HasActualDataInBuffer(cuid, new_segment.last_key, seg.last_key, buffer, icmp)) {
+            DataSegment right = seg;
+            right.first_key = new_segment.last_key;
+            next_segments.push_back(right);
           }
         }
-        // 从物理段 new_segment -> promoted_seg，并指向上面的物理文件
-        // segment range 以物理 sst 为准
-        DataSegment promoted_seg = new_segment;
-        if (new_start < seg_start) {
-             promoted_seg.first_key = seg.first_key; // 砍掉头部并发脏数据
-        }
-        if (new_end > seg_end) {
-             promoted_seg.last_key = seg.last_key;   // 砍掉尾部并发脏数据
-        }
-        next_segments.push_back(promoted_seg);
+        // 该内存段主体被 physical SST 覆盖，不再 push
       } else {
-        next_segments.push_back(seg); // 
+        // 物理段：如果发生重叠，说明新 SST 是该区域的更新/整理，替换掉旧的
+        // 这里直接不 push，由循环外的 new_segment 替代
       }
     } else {
       next_segments.push_back(seg);
@@ -128,6 +116,8 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   }
 
   if (found_overlap) {
+    // 新 SST 只添加一次
+    next_segments.push_back(new_segment);
     // sort segments (Solution G: used icmp for correct internal key order)
     std::sort(next_segments.begin(), next_segments.end(),
               [icmp](const DataSegment& a, const DataSegment& b) {
