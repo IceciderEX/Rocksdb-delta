@@ -73,6 +73,10 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
           DataSegment left_seg = seg;
           left_seg.last_key = new_segment.first_key;
           next_segments.push_back(left_seg);
+          
+          if (info_log_) {
+            ROCKS_LOG_INFO(info_log_, "[HotIndexTable] Buffer snapshot (start: %s) is larger than flushed SST (start: %s). Left remainder created.", seg_start.c_str(), new_start.c_str());
+          }
         }
 
         // 2. 右侧剩余部分
@@ -80,7 +84,21 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
           DataSegment right_seg = seg;
           right_seg.first_key = new_segment.last_key;
           next_segments.push_back(right_seg);
+
+          if (info_log_) {
+            ROCKS_LOG_INFO(info_log_, "[HotIndexTable] Buffer snapshot (end: %s) is larger than flushed SST (end: %s). Right remainder created.", seg_end.c_str(), new_end.c_str());
+          }
         }
+        // 从物理段 new_segment -> promoted_seg，并指向上面的物理文件
+        // segment range 以物理 sst 为准
+        DataSegment promoted_seg = new_segment;
+        if (new_start < seg_start) {
+             promoted_seg.first_key = seg.first_key; // 砍掉头部并发脏数据
+        }
+        if (new_end > seg_end) {
+             promoted_seg.last_key = seg.last_key;   // 砍掉尾部并发脏数据
+        }
+        next_segments.push_back(promoted_seg);
       } else {
         next_segments.push_back(seg); // 
       }
@@ -90,7 +108,6 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   }
 
   if (found_overlap) {
-    next_segments.push_back(new_segment);
     // 重新排序
     std::sort(next_segments.begin(), next_segments.end(),
               [](const DataSegment& a, const DataSegment& b) {

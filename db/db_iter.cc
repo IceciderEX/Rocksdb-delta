@@ -618,18 +618,22 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                              read_options_.skip_hot_path &&
                              !read_options_.is_metadata_scan) {
                     // 冷路径 scan（如 Init Scan）触发 SAC（全量缓冲）
+                    // trylock cuid
                     if (hotspot_manager_->ShouldTriggerScanAsCompaction(cuid)) {
-                      delta_ctx_.trigger_scan_as_compaction = true;
-                      hotspot_manager_->PrepareForFullReplace(cuid);
+                      if (hotspot_manager_->PrepareForFullReplace(cuid)) {
+                        delta_ctx_.trigger_scan_as_compaction = true;
+                      }
                     }
                   } else if (delta_ctx_.is_current_hot &&
                              !read_options_.skip_hot_path &&
                              read_options_.delta_full_scan) {
                     // 用户热路径 Full Scan：同样根据条件触发 SAC
                     // 条件：已有 snapshot 且 delta 数 >= threshold
+                    // trylock cuid
                     if (hotspot_manager_->ShouldTriggerScanAsCompaction(cuid)) {
-                      delta_ctx_.trigger_scan_as_compaction = true;
-                      hotspot_manager_->PrepareForFullReplace(cuid);
+                      if (hotspot_manager_->PrepareForFullReplace(cuid)) {
+                         delta_ctx_.trigger_scan_as_compaction = true;
+                      }
                     }
                   } else {
                     // 小 Scan 或其他情况：不缓冲数据，PartialMerge 依赖

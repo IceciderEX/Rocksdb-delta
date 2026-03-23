@@ -114,6 +114,102 @@ uint64_t HotDeltaIterator::GetPhysicalId() {
   return merging_iter_->GetPhysicalId();
 }
 
+namespace {
+
+class BoundedMemIterator : public InternalIterator {
+ public:
+  BoundedMemIterator(InternalIterator* iter, const std::string& lower_bound,
+                     const std::string& upper_bound,
+                     const InternalKeyComparator* icmp)
+      : iter_(iter),
+        lower_bound_(lower_bound),
+        upper_bound_(upper_bound),
+        icmp_(icmp) {
+    UpdateValid();
+  }
+
+  ~BoundedMemIterator() override { delete iter_; }
+
+  bool Valid() const override { return valid_; }
+
+  void SeekToFirst() override {
+    if (!lower_bound_.empty()) {
+      iter_->Seek(lower_bound_);
+    } else {
+      iter_->SeekToFirst();
+    }
+    UpdateValid();
+  }
+
+  void SeekToLast() override {
+    if (!upper_bound_.empty()) {
+      iter_->SeekForPrev(upper_bound_);
+    } else {
+      iter_->SeekToLast();
+    }
+    UpdateValid();
+  }
+
+  void Seek(const Slice& target) override {
+    if (!lower_bound_.empty() && icmp_->Compare(target, lower_bound_) < 0) {
+      iter_->Seek(lower_bound_);
+    } else if (!upper_bound_.empty() && icmp_->Compare(target, upper_bound_) > 0) {
+      valid_ = false;
+      return;
+    } else {
+      iter_->Seek(target);
+    }
+    UpdateValid();
+  }
+
+  void SeekForPrev(const Slice& target) override {
+    if (!upper_bound_.empty() && icmp_->Compare(target, upper_bound_) > 0) {
+      iter_->SeekForPrev(upper_bound_);
+    } else if (!lower_bound_.empty() && icmp_->Compare(target, lower_bound_) < 0) {
+      valid_ = false;
+      return;
+    } else {
+      iter_->SeekForPrev(target);
+    }
+    UpdateValid();
+  }
+
+  void Next() override {
+    iter_->Next();
+    UpdateValid();
+  }
+
+  void Prev() override {
+    iter_->Prev();
+    UpdateValid();
+  }
+
+  Slice key() const override { return iter_->key(); }
+  Slice value() const override { return iter_->value(); }
+  Status status() const override { return iter_->status(); }
+  
+  bool PrepareValue() override { return iter_->PrepareValue(); }
+
+ private:
+  void UpdateValid() {
+    valid_ = iter_->Valid() && IsWithinBounds(iter_->key());
+  }
+
+  bool IsWithinBounds(const Slice& k) const {
+    if (!lower_bound_.empty() && icmp_->Compare(k, lower_bound_) < 0) return false;
+    if (!upper_bound_.empty() && icmp_->Compare(k, upper_bound_) > 0) return false;
+    return true;
+  }
+
+  InternalIterator* iter_;
+  std::string lower_bound_;
+  std::string upper_bound_;
+  const InternalKeyComparator* icmp_;
+  bool valid_ = false;
+};
+
+} // namespace
+
 // ====================== HotSnapshotIterator ============================
 
 HotSnapshotIterator::HotSnapshotIterator(
@@ -175,8 +271,8 @@ bool HotSnapshotIterator::InitIterForSegment(size_t index) {
         }
       }
     }
-
-    current_iter_.reset(mem_iter);
+    // 使用 boundedIter，防止访问越界
+    current_iter_.reset(new BoundedMemIterator(mem_iter, seg.first_key, seg.last_key, &icmp_));
     return false;
   } else {
     // Case B: 物理 SST

@@ -59,7 +59,7 @@ class HotspotManager {
   bool BufferHotData(uint64_t cuid, const Slice& key, const Slice& value);
 
   // 为将要向 Buffer 写入 FullReplace 数据的 CUid 准备环境
-  void PrepareForFullReplace(uint64_t cuid);
+  bool PrepareForFullReplace(uint64_t cuid);
 
   Status FlushBlockToSharedSST(
     std::shared_ptr<HotDataBlock> block,
@@ -82,7 +82,8 @@ class HotspotManager {
                              const std::string& last_key);
 
   void FinalizeScanAsCompaction(
-      uint64_t cuid, const std::unordered_set<uint64_t>& visited_files = {});
+      uint64_t cuid, const std::unordered_set<uint64_t>& visited_files,
+      const std::string& scan_first_key, const std::string& scan_last_key);
 
   // 带策略的 Finalize 方法，支持不同的策略处理
   void FinalizeScanAsCompactionWithStrategy(

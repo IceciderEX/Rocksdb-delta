@@ -95,11 +95,16 @@ bool HotspotManager::BufferHotData(uint64_t cuid, const Slice& key,
   return buffer_.Append(cuid, key, value);
 }
 
-void HotspotManager::PrepareForFullReplace(uint64_t cuid) {
+bool HotspotManager::PrepareForFullReplace(uint64_t cuid) {
+  // Exclusive Lock for Full Scan
+  if (!TryLockCuid(cuid)) {
+    return false;
+  }
   std::lock_guard<std::mutex> lock(pending_mutex_);
   if (pending_snapshots_.find(cuid) == pending_snapshots_.end()) {
     pending_snapshots_[cuid] = std::vector<DataSegment>();
   }
+  return true;
 }
 
 Status HotspotManager::InterceptDelete(const Slice& key, SequenceNumber seq, bool sync) {
@@ -242,7 +247,7 @@ void HotspotManager::RecoverGDCT() {
 }
 
 void HotspotManager::CompactAndFlushGDCTLogIfNeeded() {
-  uint64_t now = db_options_.env->NowMicros();
+  uint64_t now = db_options_.env->NowMicros(); 
   
   // 没有积压数据 && time interval >= 30s
   if (pending_gdct_records_.load(std::memory_order_relaxed) == 0 && 
@@ -499,18 +504,40 @@ void HotspotManager::TriggerBufferFlush() {
 
 
 void HotspotManager::FinalizeScanAsCompaction(
-    uint64_t cuid, const std::unordered_set<uint64_t>& visited_files) {
+    uint64_t cuid, const std::unordered_set<uint64_t>& visited_files,
+    const std::string& scan_first_key, const std::string& scan_last_key) {
   if (cuid == 0) return;
+  auto unlock_guard = std::shared_ptr<void>(nullptr, [this, cuid](void*) {
+    this->UnlockCuid(cuid);
+  });
 
   std::vector<DataSegment> final_segments;
 
-  // Scan 过程中产生的 Pending SSTs
+  // Scan 过程中产生的 Pending SSTs【在 scan 的过程中flush】
   {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     auto it = pending_snapshots_.find(cuid);
     if (it != pending_snapshots_.end()) {
-      final_segments = it->second;
+      final_segments = std::move(it->second);
       pending_snapshots_.erase(it);
+      
+      // 处理由于并发或历史 bufferdata 残留的 SST seg 范围重叠问题
+      for (auto seg_it = final_segments.begin(); seg_it != final_segments.end(); ) {
+        // 只以这次 full scan 的 keyrange 为准
+        if (internal_comparator_->Compare(seg_it->first_key, scan_first_key) < 0) {
+          seg_it->first_key = scan_first_key;
+        }
+        if (internal_comparator_->Compare(seg_it->last_key, scan_last_key) > 0) {
+          seg_it->last_key = scan_last_key;
+        }
+        
+        // 如果裁剪后发现 seg first >= last，这段 segment 无效
+        if (internal_comparator_->Compare(seg_it->first_key, seg_it->last_key) >= 0) {
+          seg_it = final_segments.erase(seg_it);
+        } else {
+          ++seg_it;
+        }
+      }
     }
   }
 
@@ -534,26 +561,30 @@ void HotspotManager::FinalizeScanAsCompaction(
     return;
   }
 
-  // 这次 scan 可能存在数据还在 buffer 没刷新
-  // 如果 buffer 中有数据，尝试获取边界 key 作为待 promote 的内存段的 key 范围，插入到 final_segments 中，等待 PromoteSnapshot 替换
-  // tail segment, PromoteSnapshot()填充具体值
-  std::string min_key, max_key;
-  if (buffer_.GetBoundaryKeys(cuid, &min_key, &max_key, internal_comparator_)) {
+  // 防止 buffer data 的 segment keyrange 重叠
+  std::string tail_min;
+  if (final_segments.empty()) {
+    tail_min = scan_first_key;
+  } else {
+    // buffer minkey=前一个物理 SST 的结尾
+    tail_min = final_segments.back().last_key;
+  }
+
+  // 确保拼接逻辑不会发生区间倒置
+  bool has_valid_tail = internal_comparator_->Compare(tail_min, scan_last_key) <= 0;
+  if (has_buffered_data && has_valid_tail) {
     DataSegment tail_segment;
     tail_segment.file_number = static_cast<uint64_t>(-1);  // 标记为内存段
-    tail_segment.first_key = min_key;
-    tail_segment.last_key = max_key;
+    tail_segment.first_key = tail_min;
+    tail_segment.last_key = scan_last_key;
 
     final_segments.push_back(tail_segment);
-  } else {
-    // If we have no boundary keys, it means the buffer has no data for this
-    // CUID. We shouldn't proceed with UpdateSnapshot if there's no tail unless
-    // we have pending SSTs. But even with pending SSTs, replacing the whole
-    // snapshot might be dangerous if we didn't scan everything.
+  } else if (!has_valid_tail || !has_buffered_data) {
     ROCKS_LOG_WARN(db_options_.info_log,
-                   "[HotspotManager] GetBoundaryKeys failed for CUID %"
-                   PRIu64 ". Has buffered data: %d, Pending SSTs: %zu",
-                   cuid, has_buffered_data ? 1 : 0, final_segments.size());
+                   "[HotspotManager] Skipped creating tail segment for CUID %"
+                   PRIu64 ". Has buffered data: %d, valid_tail: %d, Pending SSTs: %zu",
+                   cuid, has_buffered_data ? 1 : 0, has_valid_tail ? 1 : 0,
+                   final_segments.size());
 
     if (final_segments.empty()) {
       return;
@@ -643,7 +674,7 @@ void HotspotManager::FinalizeScanAsCompactionWithStrategy(
     case ScanAsCompactionStrategy::kNoAction:
       return;
     case ScanAsCompactionStrategy::kFullReplace:
-      FinalizeScanAsCompaction(cuid, visited_files);
+      FinalizeScanAsCompaction(cuid, visited_files, scan_first_key, scan_last_key);
       // std::cout << "[HotspotManager] Finalized CUID " << cuid
       //           << " with FullReplace strategy." << std::endl;
       break;
