@@ -25,7 +25,7 @@ HotspotManager::HotspotManager(const Options& db_options,
       data_dir_(data_dir),
       internal_comparator_(internal_comparator),
       lifecycle_manager_(std::make_shared<HotSstLifecycleManager>(db_options)),
-      index_table_(lifecycle_manager_),
+      index_table_(lifecycle_manager_, db_options_.info_log),
       frequency_table_(3, 600) { // count set
   db_options_.env->CreateDirIfMissing(data_dir_);
 
@@ -479,7 +479,7 @@ void HotspotManager::TriggerBufferFlush() {
           // 无活跃 Scan，尝试 PromoteSnapshot（将 {-1} 内存段替换为真实 SST）
           // 但是 partialMerge 是后台任务，不会进行
           // FinalizeScanAsCompaction，需要考虑
-          bool promoted = index_table_.PromoteSnapshot(cuid, real_segment);
+          bool promoted = index_table_.PromoteSnapshot(cuid, real_segment, &buffer_, internal_comparator_);
           if (!promoted) {
             // 既无活跃 Scan 也无 {-1} 段，强制 Append
             ROCKS_LOG_WARN(db_options_.info_log,

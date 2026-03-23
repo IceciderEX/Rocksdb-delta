@@ -3,6 +3,24 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+static bool HasActualDataInBuffer(uint64_t cuid, const std::string& start,
+                                  const std::string& end, HotDataBuffer* buffer,
+                                  const InternalKeyComparator* icmp) {
+  if (icmp->Compare(start, end) >= 0) return false;
+
+  std::unique_ptr<InternalIterator> iter(buffer->NewIterator(cuid, icmp));
+  iter->Seek(start);
+  if (!iter->Valid()) return false;
+
+  // We are looking for data STRICTLY between start and end.
+  // Because start and end are already covered by SSTs.
+  if (icmp->Compare(iter->key(), start) == 0) {
+    iter->Next();
+  }
+
+  return iter->Valid() && icmp->Compare(iter->key(), end) < 0;
+}
+
 void HotIndexTable::UpdateSnapshot(
     uint64_t cuid, const std::vector<DataSegment>& new_segments) {
   std::vector<DataSegment> segments_to_unref;
@@ -43,7 +61,9 @@ void HotIndexTable::AppendSnapshotSegment(uint64_t cuid,
 }
 
 bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
-                                    const DataSegment& new_segment) {
+                                    const DataSegment& new_segment,
+                                    HotDataBuffer* buffer,
+                                    const InternalKeyComparator* icmp) {
   Shard& shard = GetShard(cuid);
   std::unique_lock<std::shared_mutex> lock(shard.mutex);
   auto it = shard.table.find(cuid);
@@ -71,18 +91,23 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
         found_overlap = true;
         // buffer segment 比 sst segment 更大的情况
         // 1. 左侧剩余部分
-        if (seg_start < new_start) {
+        if (icmp->Compare(seg_start, new_start) < 0) {
           DataSegment left_seg = seg;
           left_seg.last_key = new_segment.first_key;
-          next_segments.push_back(left_seg);
-          fprintf(stderr, "[HotIndexTable] Buffer snapshot (start: %s) is smaller than flushed SST (start: %s). Left remainder created.\n", seg_start.c_str(), new_start.c_str());
+          // 如果 buffer 左侧数据实际存在，加入这个 seg
+          if (HasActualDataInBuffer(cuid, left_seg.first_key, left_seg.last_key, buffer, icmp)) {
+            next_segments.push_back(left_seg);
+          }
         }
+
         // 2. 右侧剩余部分
-        if (seg_end > new_end) {
+        if (icmp->Compare(seg_end, new_end) > 0) {
           DataSegment right_seg = seg;
           right_seg.first_key = new_segment.last_key;
-          next_segments.push_back(right_seg);
-          fprintf(stderr, "[HotIndexTable] Buffer snapshot (end: %s) is larger than flushed SST (end: %s). Right remainder created.\n", seg_end.c_str(), new_end.c_str());
+          // 如果 buffer 右侧数据实际存在，加入这个 seg
+          if (HasActualDataInBuffer(cuid, right_seg.first_key, right_seg.last_key, buffer, icmp)) {
+            next_segments.push_back(right_seg);
+          }
         }
         // 从物理段 new_segment -> promoted_seg，并指向上面的物理文件
         // segment range 以物理 sst 为准
@@ -103,10 +128,10 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   }
 
   if (found_overlap) {
-    // sort segments
+    // sort segments (Solution G: used icmp for correct internal key order)
     std::sort(next_segments.begin(), next_segments.end(),
-              [](const DataSegment& a, const DataSegment& b) {
-                return a.first_key < b.first_key;
+              [icmp](const DataSegment& a, const DataSegment& b) {
+                return icmp->Compare(a.first_key, b.first_key) < 0;
               });
     for (const auto& seg : next_segments) {
       fprintf(stderr, "[HotIndexTable] Next snapshot segment: [%s - %s], file_number: %lu\n",

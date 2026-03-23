@@ -36,8 +36,9 @@ struct HotIndexEntry {
 class HotIndexTable {
  public:
   explicit HotIndexTable(
-      std::shared_ptr<HotSstLifecycleManager> lifecycle_manager)
-      : lifecycle_manager_(lifecycle_manager) {}
+      std::shared_ptr<HotSstLifecycleManager> lifecycle_manager,
+      Logger* info_log = nullptr)
+      : lifecycle_manager_(lifecycle_manager), info_log_(info_log) {}
 
   void UpdateSnapshot(uint64_t cuid,
                       const std::vector<DataSegment>& new_segments);
@@ -46,7 +47,8 @@ class HotIndexTable {
 
   // 将内存中的 Snapshot (file_id = -1) 替换为真实 new_segment
   // 返回 true 表示成功找到并替换，false 表示未找到 -1 记录
-  bool PromoteSnapshot(uint64_t cuid, const DataSegment& new_segment);
+  bool PromoteSnapshot(uint64_t cuid, const DataSegment& new_segment,
+                       HotDataBuffer* buffer, const InternalKeyComparator* icmp);
 
   void AddDelta(uint64_t cuid, const DataSegment& segment);
 
@@ -109,6 +111,7 @@ class HotIndexTable {
 
   std::array<Shard, kNumShards> shards_;
   std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
+  Logger* info_log_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
