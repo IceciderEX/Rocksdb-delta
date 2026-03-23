@@ -271,8 +271,9 @@ bool HotSnapshotIterator::InitIterForSegment(size_t index) {
         }
       }
     }
-    // 使用 boundedIter，防止访问越界
-    current_iter_.reset(new BoundedMemIterator(mem_iter, seg.first_key, seg.last_key, &icmp_));
+    current_iter_.reset(mem_iter);
+    // 使用 boundedIter，防止访问越界?
+    // current_iter_.reset(new BoundedMemIterator(mem_iter, seg.first_key, seg.last_key, &icmp_));
     return false;
   } else {
     // Case B: 物理 SST

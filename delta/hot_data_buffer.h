@@ -66,7 +66,7 @@ struct HotDataBlock {
 
 class HotDataBuffer {
  public:
-  explicit HotDataBuffer(size_t threshold_bytes = 64 * 1024 * 1024);
+  explicit HotDataBuffer(size_t threshold_bytes = 1 * 1024 * 1024);
 
   // 将数据追加到对应 CUID 的 buffer 中
   // 如果 buffer 大小超过阈值，返回 true (need Flush)

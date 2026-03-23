@@ -1,4 +1,5 @@
 #include "delta/hot_index_table.h"
+#include "util/extract_cuid.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -68,26 +69,20 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
 
       if (!is_left && !is_right) {
         found_overlap = true;
+        // buffer segment 比 sst segment 更大的情况
         // 1. 左侧剩余部分
         if (seg_start < new_start) {
           DataSegment left_seg = seg;
           left_seg.last_key = new_segment.first_key;
           next_segments.push_back(left_seg);
-          
-          if (info_log_) {
-            ROCKS_LOG_INFO(info_log_, "[HotIndexTable] Buffer snapshot (start: %s) is larger than flushed SST (start: %s). Left remainder created.", seg_start.c_str(), new_start.c_str());
-          }
+          fprintf(stderr, "[HotIndexTable] Buffer snapshot (start: %s) is smaller than flushed SST (start: %s). Left remainder created.\n", seg_start.c_str(), new_start.c_str());
         }
-
         // 2. 右侧剩余部分
         if (seg_end > new_end) {
           DataSegment right_seg = seg;
           right_seg.first_key = new_segment.last_key;
           next_segments.push_back(right_seg);
-
-          if (info_log_) {
-            ROCKS_LOG_INFO(info_log_, "[HotIndexTable] Buffer snapshot (end: %s) is larger than flushed SST (end: %s). Right remainder created.", seg_end.c_str(), new_end.c_str());
-          }
+          fprintf(stderr, "[HotIndexTable] Buffer snapshot (end: %s) is larger than flushed SST (end: %s). Right remainder created.\n", seg_end.c_str(), new_end.c_str());
         }
         // 从物理段 new_segment -> promoted_seg，并指向上面的物理文件
         // segment range 以物理 sst 为准
@@ -108,11 +103,16 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   }
 
   if (found_overlap) {
-    // 重新排序
+    // sort segments
     std::sort(next_segments.begin(), next_segments.end(),
               [](const DataSegment& a, const DataSegment& b) {
                 return a.first_key < b.first_key;
               });
+    for (const auto& seg : next_segments) {
+      fprintf(stderr, "[HotIndexTable] Next snapshot segment: [%s - %s], file_number: %lu\n",
+              FormatKeyDisplay(seg.first_key).c_str(), FormatKeyDisplay(seg.last_key).c_str(),
+              seg.file_number);
+    }
     entry.snapshot_segments = std::move(next_segments);
 
     if (lifecycle_manager_) {
@@ -461,95 +461,6 @@ void HotIndexTable::ReplaceOverlappingSegments(
     }
   }
 }
-
-
-// void HotIndexTable::ReplaceOverlappingSegments(
-//     uint64_t cuid, const DataSegment& new_segment,
-//     const std::vector<uint64_t>& obsolete_delta_files) {
-//   std::vector<DataSegment> segments_to_unref;
-
-//   {
-//     std::unique_lock<std::shared_mutex> lock(mutex_);
-//     auto& entry = table_[cuid];
-//     auto& snapshots = entry.snapshot_segments;
-
-//     // 判定与new snapshot相关的snapshot -> !(End < New.Start || Start > New.End)
-//     for (auto it = snapshots.begin(); it != snapshots.end();) {
-//       bool is_left = (ExtractUserKey(it->last_key).ToString() <
-//                       ExtractUserKey(new_segment.first_key).ToString());
-//       bool is_right = (ExtractUserKey(it->first_key).ToString() >
-//                        ExtractUserKey(new_segment.last_key).ToString());
-//       std::string s1 = ExtractUserKey(new_segment.first_key).ToString();
-//       std::string s2 = ExtractUserKey(new_segment.last_key).ToString();
-//       std::string s3 = ExtractUserKey(it->first_key).ToString();
-//       std::string s4 = ExtractUserKey(it->last_key).ToString();
-
-//       if (!is_left && !is_right) {
-//         segments_to_unref.push_back(*it);
-//         it = snapshots.erase(it);
-//       } else {
-//         ++it;
-//       }
-//     }
-
-//     // insert new_segment
-//     auto it_insert_pos =
-//         std::upper_bound(snapshots.begin(), snapshots.end(), new_segment,
-//                          [](const DataSegment& a, const DataSegment& b) {
-//                            return a.first_key < b.first_key;
-//                          });
-//     auto insert_pos = snapshots.insert(it_insert_pos, new_segment);
-
-//     // 合并相邻的内存段 (-1)
-//     if (new_segment.file_number == static_cast<uint64_t>(-1)) {
-//       // 检查前一个
-//       if (insert_pos != snapshots.begin()) {
-//         auto prev = std::prev(insert_pos);
-//         if (prev->file_number == static_cast<uint64_t>(-1)) {
-//           insert_pos->first_key = prev->first_key;
-//           snapshots.erase(prev);
-//           // erase 后 insert_pos 依然指向插入的那个元素
-//         }
-//       }
-//       // 检查后一个
-//       auto next = std::next(insert_pos);
-//       if (next != snapshots.end()) {
-//         if (next->file_number == static_cast<uint64_t>(-1)) {
-//           insert_pos->last_key = next->last_key;
-//           snapshots.erase(next);
-//         }
-//       }
-//     }
-
-//     if (!obsolete_delta_files.empty()) {
-//       auto& deltas = entry.deltas;
-
-//       // 遍历 obsolete_delta_files
-//       for (uint64_t file_num : obsolete_delta_files) {
-//         // 在 entry.deltas 中找到并移除，同时移入 obsolete_deltas
-//         for (auto it = deltas.begin(); it != deltas.end();) {
-//           if (it->file_number == file_num) {
-//             // 记录到 Obsolete (L0 Compaction再清除)
-//             entry.obsolete_deltas.push_back(*it);
-//             it = deltas.erase(it);
-//             // 注意：一个 file_number 在 deltas 中可能出现多次吗？
-//           } else {
-//             ++it;
-//           }
-//         }
-//       }
-//     }
-//   }  // Unlock
-
-//   if (lifecycle_manager_) {
-//     if (new_segment.file_number != static_cast<uint64_t>(-1)) {
-//       lifecycle_manager_->Ref(new_segment.file_number);
-//     }
-//     for (const auto& seg : segments_to_unref) {
-//       lifecycle_manager_->Unref(seg.file_number);
-//     }
-//   }
-// }
 
 size_t HotIndexTable::CountOverlappingDeltas(
     uint64_t cuid, const std::string& first_key,
