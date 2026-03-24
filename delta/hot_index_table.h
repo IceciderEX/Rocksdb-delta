@@ -37,9 +37,10 @@ class HotIndexTable {
  public:
   explicit HotIndexTable(
       std::shared_ptr<HotSstLifecycleManager> lifecycle_manager,
-      std::shared_ptr<Logger> info_log = nullptr)
-      : lifecycle_manager_(lifecycle_manager), info_log_(info_log) {}
-
+      std::shared_ptr<Logger> info_log = nullptr,
+      size_t num_shards = 128)
+      : shards_(num_shards), lifecycle_manager_(lifecycle_manager), info_log_(info_log) {}
+ 
   void UpdateSnapshot(uint64_t cuid,
                       const std::vector<DataSegment>& new_segments);
   // scan-as-compaction -> add snapshots
@@ -94,22 +95,20 @@ class HotIndexTable {
   void DumpToFile(const std::string& filename, const std::string& phase_label);
 
  private:
-  static constexpr size_t kNumShards = 128;
-  
   struct Shard {
     mutable std::shared_mutex mutex;
     std::unordered_map<uint64_t, HotIndexEntry> table;
   };
 
   Shard& GetShard(uint64_t cuid) {
-    return shards_[cuid % kNumShards];
+    return shards_[cuid % shards_.size()];
   }
 
   const Shard& GetShard(uint64_t cuid) const {
-    return shards_[cuid % kNumShards];
+    return shards_[cuid % shards_.size()];
   }
 
-  std::array<Shard, kNumShards> shards_;
+  std::vector<Shard> shards_;
   std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
   std::shared_ptr<Logger> info_log_;
 };

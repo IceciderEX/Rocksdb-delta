@@ -4,6 +4,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+GlobalDeleteCountTable::GlobalDeleteCountTable(size_t num_shards)
+    : shards_(num_shards) {}
+
 bool GlobalDeleteCountTable::TrackPhysicalUnit(uint64_t cuid, uint64_t phys_id) {
   auto& shard = GetShard(cuid);
   std::unique_lock<std::shared_mutex> lock(shard.mutex);
@@ -188,7 +191,7 @@ bool GlobalDeleteCountTable::IsDeleted(uint64_t cuid, SequenceNumber read_seqno)
 
 std::vector<std::pair<uint64_t, SequenceNumber>> GlobalDeleteCountTable::GetAllDeletedCuids() const {
   std::vector<std::pair<uint64_t, SequenceNumber>> result;
-  for (size_t i = 0; i < kNumShards; ++i) {
+  for (size_t i = 0; i < shards_.size(); ++i) {
     const auto& shard = shards_[i];
     std::shared_lock<std::shared_mutex> lock(shard.mutex);
     for (const auto& kv : shard.table) {

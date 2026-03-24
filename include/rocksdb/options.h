@@ -59,6 +59,34 @@ class WalFilter;
 class FileSystem;
 class UserDefinedIndexFactory;
 // for delta
+struct DeltaOptions {
+  // Hotness Detection
+  uint64_t hotspot_scan_threshold = 200;
+  uint64_t hotspot_scan_window_sec = 600;
+
+  // Delta Merging & SAC
+  uint32_t delta_merge_threshold = 3;
+  uint32_t sac_delta_count_threshold = 5;
+
+  // Data Buffering
+  size_t hot_data_buffer_threshold_bytes = 1048576;  // 1MB
+  uint32_t hot_data_buffer_shards = 32;
+
+  // GDCT Log Persistence
+  uint64_t gdct_log_compact_size = 33554432;           // 32MB
+  uint32_t gdct_flush_threshold_records = 15;
+  uint64_t gdct_flush_interval_us = 30000000;          // 30s
+  uint64_t gdct_compact_interval_us = 600000000;       // 600s
+
+  // Compaction Picker (Mixed L0)
+  int compaction_l0_trigger_count = 10;
+  uint64_t compaction_l0_trigger_age_sec = 3600;
+  size_t compaction_l0_files_to_pick = 5;
+
+  // Global Concurrency/Sharding (Default for GDCT/HotIndex/ScanFreq)
+  uint32_t sharding_count = 128;
+};
+
 class HotspotManager;
 
 struct Options;
@@ -406,6 +434,9 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Once validated in production, the default will likely change to something
   // around 300.
   uint32_t uncache_aggressiveness = 0;
+
+  // for delta
+  DeltaOptions delta_options;
 
   // Create ColumnFamilyOptions with default values for all fields
   ColumnFamilyOptions();

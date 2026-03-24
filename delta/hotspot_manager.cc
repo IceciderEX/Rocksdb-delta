@@ -25,8 +25,12 @@ HotspotManager::HotspotManager(const Options& db_options,
       data_dir_(data_dir),
       internal_comparator_(internal_comparator),
       lifecycle_manager_(std::make_shared<HotSstLifecycleManager>(db_options)),
-      index_table_(lifecycle_manager_, db_options_.info_log),
-      frequency_table_(3, 600) {  // count set
+      index_table_(lifecycle_manager_, db_options_.info_log, db_options_.delta_options.sharding_count),
+      buffer_(db_options_.delta_options.hot_data_buffer_threshold_bytes, db_options_.delta_options.hot_data_buffer_shards),
+      frequency_table_(db_options_.delta_options.hotspot_scan_threshold,
+                       db_options_.delta_options.hotspot_scan_window_sec,
+                       db_options_.delta_options.sharding_count),
+      delete_table_(db_options_.delta_options.sharding_count) {
   db_options_.env->CreateDirIfMissing(data_dir_);
 
   // 恢复之前因为宕机等原因遗留的 GDCT 逻辑删除记录
@@ -258,15 +262,16 @@ void HotspotManager::CompactAndFlushGDCTLogIfNeeded() {
   uint64_t now = db_options_.env->NowMicros();
 
   // 没有积压数据 && time interval >= 30s
-  if (pending_gdct_records_.load(std::memory_order_relaxed) == 0 &&
+  if (pending_gdct_records_.load(std::memory_order_relaxed) <
+          db_options_.delta_options.gdct_flush_threshold_records &&
       now - last_gdct_flush_time_us_.load(std::memory_order_relaxed) <
-          1000000) {
+          db_options_.delta_options.gdct_flush_interval_us) {
     return;
   }
   FlushGDCTLogBuffer();
   // 检查日志重写 (Compact) && time interval >= 600s
   if (now - last_gdct_compact_time_us_.load(std::memory_order_relaxed) <
-      60000000) {
+      db_options_.delta_options.gdct_compact_interval_us) {
     return;
   }
   last_gdct_compact_time_us_.store(now, std::memory_order_relaxed);
@@ -276,7 +281,8 @@ void HotspotManager::CompactAndFlushGDCTLogIfNeeded() {
 
   uint64_t file_size = 0;
   Status s = db_options_.env->GetFileSize(log_path, &file_size);
-  if (!s.ok() || file_size < 32 * 1024 * 1024) {  // 32 MB
+  if (!s.ok() ||
+      file_size < db_options_.delta_options.gdct_log_compact_size) {
     return;
   }
 
@@ -340,8 +346,10 @@ bool HotspotManager::ShouldTriggerScanAsCompaction(uint64_t cuid) {
     // a)	当前热点CUid无Snapshot。
     return true;
   }
-  // b)	已有Snapshot，且新增的Deltas片段数量超过5个。
-  if (!entry.HasSnapshot() || entry.deltas.size() > 5) {
+  // b)已有Snapshot，且新增的Deltas片段数量超过阈值。
+  if (!entry.HasSnapshot() ||
+      entry.deltas.size() >
+          db_options_.delta_options.sac_delta_count_threshold) {
     return true;
   }
   return false;
@@ -674,7 +682,7 @@ ScanAsCompactionStrategy HotspotManager::EvaluateScanAsCompactionStrategy(
   }
 
   // 根据阈值决定策略
-  if (delta_count >= kPartialMergeDeltaThreshold) {
+  if (delta_count >= db_options_.delta_options.delta_merge_threshold) {
     return ScanAsCompactionStrategy::kPartialMerge;
   }
 

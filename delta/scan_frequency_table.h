@@ -15,7 +15,7 @@ struct FrequencyEntry {
 
 class ScanFrequencyTable {
  public:
-  ScanFrequencyTable(int threshold = 200, int window_sec = 600);
+  ScanFrequencyTable(int threshold = 200, int window_sec = 600, size_t num_shards = 128);
 
   // 返回值：当前是否为热点
   // became_hot：如果不为 nullptr，返回是否为首次成为热点
@@ -26,8 +26,6 @@ class ScanFrequencyTable {
   bool IsHot(uint64_t cuid) const;
 
  private:
-  static constexpr size_t kNumShards = 128;
-
   struct Shard {
     mutable std::mutex mutex;
     std::unordered_map<uint64_t, FrequencyEntry> table;
@@ -35,18 +33,18 @@ class ScanFrequencyTable {
   };
 
   Shard& GetShard(uint64_t cuid) {
-    return shards_[cuid % kNumShards];
+    return shards_[cuid % shards_.size()];
   }
 
   const Shard& GetShard(uint64_t cuid) const {
-    return shards_[cuid % kNumShards];
+    return shards_[cuid % shards_.size()];
   }
 
   void CheckAndRotateWindow(Shard& shard);
 
   int threshold_;
   int window_sec_;
-  std::array<Shard, kNumShards> shards_;
+  std::vector<Shard> shards_;
 };
 
 } // namespace ROCKSDB_NAMESPACE

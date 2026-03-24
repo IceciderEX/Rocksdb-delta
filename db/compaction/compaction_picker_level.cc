@@ -530,9 +530,12 @@ void LevelCompactionBuilder::SetupInitialFilesDelta() {
 // 选取最老的 N 个文件进行 L0->L0 合并
 bool LevelCompactionBuilder::PickMixedL0Compaction() {
   // 策略阈值
-  const int kL0TriggerCount = 10;      // 触发阈值：SST 数量 >= 20
-  const uint64_t kL0TriggerAge = 3600; // 时间阈值：最老文件超过1h
-  const size_t kFilesToPick = 5;      // 每次合并选取的最大文件数
+  const int kL0TriggerCount =
+      mutable_cf_options_.delta_options.compaction_l0_trigger_count;
+  const uint64_t kL0TriggerAge =
+      mutable_cf_options_.delta_options.compaction_l0_trigger_age_sec;
+  const size_t kFilesToPick =
+      mutable_cf_options_.delta_options.compaction_l0_files_to_pick;
 
   // 2. 获取 L0 文件列表
   // TODO: 检查 seqno 排列顺序?

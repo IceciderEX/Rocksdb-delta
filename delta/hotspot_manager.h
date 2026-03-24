@@ -30,9 +30,6 @@ enum class ScanAsCompactionStrategy {
   kPartialMerge  // 部分合并：读取相关 snapshots + deltas + scan 数据，归并更新
 };
 
-static constexpr size_t kPartialMergeDeltaThreshold =
-    3;  // 触发部分合并的 delta 数量阈值
-
 // 异步 Partial Merge 任务
 struct PartialMergePendingTask {
   uint64_t cuid;

@@ -4,10 +4,10 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-ScanFrequencyTable::ScanFrequencyTable(int threshold, int window_sec)
-    : threshold_(threshold), window_sec_(window_sec) {
+ScanFrequencyTable::ScanFrequencyTable(int threshold, int window_sec, size_t num_shards)
+    : threshold_(threshold), window_sec_(window_sec), shards_(num_shards) {
   auto now = std::chrono::steady_clock::now();
-  for (size_t i = 0; i < kNumShards; ++i) {
+  for (size_t i = 0; i < shards_.size(); ++i) {
     shards_[i].window_start_time = now;
   }
 }

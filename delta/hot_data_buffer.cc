@@ -13,9 +13,9 @@ void HotDataBlock::Sort(const InternalKeyComparator* icmp) {
   }
 }
 
-HotDataBuffer::HotDataBuffer(size_t threshold_bytes)
-    : threshold_bytes_(threshold_bytes), total_buffered_size_(0) {
-  for (size_t i = 0; i < kNumShards; ++i) {
+HotDataBuffer::HotDataBuffer(size_t threshold_bytes, uint32_t num_shards)
+    : threshold_bytes_(threshold_bytes), total_buffered_size_(0), shards_(num_shards) {
+  for (size_t i = 0; i < shards_.size(); ++i) {
     shards_[i].active_block = std::make_shared<HotDataBlock>();
   }
 }
@@ -41,7 +41,7 @@ bool HotDataBuffer::RotateBuffer(const InternalKeyComparator* icmp) {
   bool has_data = false;
 
   // phase 1：将 active_block 替换为 new block，并转入暂存队列
-  for (size_t i = 0; i < kNumShards; ++i) {
+  for (size_t i = 0; i < shards_.size(); ++i) {
     std::lock_guard<std::mutex> lock(shards_[i].mutex);
     if (shards_[i].active_block->buckets.empty()) continue;
     
@@ -49,18 +49,18 @@ bool HotDataBuffer::RotateBuffer(const InternalKeyComparator* icmp) {
     auto old_block = shards_[i].active_block;
     shards_[i].active_block = std::make_shared<HotDataBlock>();
     shards_[i].buffered_size = 0;
-
+ 
     shards_[i].immutable_queue.push_back(old_block);
   }
-
+ 
   if (!has_data) return false;
-
+ 
   // phase 2：stack combined_block，在双重锁的保护下，防止读取数据缺失
   auto combined_block = std::make_shared<HotDataBlock>();
   
   std::lock_guard<std::mutex> global_lock(global_queue_mutex_);
   
-  for (size_t i = 0; i < kNumShards; ++i) {
+  for (size_t i = 0; i < shards_.size(); ++i) {
     std::lock_guard<std::mutex> shard_lock(shards_[i].mutex);
     
     while (!shards_[i].immutable_queue.empty()) {

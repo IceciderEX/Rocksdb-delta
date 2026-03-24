@@ -27,7 +27,7 @@ struct GDCTEntry {
 
 class GlobalDeleteCountTable {
  public:
-  GlobalDeleteCountTable() = default;
+  explicit GlobalDeleteCountTable(size_t num_shards = 128);
 
   // 【Scan 阶段调用】
   // 增加引用计数 (当 Scan 发现一个新的 SST/Memtable 包含该 CUID 时调用)
@@ -60,22 +60,20 @@ class GlobalDeleteCountTable {
   void ApplyFlushChange(uint64_t cuid, uint64_t output_file);
 
  private:
-  static constexpr size_t kNumShards = 128;
-  
   struct Shard {
     mutable std::shared_mutex mutex;
     std::unordered_map<uint64_t, GDCTEntry> table;
   };
 
   Shard& GetShard(uint64_t cuid) {
-    return shards_[cuid % kNumShards];
+    return shards_[cuid % shards_.size()];
   }
 
   const Shard& GetShard(uint64_t cuid) const {
-    return shards_[cuid % kNumShards];
+    return shards_[cuid % shards_.size()];
   }
 
-  std::array<Shard, kNumShards> shards_;
+  std::vector<Shard> shards_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

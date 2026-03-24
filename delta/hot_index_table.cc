@@ -581,13 +581,13 @@ void HotIndexTable::DumpToFile(const std::string& filename,
   outfile << "DUMP PHASE: " << phase_label << std::endl;
 
   size_t total_cuids = 0;
-  for (size_t i = 0; i < kNumShards; ++i) {
+  for (size_t i = 0; i < shards_.size(); ++i) {
     std::shared_lock<std::shared_mutex> lock(shards_[i].mutex);
     total_cuids += shards_[i].table.size();
   }
   outfile << "Total Tracked CUIDs: " << total_cuids << std::endl;
 
-  for (size_t i = 0; i < kNumShards; ++i) {
+  for (size_t i = 0; i < shards_.size(); ++i) {
     std::shared_lock<std::shared_mutex> lock(shards_[i].mutex);
     for (const auto& kv : shards_[i].table) {
       uint64_t cuid = kv.first;
