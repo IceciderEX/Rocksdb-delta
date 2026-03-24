@@ -551,8 +551,8 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
 
   // 1. 获取元数据
   HotIndexEntry entry;
-  if (!hotspot_manager_->GetHotIndexEntry(cuid, &entry)) {
-    // hot 但是没有index (可能正在后台执行 Init Scan)
+  if (!hotspot_manager_->GetHotIndexEntry(cuid, &entry) || !entry.HasSnapshot()) {
+    // 如果没有 Snapshot，使用 cold path
     return false;
   }
 
@@ -563,7 +563,7 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
                               file_options_, icmp_, mutable_cf_options_);
 
   InternalIterator* delta_iter = new HotDeltaIterator(
-      entry.deltas, version_->cfd()->table_cache(), read_options_,
+        entry.deltas, version_->cfd()->table_cache(), read_options_,
       file_options_, icmp_, mutable_cf_options_, false);
 
   std::vector<InternalIterator*> children = {delta_iter, snapshot_iter};
