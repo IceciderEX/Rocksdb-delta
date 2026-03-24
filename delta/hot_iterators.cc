@@ -574,30 +574,12 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
 
 void DeltaSwitchingIterator::Seek(const Slice& target) {
   uint64_t cuid = hotspot_manager_->ExtractCUID(target);
-
-  // bool use_hot = false;
-  // // hot cuid
-  // if (!read_options_.skip_hot_path && !read_options_.delta_full_scan &&
-  //     cuid != 0 && hotspot_manager_->IsHot(cuid)) {
-  //   use_hot = true;
-  // }
-
-  // if (use_hot) {
-  //   InitHotIter(cuid);
-  //   current_iter_ = hot_iter_;
-  //   is_hot_mode_ = true;
-  // } else {
-  //   InitColdIter();
-  //   current_iter_ = cold_iter_;
-  //   is_hot_mode_ = false;
-  // }
-  // skip_hot_path (eg. Metadata Scan)，强制冷路径
   if (read_options_.skip_hot_path) {
     InitColdIter();
     current_iter_ = cold_iter_;
     is_hot_mode_ = false;
   }
-  // 否则，不论是点查还是全扫描(delta_full_scan)，只要是热点，全部走热点路径提供给用户！
+  // 否则，不论是点查还是全扫描(delta_full_scan)，只要是热点，全部走热点路径
   else if (cuid != 0 && hotspot_manager_->IsHot(cuid)) {
     if (InitHotIter(cuid)) {
       current_iter_ = hot_iter_;
