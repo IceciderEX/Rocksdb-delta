@@ -546,7 +546,7 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
     return false;
   }
 
-  bool trigger_by_count = (total_files >= kL0TriggerCount);
+  bool trigger_by_count = (total_files >= static_cast<size_t>(kL0TriggerCount));
   bool trigger_by_time = false;
 
   // 检查最老文件的时间 l0_files.back()？

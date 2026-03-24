@@ -85,6 +85,26 @@ struct DeltaOptions {
 
   // Global Concurrency/Sharding (Default for GDCT/HotIndex/ScanFreq)
   uint32_t sharding_count = 128;
+
+  bool operator==(const DeltaOptions& other) const {
+    return hotspot_scan_threshold == other.hotspot_scan_threshold &&
+           hotspot_scan_window_sec == other.hotspot_scan_window_sec &&
+           delta_merge_threshold == other.delta_merge_threshold &&
+           sac_delta_count_threshold == other.sac_delta_count_threshold &&
+           hot_data_buffer_threshold_bytes ==
+               other.hot_data_buffer_threshold_bytes &&
+           hot_data_buffer_shards == other.hot_data_buffer_shards &&
+           gdct_log_compact_size == other.gdct_log_compact_size &&
+           gdct_flush_threshold_records == other.gdct_flush_threshold_records &&
+           gdct_flush_interval_us == other.gdct_flush_interval_us &&
+           gdct_compact_interval_us == other.gdct_compact_interval_us &&
+           compaction_l0_trigger_count == other.compaction_l0_trigger_count &&
+           compaction_l0_trigger_age_sec == other.compaction_l0_trigger_age_sec &&
+           compaction_l0_files_to_pick == other.compaction_l0_files_to_pick &&
+           sharding_count == other.sharding_count;
+  }
+
+  bool operator!=(const DeltaOptions& other) const { return !(*this == other); }
 };
 
 class HotspotManager;
