@@ -167,7 +167,21 @@ int main() {
   Status s = DestroyDB(kDBPath, options);
 
   options.create_missing_column_families = true;
-  options.disable_auto_compactions = true;
+  options.enable_delta = true;
+
+  // --- Example 1: Programmatic Configuration of DeltaOptions ---
+  // These can be set directly on the options object before opening the DB.
+  options.delta_options.hotspot_scan_threshold = 200;
+  options.delta_options.hotspot_scan_window_sec = 300;
+  options.delta_options.delta_merge_threshold = 3;
+  options.delta_options.sac_delta_count_threshold = 5;
+  options.delta_options.sharding_count = 64; // Power of 2 recommended
+  options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
+  options.delta_options.hot_data_buffer_shards = 128;
+  options.delta_options.compaction_l0_trigger_count = 20;
+  options.delta_options.compaction_l0_trigger_age_sec = 3600;
+  options.delta_options.compaction_l0_files_to_pick = 10;
+  // -------------------------------------------------------------
   options.num_levels = 1;
   options.level0_file_num_compaction_trigger = 20;
   options.level_compaction_dynamic_level_bytes = false;

@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <chrono>
+#include <vector>
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
