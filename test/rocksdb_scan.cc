@@ -389,7 +389,7 @@ int main() {
       options.delta_options.delta_merge_threshold = 3;
       options.delta_options.sac_delta_count_threshold = 5;
       options.delta_options.sharding_count = 64; // Power of 2 recommended
-      options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
+      options.delta_options.hot_data_buffer_threshold_bytes = 12 * 1024 * 1024;
       options.delta_options.hot_data_buffer_shards = 128;
       options.delta_options.compaction_l0_trigger_count = 50;
       options.delta_options.compaction_l0_trigger_age_sec = 3600;

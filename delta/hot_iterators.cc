@@ -362,6 +362,13 @@ void HotSnapshotIterator::Next() {
 
   current_iter_->Next();
 
+  if (Valid() && icmp_.Compare(Slice(prev_key_debug), key()) >= 0) {
+    fprintf(stderr, "Prev: %s", FormatKeyDisplay(prev_key_debug).c_str());
+    fprintf(stderr, "Curr: %s", FormatKeyDisplay(key()).c_str());
+    fprintf(stderr, "[FATAL] HotSnapshotIterator Regression within segment %d!\n", current_segment_index_);
+    assert(true);
+  }
+
   while (!Valid()) {
     int next_index = current_segment_index_ + 1;
     if (next_index >= static_cast<int>(segments_.size())) {
@@ -374,6 +381,23 @@ void HotSnapshotIterator::Next() {
     if (current_iter_) {
       current_iter_->Seek(segments_[current_segment_index_].first_key);
     }
+
+    // Debug 打印跨段情况，捕捉跨段回退
+    if (Valid() && icmp_.Compare(Slice(prev_key_debug), key()) > 0) {
+      fprintf(stderr, "[FATAL] HotSnapshotIterator Regression across segment!\n");
+      fprintf(stderr, "Prev: %s", FormatKeyDisplay(prev_key_debug).c_str());
+      fprintf(stderr, "Curr: %s", FormatKeyDisplay(key()).c_str());
+      fprintf(stderr, "Old Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
+              segments_[old_segment].file_number,
+              FormatKeyDisplay(segments_[old_segment].first_key).c_str(),
+              FormatKeyDisplay(segments_[old_segment].last_key).c_str());
+      fprintf(stderr, "New Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
+              segments_[current_segment_index_].file_number,
+              FormatKeyDisplay(segments_[current_segment_index_].first_key).c_str(),
+              FormatKeyDisplay(segments_[current_segment_index_].last_key).c_str());
+      fprintf(stderr, "Old Segment: %d, New Segment: %d\n", old_segment, current_segment_index_);
+      assert(true);
+    } 
   }
 }
 
