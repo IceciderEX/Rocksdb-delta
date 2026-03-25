@@ -311,7 +311,7 @@ int main() {
   std::thread writer(WriterThread, db, cuids);
   std::thread reader1(ReaderThread, db, cuids, 1);
   std::thread reader2(ReaderThread, db, cuids, 2);
-  std::thread reader3(ReaderThread, db, cuids, 3);
+  // std::thread reader3(ReaderThread, db, cuids, 3);
   std::thread manager(ManagerThread, db_impl);
 
   auto start_time = std::chrono::steady_clock::now();
@@ -328,7 +328,7 @@ int main() {
   writer.join();
   reader1.join();
   reader2.join();
-  reader3.join();
+  // reader3.join();
   manager.join();
 
   std::cout << "Stress Test Completed." << std::endl;

@@ -488,7 +488,7 @@ void HotspotManager::TriggerBufferFlush() {
         const DataSegment& real_segment = kv.second;
 
         // 先检查 pending_snapshots_，再尝试 PromoteSnapshot
-        // 如果该 CUID 有正在进行的 Scan（pending_snapshots_ 中有注册），
+        // 如果该 CUID 有正在进行的 full Scan（pending_snapshots_ 中有注册），
         // 将 SST 放入 pending，由 FinalizeScanAsCompaction 提交
         bool added_to_pending = false;
         {
