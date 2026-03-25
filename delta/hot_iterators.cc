@@ -247,6 +247,9 @@ bool HotSnapshotIterator::InitIterForSegment(size_t index) {
     // Case A: 内存 Buffer fileid -1
     InternalIterator* mem_iter =
         hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
+    if (cuid_ == 1003) {
+        fprintf(stderr, "[DIAG_ITER] InitIter for 1003 segment %zu. mem_iter=%p\n", index, mem_iter);
+    }
     
     // 防止buffer data在线程调度时清空，再检查一次
     mem_iter->SeekToFirst();
@@ -344,6 +347,9 @@ void HotSnapshotIterator::Seek(const Slice& target) {
 
   // segment seek
   if (current_iter_) {
+    if (cuid_ == 1003) {
+      fprintf(stderr, "[DIAG_SEEK] 1003 target=%s, current_seg=%d\n", target.ToString(true).c_str(), current_segment_index_);
+    }
     current_iter_->Seek(target);
 
     if (!Valid()) {

@@ -495,6 +495,11 @@ void HotspotManager::TriggerBufferFlush() {
           std::lock_guard<std::mutex> lock(pending_mutex_);
           auto it = pending_snapshots_.find(cuid);
           if (it != pending_snapshots_.end()) {
+            if (cuid == 1003) {
+              fprintf(stderr, "[DIAG_FLUSH] CUID 1003 Pending SST added: file %lu, range [%s - %s]\n", 
+                      real_segment.file_number, FormatKeyDisplay(real_segment.first_key).c_str(), 
+                      FormatKeyDisplay(real_segment.last_key).c_str());
+            }
             it->second.push_back(real_segment);
             added_to_pending = true;
           }
@@ -502,10 +507,12 @@ void HotspotManager::TriggerBufferFlush() {
 
         if (!added_to_pending) {
           // 无活跃 Scan，尝试 PromoteSnapshot（将 {-1} 内存段替换为真实 SST）
-          // 但是 partialMerge 是后台任务，不会进行
-          // FinalizeScanAsCompaction，需要考虑
           bool promoted = index_table_.PromoteSnapshot(
               cuid, real_segment, &buffer_, internal_comparator_);
+          if (cuid == 1003) {
+            fprintf(stderr, "[DIAG_FLUSH] CUID 1003 PromoteSnapshot result: %s, file: %lu\n", 
+                    promoted ? "SUCCESS" : "FAILED", real_segment.file_number);
+          }
           if (!promoted) {
             // 既无活跃 Scan 也无 {-1} 段，强制 Append
             ROCKS_LOG_WARN(db_options_.info_log,
@@ -523,6 +530,9 @@ void HotspotManager::TriggerBufferFlush() {
                       s.ToString().c_str());
     }
     // 刷盘和index更新完成之后再移除
+    if (block) {
+        fprintf(stderr, "[DIAG_POP] Popping block %p from buffer queue\n", block.get());
+    }
     buffer_.PopFrontBlockAfterFlush();
     block = buffer_.GetFrontBlockForFlush();
   }
@@ -767,6 +777,9 @@ bool HotspotManager::IsHot(uint64_t cuid) {
 // --------------------- HotspotManager Iterator --------------------- //
 InternalIterator* HotspotManager::NewBufferIterator(
     uint64_t cuid, const InternalKeyComparator* icmp) {
+  if (cuid == 1003) {
+      fprintf(stderr, "[DIAG_MGR] Reader requesting NewBufferIterator for 1003\n");
+  }
   return buffer_.NewIterator(cuid, icmp);
 }
 

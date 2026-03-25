@@ -250,6 +250,10 @@ InternalIterator* HotDataBuffer::NewIterator(
   //                         });
   // filtered_entries.erase(last, filtered_entries.end());
 
+  if (cuid == 1003) {
+      fprintf(stderr, "[DIAG_BUFFER] NewIterator for 1003: %zu entries. Blocks in queue: %zu\n", 
+              filtered_entries.size(), immutable_queue_.size());
+  }
   return new HotDataBufferIterator(std::move(filtered_entries), icmp);
 }
 
