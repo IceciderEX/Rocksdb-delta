@@ -1,6 +1,7 @@
 make_config.mk
 rocksdb.pc
 db_tmp/
+install/
 .agents
 .github
 
