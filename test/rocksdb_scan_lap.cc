@@ -336,6 +336,11 @@ int main() {
       options.delta_options.compaction_l0_trigger_age_sec = 3600;
       options.delta_options.compaction_l0_files_to_pick = 10;
       // -------------------------------------------------------------
+      options.level0_slowdown_writes_trigger = 1000; // l0 file count thres
+      options.level0_stop_writes_trigger = 2000; // l0 file count thres
+      options.level0_file_num_compaction_trigger = 100; // l0 file count thres
+      options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
+      options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
       options.num_levels = 1;
       options.level0_file_num_compaction_trigger = 20;
       options.level_compaction_dynamic_level_bytes = false;

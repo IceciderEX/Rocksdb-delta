@@ -81,7 +81,7 @@ void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
   WriteOptions wo;
   while (!stop_test) {
     for (size_t i = 0; i < cuids.size(); ++i) {
-      uint64_t cuid = cuids[i];
+      uint64_t cuid = 1003;
       {
         std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
         for (int k = 0; k < 20; ++k) {
@@ -90,7 +90,6 @@ void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
           ground_truths[cuid]->row_ids.insert(rid);
         }
       }
-      db->Flush(FlushOptions());
       global_stats.total_writes += 20;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -191,21 +190,22 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
           }
 
           // Check buffer data count
-          auto* buf_iter = hotspot_mgr->NewBufferIterator(cuid, nullptr);
-          if (buf_iter) {
-            size_t buf_count = 0;
-            for (buf_iter->SeekToFirst(); buf_iter->Valid(); buf_iter->Next()) {
-              buf_count++;
-            }
-            std::cerr << "[DIAG] Buffer data count for CUID " << cuid << ": "
-                      << buf_count << std::endl;
-            delete buf_iter;
-          }
-
+          // auto* buf_iter = hotspot_mgr->NewBufferIterator(cuid, nullptr);
+          // if (buf_iter) {
+          //   size_t buf_count = 0;
+          //   for (buf_iter->SeekToFirst(); buf_iter->Valid(); buf_iter->Next()) {
+          //     buf_count++;
+          //   }
+          //   std::cerr << "[DIAG] Buffer data count for CUID " << cuid << ": "
+          //             << buf_count << std::endl;
+          //   delete buf_iter;
+          // }
+          int count = 0;
           for (it->Seek(start_key); it->Valid(); it->Next()) {
             if (ExtractCUID(it->key()) != cuid) break;
-            // std::cout << FormatKeyDisplay(it->key()) << std::endl;
+            if (count % 100 == 0) std::cout << FormatKeyDisplay(it->key()) << std::endl;
             found.insert(ExtractRowID(it->key()));
+            count++;
           }
         }
       }
@@ -241,7 +241,7 @@ int main() {
   options.delta_options.delta_merge_threshold = 3;
   options.delta_options.sac_delta_count_threshold = 5;
   options.delta_options.sharding_count = 64; // Power of 2 recommended
-  options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
+  options.delta_options.hot_data_buffer_threshold_bytes = 2 * 1024 * 1024;
   options.delta_options.hot_data_buffer_shards = 128;
   options.delta_options.compaction_l0_trigger_count = 20;
   options.delta_options.compaction_l0_trigger_age_sec = 3600;

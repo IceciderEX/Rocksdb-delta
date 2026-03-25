@@ -629,21 +629,28 @@ void HotspotManager::FinalizeScanAsCompaction(
     return;
   }
 
-  // 验证拼接出来的 final_segments 是不是重叠的
+  // 【debug】验证拼接出来的 final_segments 是不是重叠的
   if (final_segments.size() > 1) {
     for (size_t i = 0; i < final_segments.size() - 1; ++i) {
-      if (final_segments[i].file_number == static_cast<uint64_t>(-1) ||
-          final_segments[i + 1].file_number == static_cast<uint64_t>(-1)) {
-        std::string s1_end = FormatKeyDisplay(final_segments[i].last_key);
-        std::string s2_start =
-            FormatKeyDisplay(final_segments[i + 1].first_key);
-
-        if (s1_end > s2_start) {
-          fprintf(stderr,
-                  "\n[FATAL] FinalizeScanAsCompaction overlapping! SST Ends: "
-                  "%s, Buffer Starts: %s\n",
-                  s1_end.c_str(), s2_start.c_str());
-        }
+      const auto& s1 = final_segments[i];
+      const auto& s2 = final_segments[i+1];
+      
+      // 检测方法 A: 顺序检测 (i+1 的起点应该 >= i 的起点)
+      bool unsorted = internal_comparator_->Compare(s1.first_key, s2.first_key) > 0;
+      
+      // 检测方法 B: 重叠检测 (i 的终点不能跨过 i+1 的起点)
+      bool overlapping = internal_comparator_->Compare(s1.last_key, s2.first_key) > 0;
+      
+      if (unsorted || overlapping) {
+        fprintf(stderr, "\n[DIAGNOSE_FATAL] FinalizeScanAsCompaction Inconsistency detected!\n");
+        fprintf(stderr, "CUID: %lu, Issue: %s\n", cuid, unsorted ? "UNSORTED" : "OVERLAPPING");
+        fprintf(stderr, "Seg[%zu] [%s - %s], file: %lu\n", 
+                i, FormatKeyDisplay(s1.first_key).c_str(), 
+                FormatKeyDisplay(s1.last_key).c_str(), s1.file_number);
+        fprintf(stderr, "Seg[%zu] [%s - %s], file: %lu\n", 
+                i+1, FormatKeyDisplay(s2.first_key).c_str(), 
+                FormatKeyDisplay(s2.last_key).c_str(), s2.file_number);
+        fprintf(stderr, "--------------\n");
       }
     }
   }

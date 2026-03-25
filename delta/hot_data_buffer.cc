@@ -32,7 +32,7 @@ bool HotDataBuffer::Append(uint64_t cuid, const Slice& key,
   }
   
   total_buffered_size_.fetch_add(entry_size);
-  // 使用活跃计数器触发 Flush，确保只有积攒够 64MB 活跃数据才 Rotate
+  // 使用 active 计数器触发 Flush，确保只有积攒够活跃数据才 Rotate
   size_t current_active = total_active_size_.fetch_add(entry_size) + entry_size;
   return current_active >= threshold_bytes_;
 }

@@ -362,9 +362,11 @@ void HotSnapshotIterator::Next() {
 
   current_iter_->Next();
 
-  if (Valid() && icmp_.Compare(Slice(prev_key_debug), key()) >= 0) {
-    fprintf(stderr, "Prev: %s", FormatKeyDisplay(prev_key_debug).c_str());
-    fprintf(stderr, "Curr: %s", FormatKeyDisplay(key()).c_str());
+  if (Valid() &&
+      icmp_.user_comparator()->Compare(ExtractUserKey(Slice(prev_key_debug)),
+                                       ExtractUserKey(key())) > 0) {
+    fprintf(stderr, "Prev: %s\n", FormatKeyDisplay(prev_key_debug).c_str());
+    fprintf(stderr, "Curr: %s\n", FormatKeyDisplay(key()).c_str());
     fprintf(stderr, "[FATAL] HotSnapshotIterator Regression within segment %d!\n", current_segment_index_);
     assert(true);
   }
@@ -383,10 +385,14 @@ void HotSnapshotIterator::Next() {
     }
 
     // Debug 打印跨段情况，捕捉跨段回退
-    if (Valid() && icmp_.Compare(Slice(prev_key_debug), key()) > 0) {
+    if (Valid() &&
+      icmp_.user_comparator()->Compare(ExtractUserKey(Slice(prev_key_debug)),
+                       ExtractUserKey(key())) > 0) {
       fprintf(stderr, "[FATAL] HotSnapshotIterator Regression across segment!\n");
-      fprintf(stderr, "Prev: %s", FormatKeyDisplay(prev_key_debug).c_str());
-      fprintf(stderr, "Curr: %s", FormatKeyDisplay(key()).c_str());
+      fprintf(stderr, "Prev: %s\n", FormatKeyDisplay(prev_key_debug).c_str());
+      fprintf(stderr, "Curr: %s\n", FormatKeyDisplay(key()).c_str());
+      fprintf(stderr, "PrevHex: %s\n", Slice(prev_key_debug).ToString(true).c_str());
+      fprintf(stderr, "CurrHex: %s\n", key().ToString(true).c_str());
       fprintf(stderr, "Old Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
               segments_[old_segment].file_number,
               FormatKeyDisplay(segments_[old_segment].first_key).c_str(),
@@ -644,13 +650,13 @@ void DeltaSwitchingIterator::Next() {
 
     current_iter_->Next();
     
-    // 跳过与上一条相同 UserKey 的所有条目，否则FindNextUserEntryInternalImpl会
+    // 跳过 <= 上一条 UserKey 的所有条目，否则FindNextUserEntryInternalImpl会
     // 出现错误Assertion `!skipping_saved_key || CompareKeyForSkip(ikey_.user_key, saved_key_.GetUserKey()) > 0' failed.
     while (current_iter_->Valid()) {
       Slice cur_user_key = ExtractUserKey(current_iter_->key());
       int cmp = icmp_.user_comparator()->Compare(cur_user_key, Slice(prev_user_key_buf_));
 
-      if (cmp != 0) {
+      if (cmp > 0) {
         break;
       }
       current_iter_->Next();
