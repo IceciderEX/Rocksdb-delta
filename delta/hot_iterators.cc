@@ -362,38 +362,18 @@ void HotSnapshotIterator::Next() {
 
   current_iter_->Next();
 
-  if (!Valid()) {
+  while (!Valid()) {
+    int next_index = current_segment_index_ + 1;
+    if (next_index >= static_cast<int>(segments_.size())) {
+      break;
+    }
+
     // 当前 Segment 耗尽(或越界)，切换到下一个
     int old_segment = current_segment_index_;
     SwitchToNextSegment();
-    if (Valid()) {
+    if (current_iter_) {
       current_iter_->Seek(segments_[current_segment_index_].first_key);
     }
-    
-    // // Debug 打印跨段情况，捕捉跨段回退
-    // if (Valid() && icmp_.Compare(Slice(prev_key_debug), key()) > 0) {
-    //   fprintf(stderr, "[FATAL] HotSnapshotIterator Regression across segment!\n");
-    //   fprintf(stderr, "Prev: %s", FormatKeyDisplay(prev_key_debug).c_str());
-    //   fprintf(stderr, "Curr: %s", FormatKeyDisplay(key()).c_str());
-    //   fprintf(stderr, "Old Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
-    //           segments_[old_segment].file_number,
-    //           FormatKeyDisplay(segments_[old_segment].first_key).c_str(),
-    //           FormatKeyDisplay(segments_[old_segment].last_key).c_str());
-    //   fprintf(stderr, "New Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
-    //           segments_[current_segment_index_].file_number,
-    //           FormatKeyDisplay(segments_[current_segment_index_].first_key).c_str(),
-    //           FormatKeyDisplay(segments_[current_segment_index_].last_key).c_str());
-    //   fprintf(stderr, "Old Segment: %d, New Segment: %d\n", old_segment, current_segment_index_);
-    //   assert(true);
-    // }
-  } else {
-    // Debug 打印同段情况，捕捉同段回退
-    // if (icmp_.Compare(Slice(prev_key_debug), key()) >= 0) {
-    //   fprintf(stderr, "Prev: %s", FormatKeyDisplay(prev_key_debug).c_str());
-    //   fprintf(stderr, "Curr: %s", FormatKeyDisplay(key()).c_str());
-    //   fprintf(stderr, "[FATAL] HotSnapshotIterator Regression within segment %d!\n", current_segment_index_);
-    //   assert(true);
-    // }
   }
 }
 
@@ -640,7 +620,8 @@ void DeltaSwitchingIterator::Next() {
 
     current_iter_->Next();
     
-    // 跳过与上一条相同 UserKey 的所有条目
+    // 跳过与上一条相同 UserKey 的所有条目，否则FindNextUserEntryInternalImpl会
+    // 出现错误Assertion `!skipping_saved_key || CompareKeyForSkip(ikey_.user_key, saved_key_.GetUserKey()) > 0' failed.
     while (current_iter_->Valid()) {
       Slice cur_user_key = ExtractUserKey(current_iter_->key());
       int cmp = icmp_.user_comparator()->Compare(cur_user_key, Slice(prev_user_key_buf_));
@@ -648,7 +629,6 @@ void DeltaSwitchingIterator::Next() {
       if (cmp != 0) {
         break;
       }
-
       current_iter_->Next();
     }
   } else {

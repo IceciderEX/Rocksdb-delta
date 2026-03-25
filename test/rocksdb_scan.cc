@@ -209,16 +209,7 @@ class PerfRunner {
               std::cerr << "[DIAG] CUID " << state.cuid << " has NO HotIndexEntry!" << std::endl;
             }
 
-            // Check buffer data count
-            auto* buf_iter = hotspot_mgr->NewBufferIterator(state.cuid, nullptr);
-            if (buf_iter) {
-              size_t buf_count = 0;
-              for (buf_iter->SeekToFirst(); buf_iter->Valid(); buf_iter->Next()) {
-                buf_count++;
-              }
-              std::cerr << "[DIAG] Buffer data count for CUID " << state.cuid << ": " << buf_count << std::endl;
-              delete buf_iter;
-            }
+            DoScan_Debug(state.cuid, final_rows, true, read_opts, stats);
           }
         }
         
@@ -226,9 +217,7 @@ class PerfRunner {
         pending_deletes.push_back({state.cuid, final_rows});
         active_cuids.erase(active_cuids.begin() + idx); 
 
-        // 补充一个新的血液到池子里
         add_new_cuid();
-
         // 推进删除滑动时间窗
         if (pending_deletes.size() > kDeleteWindowSize) {
           auto oldest = pending_deletes.front();
@@ -285,6 +274,42 @@ class PerfRunner {
     int count = 0;
     while (it->Valid()) {
       if (ExtractCUID(it->key()) != cuid) break;
+      count++;
+      it->Next();
+    }
+    delete it;
+    auto t_end = std::chrono::high_resolution_clock::now();
+    stats->AddScan(std::chrono::duration<double, std::milli>(t_end - t_start).count(), count);
+
+    return count;
+  }
+
+  int DoScan_Debug(uint64_t cuid, int cur_rows, bool full_scan, const rocksdb::ReadOptions& ro, ThreadStats* stats) {
+    std::string start_key, end_key;
+    if (full_scan) {
+      start_key = GenerateKey(cuid, 0);
+      end_key = GenerateKey(cuid + 1, 0);
+    } else {
+      int offset = std::max(0, cur_rows - 500);
+      start_key = GenerateKey(cuid, offset);
+      end_key = GenerateKey(cuid, cur_rows);
+    }
+
+    rocksdb::Slice upper_bound(end_key);
+    rocksdb::ReadOptions ro_copy = ro;
+    ro_copy.iterate_upper_bound = &upper_bound;
+    ro_copy.delta_full_scan = full_scan;
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+    rocksdb::Iterator* it = db_->NewIterator(ro_copy);
+    it->Seek(start_key);
+
+    int count = 0;
+    while (it->Valid()) {
+      if (ExtractCUID(it->key()) != cuid) break;
+      if (count % 100 == 0) {
+        fprintf(stderr, "Scanned key: %s\n", rocksdb::FormatKeyDisplay(it->key()).c_str());
+      }
       count++;
       it->Next();
     }

@@ -532,12 +532,12 @@ void HotspotManager::FinalizeScanAsCompaction(
     uint64_t cuid, const std::unordered_set<uint64_t>& visited_files,
     const std::string& scan_first_key, const std::string& scan_last_key) {
   if (cuid == 0) return;
-  auto unlock_guard = std::shared_ptr<void>(
-      nullptr, [this, cuid](void*) { this->UnlockCuid(cuid); });
+  auto unlock_guard = std::shared_ptr<void>( 
+    nullptr, [this, cuid](void*) { this->UnlockCuid(cuid); });
 
   std::vector<DataSegment> final_segments;
 
-  // Scan 过程中产生的 Pending SSTs【在 scan 的过程中flush】
+  // Scan 过程中产生的 Pending SSTs【在 scan 的过程中flush的】
   {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     auto it = pending_snapshots_.find(cuid);
@@ -546,8 +546,7 @@ void HotspotManager::FinalizeScanAsCompaction(
       pending_snapshots_.erase(it);
 
       // 处理由于并发或历史 bufferdata 残留的 SST seg 范围重叠问题
-      for (auto seg_it = final_segments.begin();
-           seg_it != final_segments.end();) {
+      for (auto seg_it = final_segments.begin(); seg_it != final_segments.end();) {
         // 只以这次 full scan 的 keyrange 为准
         if (internal_comparator_->Compare(seg_it->first_key, scan_first_key) <
             0) {
