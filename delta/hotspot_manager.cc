@@ -495,33 +495,24 @@ void HotspotManager::TriggerBufferFlush() {
           std::lock_guard<std::mutex> lock(pending_mutex_);
           auto it = pending_snapshots_.find(cuid);
           if (it != pending_snapshots_.end()) {
-            if (cuid == 1003) {
-              fprintf(stderr, "[DIAG_FLUSH] CUID 1003 Pending SST added: file %lu, range [%s - %s]\n", 
-                      real_segment.file_number, FormatKeyDisplay(real_segment.first_key).c_str(), 
-                      FormatKeyDisplay(real_segment.last_key).c_str());
-            }
             it->second.push_back(real_segment);
             added_to_pending = true;
           }
         }
 
-        if (!added_to_pending) {
-          // 无活跃 Scan，尝试 PromoteSnapshot（将 {-1} 内存段替换为真实 SST）
-          bool promoted = index_table_.PromoteSnapshot(
-              cuid, real_segment, &buffer_, internal_comparator_);
-          if (cuid == 1003) {
-            fprintf(stderr, "[DIAG_FLUSH] CUID 1003 PromoteSnapshot result: %s, file: %lu\n", 
-                    promoted ? "SUCCESS" : "FAILED", real_segment.file_number);
-          }
-          if (!promoted) {
-            // 既无活跃 Scan 也无 {-1} 段，强制 Append
-            ROCKS_LOG_WARN(db_options_.info_log,
-                           "[HotspotManager] No active scan or {-1} segment "
-                           "for CUID %" PRIu64
-                           ". Appending snapshot segment directly.",
-                           cuid);
-            index_table_.AppendSnapshotSegment(cuid, real_segment);
-          }
+        // 无论是否 added_to_pending，只要发生了flush，必须同步到 index
+        // 防止并发 Reader 因为 Buffer 没了而 sst segment 没更新导致的数据缺失
+        bool promoted = index_table_.PromoteSnapshot(
+            cuid, real_segment, &buffer_, internal_comparator_);
+
+        if (!promoted && !added_to_pending) {
+          // 既无活跃 Scan 也无 {-1} 段，说明是全新的 Snapshot 段，强制 Append
+          ROCKS_LOG_WARN(db_options_.info_log,
+                         "[HotspotManager] No active scan or {-1} segment "
+                         "for CUID %" PRIu64
+                         ". Appending snapshot segment directly.",
+                         cuid);
+          index_table_.AppendSnapshotSegment(cuid, real_segment);
         }
       }
     } else {
@@ -530,9 +521,6 @@ void HotspotManager::TriggerBufferFlush() {
                       s.ToString().c_str());
     }
     // 刷盘和index更新完成之后再移除
-    if (block) {
-        fprintf(stderr, "[DIAG_POP] Popping block %p from buffer queue\n", block.get());
-    }
     buffer_.PopFrontBlockAfterFlush();
     block = buffer_.GetFrontBlockForFlush();
   }
@@ -777,9 +765,6 @@ bool HotspotManager::IsHot(uint64_t cuid) {
 // --------------------- HotspotManager Iterator --------------------- //
 InternalIterator* HotspotManager::NewBufferIterator(
     uint64_t cuid, const InternalKeyComparator* icmp) {
-  if (cuid == 1003) {
-      fprintf(stderr, "[DIAG_MGR] Reader requesting NewBufferIterator for 1003\n");
-  }
   return buffer_.NewIterator(cuid, icmp);
 }
 
