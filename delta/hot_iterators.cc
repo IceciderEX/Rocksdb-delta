@@ -234,72 +234,80 @@ HotSnapshotIterator::~HotSnapshotIterator() {
 }
 
 bool HotSnapshotIterator::InitIterForSegment(size_t index) {
-  if (index >= segments_.size()) {
-    current_iter_.reset(nullptr);
-    current_segment_index_ = -1;
-    return false;
-  }
+  for (int retry = 0; retry < 10; ++retry) {
+    if (index >= segments_.size()) {
+      current_iter_.reset(nullptr);
+      current_segment_index_ = -1;
+      return false;
+    }
 
-  const auto& seg = segments_[index];
-  current_segment_index_ = static_cast<int>(index);
+    const auto& seg = segments_[index];
+    current_segment_index_ = static_cast<int>(index);
 
-  if (seg.file_number == static_cast<uint64_t>(-1)) {
-    // Case A: 内存 Buffer fileid -1
-    InternalIterator* mem_iter =
-        hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
-    
-    // 防止buffer data在线程调度时清空，再检查一次
-    mem_iter->SeekToFirst();
-    if (!mem_iter->Valid()) {
-      HotIndexEntry latest_entry;
-      if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry) && latest_entry.HasSnapshot()) {
-        bool snapshot_changed = false;
-        if (segments_.size() != latest_entry.snapshot_segments.size()) {
-           snapshot_changed = true;
-        } else {
-           for (size_t i = 0; i < segments_.size(); ++i) {
-               if (segments_[i].file_number != latest_entry.snapshot_segments[i].file_number) {
-                   snapshot_changed = true;
-                   break;
-               }
-           }
-        }
-        if (snapshot_changed) {
-          segments_ = latest_entry.snapshot_segments;
-          delete mem_iter;
-          return true;  // index again
+    if (seg.file_number == static_cast<uint64_t>(-1)) {
+      // Case A: 内存 Buffer fileid -1
+      InternalIterator* mem_iter =
+          hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
+      
+      // 防止buffer data在线程调度时清空，或者头部已经下刷为 SST，再检查一次
+      mem_iter->SeekToFirst();
+      if (!mem_iter->Valid() || icmp_.Compare(mem_iter->key(), seg.first_key) > 0) {
+        HotIndexEntry latest_entry;
+        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry) && latest_entry.HasSnapshot()) {
+          bool snapshot_changed = false;
+          if (segments_.size() != latest_entry.snapshot_segments.size()) {
+            snapshot_changed = true;
+          } else {
+            for (size_t i = 0; i < segments_.size(); ++i) {
+              if (segments_[i].file_number != latest_entry.snapshot_segments[i].file_number) {
+                snapshot_changed = true;
+                break;
+              }
+            }
+          }
+
+          if (snapshot_changed) {
+            segments_ = latest_entry.snapshot_segments;
+            delete mem_iter;
+            // 加载索引后，使用循环重试当前 index
+            continue;
+          }
         }
       }
+      current_iter_.reset(mem_iter);
+      // 使用 boundedIter，防止访问越界?
+      // current_iter_.reset(new BoundedMemIterator(mem_iter, seg.first_key, seg.last_key, &icmp_));
+      return false;
+    } else {
+      // Case B: 物理 SST
+      FileMetaData meta = MakeFileMetaFromSegment(seg, false);
+
+      current_read_options_ = read_options_;
+      current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
+      current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
+      current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
+      current_lower_bound_slice_ = Slice(current_lower_bound_str_);
+      current_upper_bound_slice_ = Slice(current_upper_bound_str_);
+      current_read_options_.iterate_lower_bound = &current_lower_bound_slice_;
+      current_read_options_.iterate_upper_bound = &current_upper_bound_slice_;
+
+      InternalIterator* iter = table_cache_->NewIterator(
+          current_read_options_, file_options_, icmp_, meta, nullptr,
+          mutable_cf_options_, nullptr, nullptr, TableReaderCaller::kUserIterator,
+          nullptr, false,
+          1,  // L1+
+          0, nullptr, nullptr,
+          false,  // allow_unprepared_value
+          nullptr, nullptr);
+
+      current_iter_.reset(iter);
+      return false;
     }
-    current_iter_.reset(mem_iter);
-    // 使用 boundedIter，防止访问越界?
-    // current_iter_.reset(new BoundedMemIterator(mem_iter, seg.first_key, seg.last_key, &icmp_));
-    return false;
-  } else {
-    // Case B: 物理 SST
-    FileMetaData meta = MakeFileMetaFromSegment(seg, false);
-
-    current_read_options_ = read_options_;
-    current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
-    current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
-    current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
-    current_lower_bound_slice_ = Slice(current_lower_bound_str_);
-    current_upper_bound_slice_ = Slice(current_upper_bound_str_);
-    current_read_options_.iterate_lower_bound = &current_lower_bound_slice_;
-    current_read_options_.iterate_upper_bound = &current_upper_bound_slice_;
-
-    InternalIterator* iter = table_cache_->NewIterator(
-        current_read_options_, file_options_, icmp_, meta, nullptr,
-        mutable_cf_options_, nullptr, nullptr, TableReaderCaller::kUserIterator,
-        nullptr, false,
-        1,  // L1+
-        0, nullptr, nullptr,
-        false,  // allow_unprepared_value
-        nullptr, nullptr);
-
-    current_iter_.reset(iter);
-    return false;
   }
+  // 重试 10 次都没成功？
+  // 说明元数据可能真的坏了?
+  current_iter_.reset(nullptr);
+  return false;
 }
 
 void HotSnapshotIterator::Seek(const Slice& target) {

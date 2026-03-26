@@ -214,34 +214,37 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
           int i = 0;
           count = i;
         }
-      } else {
-        auto hotspot_mgr = dynamic_cast<DBImpl*>(db)->GetHotspotManager();
-        if (hotspot_mgr) {
-          HotIndexEntry diag_entry;
-          if (hotspot_mgr->GetHotIndexEntry(cuid, &diag_entry)) {
-            std::cerr << "[DIAG] CUID " << cuid << " snapshot_segments="
-                      << diag_entry.snapshot_segments.size()
-                      << " deltas=" << diag_entry.deltas.size() << std::endl;
-            for (size_t si = 0; si < diag_entry.snapshot_segments.size();
-                si++) {
-              const auto& seg = diag_entry.snapshot_segments[si];
-              std::cerr << "[DIAG]   snap[" << si
-                        << "] file=" << (int64_t)seg.file_number
-                        << " first_key=" << FormatKeyDisplay(seg.first_key)
-                        << " last_key=" << FormatKeyDisplay(seg.last_key)
+      } 
+      else {
+        if (rand() % 100 < 5) {
+          auto hotspot_mgr = dynamic_cast<DBImpl*>(db)->GetHotspotManager();
+          if (hotspot_mgr) {
+            HotIndexEntry diag_entry;
+            if (hotspot_mgr->GetHotIndexEntry(cuid, &diag_entry)) {
+              std::cerr << "[DIAG] CUID " << cuid << " snapshot_segments="
+                        << diag_entry.snapshot_segments.size()
+                        << " deltas=" << diag_entry.deltas.size() << std::endl;
+              for (size_t si = 0; si < diag_entry.snapshot_segments.size();
+                  si++) {
+                const auto& seg = diag_entry.snapshot_segments[si];
+                std::cerr << "[DIAG]   snap[" << si
+                          << "] file=" << (int64_t)seg.file_number
+                          << " first_key=" << FormatKeyDisplay(seg.first_key)
+                          << " last_key=" << FormatKeyDisplay(seg.last_key)
+                          << std::endl;
+              }
+              for (size_t di = 0; di < diag_entry.deltas.size(); di++) {
+                const auto& seg = diag_entry.deltas[di];
+                std::cerr << "[DIAG]   delta[" << di
+                          << "] file=" << (int64_t)seg.file_number
+                          << " first_key=" << FormatKeyDisplay(seg.first_key)
+                          << " last_key=" << FormatKeyDisplay(seg.last_key)
+                          << std::endl;
+              }
+            } else {
+              std::cerr << "[DIAG] CUID " << cuid << " has NO HotIndexEntry!"
                         << std::endl;
             }
-            for (size_t di = 0; di < diag_entry.deltas.size(); di++) {
-              const auto& seg = diag_entry.deltas[di];
-              std::cerr << "[DIAG]   delta[" << di
-                        << "] file=" << (int64_t)seg.file_number
-                        << " first_key=" << FormatKeyDisplay(seg.first_key)
-                        << " last_key=" << FormatKeyDisplay(seg.last_key)
-                        << std::endl;
-            }
-          } else {
-            std::cerr << "[DIAG] CUID " << cuid << " has NO HotIndexEntry!"
-                      << std::endl;
           }
         }
       }
@@ -277,7 +280,7 @@ int main() {
   options.delta_options.delta_merge_threshold = 3;
   options.delta_options.sac_delta_count_threshold = 5;
   options.delta_options.sharding_count = 64; // Power of 2 recommended
-  options.delta_options.hot_data_buffer_threshold_bytes = 2 * 1024 * 1024;
+  options.delta_options.hot_data_buffer_threshold_bytes = 128 * 1024;
   options.delta_options.hot_data_buffer_shards = 128;
   options.delta_options.compaction_l0_trigger_count = 20;
   options.delta_options.compaction_l0_trigger_age_sec = 3600;
@@ -311,7 +314,7 @@ int main() {
   std::thread writer(WriterThread, db, cuids);
   std::thread reader1(ReaderThread, db, cuids, 1);
   std::thread reader2(ReaderThread, db, cuids, 2);
-  // std::thread reader3(ReaderThread, db, cuids, 3);
+  std::thread reader3(ReaderThread, db, cuids, 3);
   std::thread manager(ManagerThread, db_impl);
 
   auto start_time = std::chrono::steady_clock::now();

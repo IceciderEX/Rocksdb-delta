@@ -627,6 +627,27 @@ void HotspotManager::FinalizeScanAsCompaction(
     return;
   }
 
+  // sort and cut segment
+  std::sort(final_segments.begin(), final_segments.end(),
+            [this](const DataSegment& a, const DataSegment& b) {
+              return internal_comparator_->Compare(a.first_key, b.first_key) < 0;
+            });
+  for (size_t i = 0; i + 1 < final_segments.size(); ++i) {
+    if (internal_comparator_->Compare(final_segments[i].last_key,
+                                      final_segments[i + 1].first_key) > 0) {
+      final_segments[i].last_key = final_segments[i + 1].first_key;
+    }
+  }
+  // 5. 移除裁剪后失效的空段 (first_key >= last_key)
+  for (auto it = final_segments.begin(); it != final_segments.end(); ) {
+    if (!it->last_key.empty() && 
+        internal_comparator_->Compare(it->first_key, it->last_key) >= 0) {
+      it = final_segments.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
   // 【debug】验证拼接出来的 final_segments 是不是重叠的
   if (final_segments.size() > 1) {
     for (size_t i = 0; i < final_segments.size() - 1; ++i) {
