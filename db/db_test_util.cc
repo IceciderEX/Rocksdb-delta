@@ -103,9 +103,11 @@ DBTestBase::DBTestBase(const std::string path, bool env_do_fsync)
 }
 
 DBTestBase::~DBTestBase() {
+#ifndef NDEBUG
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({});
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+#endif
   Close();
   Options options;
   options.db_paths.emplace_back(dbname_, 0);
@@ -349,10 +351,12 @@ Options DBTestBase::GetOptions(
   bool set_block_based_table_factory = true;
 #if !defined(OS_MACOSX) && !defined(OS_WIN) && !defined(OS_SOLARIS) && \
     !defined(OS_AIX)
+#ifndef NDEBUG
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
       "NewRandomAccessFile:O_DIRECT");
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
       "NewWritableFile:O_DIRECT");
+#endif
 #endif
   // kMustFreeHeapAllocations -> indicates ASAN build
   if (kMustFreeHeapAllocations && !options_override.full_block_cache) {
@@ -418,7 +422,9 @@ Options DBTestBase::GetOptions(
       options.use_direct_reads = true;
       options.use_direct_io_for_flush_and_compaction = true;
       options.compaction_readahead_size = 2 * 1024 * 1024;
+#ifndef NDEBUG
       SetupSyncPointsToMockDirectIO();
+#endif
       break;
     }
     case kMergePut:
@@ -1354,14 +1360,25 @@ void DBTestBase::MoveFilesToLevel(int level, ColumnFamilyHandle* column_family,
                                   DB* db) {
   DBImpl* db_impl = db ? static_cast<DBImpl*>(db) : dbfull();
   for (int l = 0; l < level; ++l) {
+#ifndef NDEBUG
     EXPECT_OK(db_impl->TEST_CompactRange(l, nullptr, nullptr, column_family));
+#else
+    CompactRangeOptions cro;
+    cro.change_level = true;
+    cro.target_level = l;
+    EXPECT_OK(db_impl->CompactRange(cro, column_family, nullptr, nullptr));
+#endif
   }
 }
 
 void DBTestBase::DumpFileCounts(const char* label) {
   fprintf(stderr, "---\n%s:\n", label);
+#ifndef NDEBUG
   fprintf(stderr, "maxoverlap: %" PRIu64 "\n",
           dbfull()->TEST_MaxNextLevelOverlappingBytes());
+#else
+  fprintf(stderr, "maxoverlap: %" PRIu64 "\n", static_cast<uint64_t>(0));
+#endif
   for (int level = 0; level < db_->NumberLevels(); level++) {
     int num = NumTableFilesAtLevel(level);
     if (num > 0) {
@@ -1404,8 +1421,13 @@ void DBTestBase::GenerateNewFile(int cf, Random* rnd, int* key_idx,
     (*key_idx)++;
   }
   if (!nowait) {
+#ifndef NDEBUG
     ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
     ASSERT_OK(dbfull()->TEST_WaitForCompact());
+#else
+    ASSERT_OK(Flush(cf));
+    ASSERT_OK(db_->WaitForCompact(WaitForCompactOptions()));
+#endif
   }
 }
 
@@ -1416,8 +1438,13 @@ void DBTestBase::GenerateNewFile(Random* rnd, int* key_idx, bool nowait) {
     (*key_idx)++;
   }
   if (!nowait) {
+#ifndef NDEBUG
     ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
     ASSERT_OK(dbfull()->TEST_WaitForCompact());
+#else
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->WaitForCompact(WaitForCompactOptions()));
+#endif
   }
 }
 
@@ -1429,8 +1456,13 @@ void DBTestBase::GenerateNewRandomFile(Random* rnd, bool nowait) {
   }
   ASSERT_OK(Put("key" + rnd->RandomString(7), rnd->RandomString(200)));
   if (!nowait) {
+#ifndef NDEBUG
     ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
     ASSERT_OK(dbfull()->TEST_WaitForCompact());
+#else
+    ASSERT_OK(Flush());
+    ASSERT_OK(db_->WaitForCompact(WaitForCompactOptions()));
+#endif
   }
 }
 

@@ -20,6 +20,7 @@
 
 #pragma once
 #include <atomic>
+#include <array>
 #include <deque>
 #include <limits>
 #include <map>
@@ -339,6 +340,18 @@ class VersionStorageInfo {
     return files_[level];
   }
 
+  // REQUIRES: PrepareForVersionAppend has been called
+  // Returns cached L0 files that belong to the given partition.
+  const std::vector<FileMetaData*>& Level0FilesForPartition(
+      int32_t partition_id) const {
+    assert(finalized_);
+    if (partition_id < 0 ||
+        partition_id >= static_cast<int32_t>(kL0PartitionIndexCount)) {
+      return empty_l0_partition_files_;
+    }
+    return l0_partition_files_[static_cast<size_t>(partition_id)];
+  }
+
   bool HasMissingEpochNumber() const;
   uint64_t GetMaxEpochNumberOfFiles() const;
   EpochNumberRequirement GetEpochNumberRequirement() const {
@@ -655,9 +668,12 @@ class VersionStorageInfo {
   }
 
   void GenerateLevelFilesBrief();
+  void GenerateLevel0PartitionFiles();
   void GenerateLevel0NonOverlapping();
   void GenerateBottommostFiles();
   void GenerateFileLocationIndex();
+
+  static constexpr size_t kL0PartitionIndexCount = 16;
 
   const InternalKeyComparator* internal_comparator_;
   const Comparator* user_comparator_;
@@ -679,6 +695,11 @@ class VersionStorageInfo {
   // In L0, files are ordered in decreasing epoch number, meaning
   // more recent updates are ordered first.
   std::vector<FileMetaData*>* files_;
+
+  // Cached mapping: partition_id -> L0 files in that partition.
+  std::array<std::vector<FileMetaData*>, kL0PartitionIndexCount>
+      l0_partition_files_;
+  std::vector<FileMetaData*> empty_l0_partition_files_;
 
   // Map of all table files in version. Maps file number to (level, position on
   // level).

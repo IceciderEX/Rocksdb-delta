@@ -1286,11 +1286,27 @@ class LevelIterator final : public InternalIterator {
     }
   }
 
+  // 对比文件所处分区是否等于指定分区
+  bool FileMatchesReadPartition(size_t file_index) const {
+    if (!mutable_cf_options_.delta_options.enable_partition ||
+        read_options_.read_partition_id < 0) {
+      return true;
+    }
+    // 比较文件元数据中的 partition_id 与请求的 partition_id
+    return static_cast<int32_t>(flevel_->files[file_index]
+                                    .file_metadata
+                                    ->partition_id) == read_options_.read_partition_id;
+  }
+
   // Move file_iter_ to the file at file_index_.
   // range_tombstone_iter_ is updated with a range tombstone iterator
   // into the new file. Old range tombstone iterator is cleared.
   InternalIterator* NewFileIterator() {
     assert(file_index_ < flevel_->num_files);
+    // 跳过非本分区的文件
+    if (!FileMatchesReadPartition(file_index_)) {
+      return nullptr;
+    }
     auto file_meta = flevel_->files[file_index_];
     if (should_sample_) {
       sample_file_read_inc(file_meta.file_metadata);
@@ -1419,7 +1435,8 @@ void LevelIterator::Seek(const Slice& target) {
   bool need_to_reseek = true;
   if (file_iter_.iter() != nullptr && file_index_ < flevel_->num_files) {
     const FdWithKeyRange& cur_file = flevel_->files[file_index_];
-    if (icomparator_.InternalKeyComparator::Compare(
+    if (FileMatchesReadPartition(file_index_) &&
+      icomparator_.InternalKeyComparator::Compare(
             target, cur_file.largest_key) <= 0 &&
         icomparator_.InternalKeyComparator::Compare(
             target, cur_file.smallest_key) >= 0) {
@@ -2358,22 +2375,48 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
   if (level == 0) {
     // Merge all level zero files together since they may overlap
     std::unique_ptr<TruncatedRangeDelIterator> tombstone_iter = nullptr;
-    for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
-      const auto& file = storage_info_.LevelFilesBrief(0).files[i];
-      auto table_iter = cfd_->table_cache()->NewIterator(
-          read_options, soptions, cfd_->internal_comparator(),
-          *file.file_metadata, /*range_del_agg=*/nullptr, mutable_cf_options_,
-          nullptr, cfd_->internal_stats()->GetFileReadHist(0),
-          TableReaderCaller::kUserIterator, arena,
-          /*skip_filters=*/false, /*level=*/0, max_file_size_for_l0_meta_pin_,
-          /*smallest_compaction_key=*/nullptr,
-          /*largest_compaction_key=*/nullptr, allow_unprepared_value,
-          /*range_del_read_seqno=*/nullptr, &tombstone_iter);
-      if (read_options.ignore_range_deletions) {
-        merge_iter_builder->AddIterator(table_iter);
-      } else {
-        merge_iter_builder->AddPointAndTombstoneIterator(
-            table_iter, std::move(tombstone_iter));
+    const bool use_partition_index =
+        mutable_cf_options_.delta_options.enable_partition &&
+        read_options.read_partition_id >= 0;
+
+    if (use_partition_index) {
+      const auto& partition_files =
+          storage_info_.Level0FilesForPartition(read_options.read_partition_id);
+      for (const auto* file_meta : partition_files) {
+        auto table_iter = cfd_->table_cache()->NewIterator(
+            read_options, soptions, cfd_->internal_comparator(), *file_meta,
+            /*range_del_agg=*/nullptr, mutable_cf_options_, nullptr,
+            cfd_->internal_stats()->GetFileReadHist(0),
+            TableReaderCaller::kUserIterator, arena,
+            /*skip_filters=*/false, /*level=*/0, max_file_size_for_l0_meta_pin_,
+            /*smallest_compaction_key=*/nullptr,
+            /*largest_compaction_key=*/nullptr, allow_unprepared_value,
+            /*range_del_read_seqno=*/nullptr, &tombstone_iter);
+        if (read_options.ignore_range_deletions) {
+          merge_iter_builder->AddIterator(table_iter);
+        } else {
+          merge_iter_builder->AddPointAndTombstoneIterator(
+              table_iter, std::move(tombstone_iter));
+        }
+      }
+    } else {
+      for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
+        const auto& file = storage_info_.LevelFilesBrief(0).files[i];
+        auto table_iter = cfd_->table_cache()->NewIterator(
+            read_options, soptions, cfd_->internal_comparator(),
+            *file.file_metadata, /*range_del_agg=*/nullptr, mutable_cf_options_,
+            nullptr, cfd_->internal_stats()->GetFileReadHist(0),
+            TableReaderCaller::kUserIterator, arena,
+            /*skip_filters=*/false, /*level=*/0, max_file_size_for_l0_meta_pin_,
+            /*smallest_compaction_key=*/nullptr,
+            /*largest_compaction_key=*/nullptr, allow_unprepared_value,
+            /*range_del_read_seqno=*/nullptr, &tombstone_iter);
+        if (read_options.ignore_range_deletions) {
+          merge_iter_builder->AddIterator(table_iter);
+        } else {
+          merge_iter_builder->AddPointAndTombstoneIterator(
+              table_iter, std::move(tombstone_iter));
+        }
       }
     }
     if (should_sample) {
@@ -2381,8 +2424,16 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
       // rather than Seek(), while files in other levels are recored per seek.
       // If users execute one range query per iterator, there may be some
       // discrepancy here.
-      for (FileMetaData* meta : storage_info_.LevelFiles(0)) {
-        sample_file_read_inc(meta);
+      if (use_partition_index) {
+        const auto& partition_files =
+            storage_info_.Level0FilesForPartition(read_options.read_partition_id);
+        for (FileMetaData* meta : partition_files) {
+          sample_file_read_inc(meta);
+        }
+      } else {
+        for (FileMetaData* meta : storage_info_.LevelFiles(0)) {
+          sample_file_read_inc(meta);
+        }
       }
     }
   } else if (storage_info_.LevelFilesBrief(level).num_files > 0) {
@@ -2754,6 +2805,14 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   FdWithKeyRange* f = fp.GetNextFile();
 
   while (f != nullptr) {
+    // 跳过分区不匹配的文件
+    if (mutable_cf_options_.delta_options.enable_partition &&
+      read_options.read_partition_id >= 0 &&
+        static_cast<int32_t>(f->file_metadata->partition_id) !=
+            read_options.read_partition_id) {
+      f = fp.GetNextFile();
+      continue;
+    }
     if (*max_covering_tombstone_seq > 0) {
       // The remaining files we look at will only contain covered keys, so we
       // stop here.
@@ -3404,6 +3463,26 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
   }
 }
 
+void VersionStorageInfo::GenerateLevel0PartitionFiles() {
+  for (auto& files_in_partition : l0_partition_files_) {
+    files_in_partition.clear();
+  }
+
+  if (num_levels_ <= 0) {
+    return;
+  }
+
+  for (FileMetaData* f : files_[0]) {
+    if (f == nullptr) {
+      continue;
+    }
+    const uint32_t partition_id = f->partition_id;
+    if (partition_id < kL0PartitionIndexCount) {
+      l0_partition_files_[partition_id].push_back(f);
+    }
+  }
+}
+
 void VersionStorageInfo::PrepareForVersionAppend(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options) {
@@ -3413,6 +3492,7 @@ void VersionStorageInfo::PrepareForVersionAppend(
   UpdateFilesByCompactionPri(immutable_options, mutable_cf_options);
   GenerateFileIndexer();
   GenerateLevelFilesBrief();
+  GenerateLevel0PartitionFiles();
   GenerateLevel0NonOverlapping();
   GenerateBottommostFiles();
   GenerateFileLocationIndex();

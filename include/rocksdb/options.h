@@ -60,6 +60,9 @@ class FileSystem;
 class UserDefinedIndexFactory;
 // for delta
 struct DeltaOptions {
+  // Enable partition-aware flush/read/compaction for L0.
+  bool enable_partition = false;
+
   // Hotness Detection
   uint64_t hotspot_scan_threshold = 200;
   uint64_t hotspot_scan_window_sec = 600;
@@ -87,7 +90,8 @@ struct DeltaOptions {
   uint32_t sharding_count = 128;
 
   bool operator==(const DeltaOptions& other) const {
-    return hotspot_scan_threshold == other.hotspot_scan_threshold &&
+      return enable_partition == other.enable_partition &&
+        hotspot_scan_threshold == other.hotspot_scan_threshold &&
            hotspot_scan_window_sec == other.hotspot_scan_window_sec &&
            delta_merge_threshold == other.delta_merge_threshold &&
            sac_delta_count_threshold == other.sac_delta_count_threshold &&
@@ -2331,6 +2335,10 @@ struct ReadOptions {
   bool skip_hot_path = false;
   // 用于标记是否为系统后台触发的 Metadata Scan，如果是，则不执行缓冲和替换
   bool is_metadata_scan = false;
+  // for delta
+  // 将读取/扫描操作限制在特定分区上。-1 表示所有分区。
+  // 仅在 delta_options.enable_partition=true 时生效。
+  int32_t read_partition_id = -1;
 
   ReadOptions() {}
   ReadOptions(bool _verify_checksums, bool _fill_cache);

@@ -1703,3 +1703,11 @@ endif()
 # for delta
 add_executable(rocksdb_scan test/rocksdb_scan.cc db/db_test_util.cc)
 target_link_libraries(rocksdb_scan rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+
+# for delta partition correctness verification
+add_executable(rocksdb_partition_verify test/rocksdb_partition_verify.cc db/db_test_util.cc)
+target_link_libraries(rocksdb_partition_verify rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+
+# for delta partition/index effectiveness verification on larger datasets
+add_executable(rocksdb_partition_index_large_test test/rocksdb_partition_index_large_test.cc db/db_test_util.cc)
+target_link_libraries(rocksdb_partition_index_large_test rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})

@@ -1555,6 +1555,8 @@ Compaction* UniversalCompactionBuilder::PickDeleteTriggeredCompaction() {
       if (start_level == 0) {
         if (!picker_->GetOverlappingL0Files(vstorage_, &start_level_inputs,
                                             output_level, nullptr,
+                                            mutable_cf_options_.delta_options
+                                                .enable_partition,
                                             starting_l0_file)) {
           return nullptr;
         }

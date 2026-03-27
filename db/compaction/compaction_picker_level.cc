@@ -336,7 +336,8 @@ void LevelCompactionBuilder::SetupInitialFiles() {
 bool LevelCompactionBuilder::SetupOtherL0FilesIfNeeded() {
   if (start_level_ == 0 && output_level_ != 0 && !is_l0_trivial_move_) {
     return compaction_picker_->GetOverlappingL0Files(
-        vstorage_, &start_level_inputs_, output_level_, &parent_index_);
+      vstorage_, &start_level_inputs_, output_level_, &parent_index_,
+      mutable_cf_options_.delta_options.enable_partition);
   }
   return true;
 }
@@ -529,6 +530,8 @@ void LevelCompactionBuilder::SetupInitialFilesDelta() {
 // for delta
 // 选取最老的 N 个文件进行 L0->L0 合并
 bool LevelCompactionBuilder::PickMixedL0Compaction() {
+  const bool enable_partition =
+      mutable_cf_options_.delta_options.enable_partition;
   // 策略阈值
   const int kL0TriggerCount =
       mutable_cf_options_.delta_options.compaction_l0_trigger_count;
@@ -563,23 +566,26 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
     return false;
   }
 
+  // for delta
   // 选最早生成的 kFilesToPick 个文件
-  // [Size - Pick ... Size - 1]？
-  size_t pick_count = std::min(kFilesToPick, total_files);
+  // [Size - Pick ... Size - 1]，且限定单一 partition
+  size_t start_index = total_files - 1;
+  const uint32_t target_partition = l0_files[start_index]->partition_id;
 
-  // 超时触发的且文件数不足 10 个
-  if (trigger_by_time && pick_count < kFilesToPick) {
-      pick_count = total_files;
-  }
-
-  size_t start_index = total_files - pick_count;
   start_level_inputs_.level = 0;
   start_level_inputs_.files.clear();
   start_level_ = 0;
   output_level_ = 0; // L0 -> L0
 
-  for (size_t i = start_index; i < total_files; ++i) {
-    FileMetaData* f = l0_files[i];
+  for (size_t i = total_files; i > 0; --i) {
+    size_t idx = i - 1;
+    FileMetaData* f = l0_files[idx];
+    if (enable_partition && f->partition_id != target_partition) {
+      continue;
+    }
+    if (start_level_inputs_.files.size() >= kFilesToPick) {
+      break;
+    }
     // 检查并发冲突的逻辑？？
     if (f->being_compacted) {
       // TODO：如果最老的数据正在合并，直接abandon这次compaction？
@@ -587,6 +593,11 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
       return false;
     }
     start_level_inputs_.files.push_back(f);
+  }
+
+  if (start_level_inputs_.files.size() < 2) {
+    start_level_inputs_.clear();
+    return false;
   }
 
 
@@ -648,6 +659,19 @@ Compaction* LevelCompactionBuilder::GetCompaction() {
   // compaction_inputs_[0].size() == 1 since SetupOtherL0FilesIfNeeded() did not
   // pull in more L0s.
   assert(!compaction_inputs_.empty());
+  if (mutable_cf_options_.delta_options.enable_partition) {
+    uint32_t partition_id = compaction_inputs_[0].files[0]->partition_id;
+    for (const auto& input_level : compaction_inputs_) {
+      for (const auto* f : input_level.files) {
+        if (f->partition_id != partition_id) {
+          ROCKS_LOG_BUFFER(
+              log_buffer_,
+              "[Delta-Opt] Skip compaction with mixed partitions");
+          return nullptr;
+        }
+      }
+    }
+  }
   bool l0_files_might_overlap =
       start_level_ == 0 && !is_l0_trivial_move_ &&
       (compaction_inputs_.size() > 1 || compaction_inputs_[0].size() > 1);

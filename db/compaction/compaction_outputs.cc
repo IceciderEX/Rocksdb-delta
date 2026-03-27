@@ -11,6 +11,7 @@
 #include "db/compaction/compaction_outputs.h"
 
 #include "db/builder.h"
+#include "util/l0_partition.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -432,6 +433,13 @@ Status CompactionOutputs::AddToOutput(
   }
 
   const ParsedInternalKey& ikey = c_iter.ikey();
+  // for delta
+  // 提取分区id
+  if (compaction_->mutable_cf_options().delta_options.enable_partition &&
+      current_output().meta.smallest.size() == 0) {
+    current_output().meta.partition_id =
+        ExtractL0PartitionFromUserKey(ikey.user_key);
+  }
   if (ikey.type == kTypeValuePreferredSeqno) {
     SequenceNumber preferred_seqno = ParsePackedValueForSeqno(value);
     smallest_preferred_seqno_ =
