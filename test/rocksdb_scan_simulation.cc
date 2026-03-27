@@ -31,9 +31,9 @@
 // ==========================================
 const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_native";
 const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_delta";
-const int kNumThreads = 32;             // number of concurrent threads
-const int kTestDurationSec = 600;       // time in seconds
-const int kNumCuids = 1000000;          // 100W CUID 总库
+const int kNumThreads = 16;
+const int kTestDurationSec = 600;       // s
+const int kNumCuids = 1000000;           // 100W CUID 总库
 const int kBatchSize = 512;             // 每次 Put 128 行
 const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
 const double kHotRatio = 0.15;          // 15% 的热点
@@ -422,6 +422,7 @@ int main() {
   };
 
   run_benchmark(kDeltaDBPath, true, "DELTA MODE");
+  // 70w
   run_benchmark(kNativeDBPath, false, "NATIVE MODE");
 
   return 0;

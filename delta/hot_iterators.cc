@@ -525,14 +525,14 @@ bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
     if (same) return false; 
   }
 
-  if (cuid_ == 1003) {
-    fprintf(stderr,
-            "[DIAG_RESYNC] CUID %lu: Map changed! Old segs: %zu, New segs: "
-            "%zu. Relocating from prev_key: %s\n",
-            cuid_, segments_.size(),
-            latest_entry.snapshot_segments.size(),
-            FormatKeyDisplay(prev_key).c_str());
-  }
+  // if (cuid_ == 1003) {
+  //   fprintf(stderr,
+  //           "[DIAG_RESYNC] CUID %lu: Map changed! Old segs: %zu, New segs: "
+  //           "%zu. Relocating from prev_key: %s\n",
+  //           cuid_, segments_.size(),
+  //           latest_entry.snapshot_segments.size(),
+  //           FormatKeyDisplay(prev_key).c_str());
+  // }
 
   segments_ = latest_entry.snapshot_segments;
   resync_count_++;

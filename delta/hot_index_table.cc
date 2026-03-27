@@ -117,15 +117,15 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
       }
 
       // [DIAG] 打印重叠处理情况
-      fprintf(stderr,
-              "[DIAG_PROMOTE] CUID %lu: %s Segment %lu [%s - %s] split by SST "
-              "%lu [%s - %s]\n",
-              cuid,
-              seg.file_number == static_cast<uint64_t>(-1) ? "Mem" : "Phys",
-              seg.file_number, FormatKeyDisplay(seg.first_key).c_str(),
-              FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
-              FormatKeyDisplay(new_segment.first_key).c_str(),
-              FormatKeyDisplay(new_segment.last_key).c_str());
+      // fprintf(stderr,
+      //         "[DIAG_PROMOTE] CUID %lu: %s Segment %lu [%s - %s] split by SST "
+      //         "%lu [%s - %s]\n",
+      //         cuid,
+      //         seg.file_number == static_cast<uint64_t>(-1) ? "Mem" : "Phys",
+      //         seg.file_number, FormatKeyDisplay(seg.first_key).c_str(),
+      //         FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
+      //         FormatKeyDisplay(new_segment.first_key).c_str(),
+      //         FormatKeyDisplay(new_segment.last_key).c_str());
     } else {
       next_segments.push_back(seg);
     }
