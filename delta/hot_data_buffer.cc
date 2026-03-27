@@ -60,6 +60,9 @@ bool HotDataBuffer::RotateBuffer(const InternalKeyComparator* icmp) {
   
   std::lock_guard<std::mutex> global_lock(global_queue_mutex_);
   
+  // [DIAG] 记录合并开始
+  // fprintf(stderr, "[DIAG_GAP] RotateBuffer Merge START. GlobalQ size: %zu\n", immutable_queue_.size());
+  
   for (size_t i = 0; i < shards_.size(); ++i) {
     std::lock_guard<std::mutex> shard_lock(shards_[i].mutex);
     
@@ -101,12 +104,15 @@ bool HotDataBuffer::RotateBuffer(const InternalKeyComparator* icmp) {
   // sort 确保 Reader 有序
   combined_block->Sort(icmp);
   immutable_queue_.push_back(combined_block);
+  // [DIAG] 记录合并结束
+  // fprintf(stderr, "[DIAG_GAP] RotateBuffer Merge END. Block added to GlobalQ.\n");
   return true;
 }
 
 std::shared_ptr<HotDataBlock> HotDataBuffer::GetFrontBlockForFlush() {
   std::lock_guard<std::mutex> lock(global_queue_mutex_);
   if (immutable_queue_.empty()) return nullptr;
+  // fprintf(stderr, "[DIAG_GAP] GetFrontBlockForFlush called. GlobalQ size: %zu\n", immutable_queue_.size());
   return immutable_queue_.front();
 }
 
@@ -238,12 +244,40 @@ InternalIterator* HotDataBuffer::NewIterator(
     }
   } // two lock ends
 
+  // if (cuid == 1003) {
+  //     if (filtered_entries.empty()) {
+  //         Shard& s = GetShard(cuid);
+  //         fprintf(stderr, "[DIAG_DATA] CUID 1003 EMPTY! ShardQ: %zu, GlobalQ: %zu, ActiveBuckets: %zu\n",
+  //                 s.immutable_queue.size(), immutable_queue_.size(), s.active_block->buckets.size());
+  //     } else {
+  //         std::string first_hex = Slice(filtered_entries.front().key).ToString(true);
+  //         std::string last_hex = Slice(filtered_entries.back().key).ToString(true);
+  //         fprintf(stderr, "[DIAG_DATA] CUID 1003 size=%zu, FirstHex: %s\n", 
+  //                 filtered_entries.size(), first_hex.substr(0, 60).c_str());
+  //         fprintf(stderr, "[DIAG_DATA] CUID 1003 LastHex: %s\n", 
+  //                 last_hex.substr(0, 60).c_str());
+  //     }
+  // }
+
   // 不同 block 之间可能重叠？
   std::sort(filtered_entries.begin(), filtered_entries.end(),
             [icmp](const HotEntry& a, const HotEntry& b) {
               return icmp->Compare(Slice(a.key), Slice(b.key)) < 0;
             });
-  // // 需要进行重复检查，防止 dbiter 报错
+  // [DIAG] 排序自检
+  // if (filtered_entries.size() > 1) {
+  //   if (cuid == 1003) {
+  //       fprintf(stderr, "[DIAG_KEY] NewIterator 1003 First Key Size: %zu\n", filtered_entries[0].key.size());
+  //   }
+  //   for (size_t i = 0; i < filtered_entries.size() - 1; ++i) {
+  //     if (icmp->Compare(filtered_entries[i].key, filtered_entries[i+1].key) > 0) {
+  //       fprintf(stderr, "[DIAG_SORT_ERROR] CUID %lu: Keys are NOT monotonic at index %zu!\n", cuid, i);
+  //     }
+  //   }
+  // }
+
+  // 需要进行重复检查，防止 dbiter 报错?
+  // 性能考虑还是不要了？
   // auto last = std::unique(filtered_entries.begin(), filtered_entries.end(),
   //                         [icmp](const HotEntry& a, const HotEntry& b) {
   //                           return icmp->Compare(Slice(a.key), Slice(b.key)) == 0;

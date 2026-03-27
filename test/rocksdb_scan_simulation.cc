@@ -31,11 +31,11 @@
 // ==========================================
 const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_native";
 const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_delta";
-const int kNumThreads = 16;
-const int kTestDurationSec = 240;       // s
-const int kNumCuids = 100000;           // 10W CUID 总库
-const int kBatchSize = 128;             // 每次 Put 128 行
-const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (约 25,600 行)
+const int kNumThreads = 32;             // number of concurrent threads
+const int kTestDurationSec = 600;       // time in seconds
+const int kNumCuids = 1000000;          // 100W CUID 总库
+const int kBatchSize = 512;             // 每次 Put 128 行
+const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
 const double kHotRatio = 0.15;          // 15% 的热点
 const int kHotScanTarget = 1000;        // 热点访问目标
 const int kColdScanTarget = 150;        // 普通访问目标
@@ -107,13 +107,14 @@ class PerfRunner {
   PerfRunner(rocksdb::DB* db, std::atomic<uint64_t>* next_cuid) 
       : db_(db), next_cuid_(next_cuid) {}
 
-  struct CuidState {
-    uint64_t cuid;
-    bool is_hot;
-    int target_scans;
-    int puts_done = 0;
-    int scans_done = 0;
-  };
+    struct CuidState {
+      uint64_t cuid;
+      bool is_hot;
+      int target_scans;
+      int puts_done = 0;
+      int scans_done = 0;
+      std::chrono::steady_clock::time_point last_scan_time = std::chrono::steady_clock::now();
+    };
 
   void Run(int thread_id, std::atomic<bool>* stop, ThreadStats* stats) {
     std::default_random_engine gen(thread_id + static_cast<int>(time(0)));
@@ -123,12 +124,12 @@ class PerfRunner {
     std::vector<CuidState> active_cuids;
     std::deque<std::pair<uint64_t, int>> pending_deletes;
     
-    // === 调整生命周期参数 ===
-    // 之前设置了 50+50 导致240秒内根本填不满滑动窗口，没触发删除
-    // 现在调整为：并发25个活跃 + 10个等待删除 = 35个/线程
-    // 16线程全局共有约 560 个 CUID，超过 1GB 数据，足以压入 L1/L2
-    const size_t kMaxActiveCuids = 25;   
-    const size_t kDeleteWindowSize = 10; 
+    // === 100GB 目标数据量计算过程 ===
+    // 单个 CUID 数据量约：512 batch * 200 rows/batch * 72 bytes/row ≈ 7.37 MB
+    // 实现 100GB 常驻数据需 100,000 / 7.37 ≈ 13,568 个 CUID
+    // 设 16 线程，则每线程需维持 13,568 / 16 ≈ 848 个 CUID (活跃 + 待删除)
+    const size_t kMaxActiveCuids = 600;   
+    const size_t kDeleteWindowSize = 200; 
 
     auto add_new_cuid = [&]() {
       uint64_t cuid = next_cuid_->fetch_add(1);
@@ -168,20 +169,33 @@ class PerfRunner {
         do_put = false; // 只剩 Scan 没做了
       }
 
-      // 3. 对随机到的 CUID 切片执行一步动作
+      // 3. 执行动作
+      auto now = std::chrono::steady_clock::now();
+      if (!do_put) {
+          if (std::chrono::duration_cast<std::chrono::milliseconds>(now - state.last_scan_time).count() < 1000) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(5));
+              continue; // 距离上次扫描不足 1s，且当前逻辑想进行扫描，则跳过本次循环等待
+          }
+      }
+
+      // 3. 执行动作
       if (do_put) {
         DoPut(state.cuid, state.puts_done * kBatchSize, stats);
         state.puts_done++;
       } else {
-        bool full_scan = (dist(gen) < 0.1);
-        DoScan(state.cuid, state.puts_done * kBatchSize, full_scan, read_opts, stats);
+        bool full_scan = (dist(gen) < 0.2); // 20% Full Scan (SAC) / 80% Partial Scan
+        DoScan(state.cuid, state.puts_done * kBatchSize, full_scan, read_opts, stats, gen);
         state.scans_done++;
+        state.last_scan_time = now;
       }
+
+      // 模拟业务节奏
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
       // 4. 判断该 CUID 是否终于走完了完整的轮回
       if (state.puts_done >= kTargetPutBatches && state.scans_done >= state.target_scans) {
         int final_rows = state.puts_done * kBatchSize;
-        int final_scan_count = DoScan(state.cuid, final_rows, true, read_opts, stats);
+        int final_scan_count = DoScan(state.cuid, final_rows, true, read_opts, stats, gen);
         if (final_scan_count != final_rows) {
           std::cerr << "[ERROR] Thread " << thread_id << " - CUID " << state.cuid 
                     << " final full scan mismatch! Expected: " << final_rows 
@@ -228,15 +242,27 @@ class PerfRunner {
     stats->AddPut(std::chrono::duration<double, std::milli>(end - start).count());
   }
 
-  int DoScan(uint64_t cuid, int cur_rows, bool full_scan, const rocksdb::ReadOptions& ro, ThreadStats* stats) {
+  int DoScan(uint64_t cuid, int cur_rows, bool full_scan, const rocksdb::ReadOptions& ro, ThreadStats* stats, std::default_random_engine& gen) {
     std::string start_key, end_key;
     if (full_scan) {
       start_key = GenerateKey(cuid, 0);
       end_key = GenerateKey(cuid + 1, 0);
     } else {
-      int offset = std::max(0, cur_rows - 500);
-      start_key = GenerateKey(cuid, offset);
-      end_key = GenerateKey(cuid, cur_rows);
+      // 随机扫描 10%-75% 的数据范围
+      if (cur_rows < 10) {
+          start_key = GenerateKey(cuid, 0);
+          end_key = GenerateKey(cuid, cur_rows);
+      } else {
+          int min_len = static_cast<int>(cur_rows * 0.1);
+          int max_len = static_cast<int>(cur_rows * 0.75);
+          std::uniform_int_distribution<int> len_dist(min_len, std::max(min_len + 1, max_len));
+          int scan_len = len_dist(gen);
+          
+          std::uniform_int_distribution<int> start_dist(0, std::max(0, cur_rows - scan_len));
+          int start_row = start_dist(gen);
+          start_key = GenerateKey(cuid, start_row);
+          end_key = GenerateKey(cuid, start_row + scan_len);
+      }
     }
 
     rocksdb::Slice upper_bound(end_key);
@@ -336,16 +362,17 @@ int main() {
       options.delta_options.compaction_l0_trigger_age_sec = 3600;
       options.delta_options.compaction_l0_files_to_pick = 10;
       // -------------------------------------------------------------
-      options.level0_slowdown_writes_trigger = 1000; // l0 file count thres
-      options.level0_stop_writes_trigger = 2000; // l0 file count thres
+      options.level0_slowdown_writes_trigger = 200; // l0 file count thres
+      options.level0_stop_writes_trigger = 400; // l0 file count thres
       options.level0_file_num_compaction_trigger = 100; // l0 file count thres
       options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
       options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
+      options.max_background_jobs = 16; // 与写入线程相同？
       options.num_levels = 1;
-      options.level0_file_num_compaction_trigger = 20;
       options.level_compaction_dynamic_level_bytes = false;
     } else {
       options.enable_delta = false;
+      options.max_background_jobs = 16;
     }
 
     rocksdb::DestroyDB(path, options);
@@ -395,7 +422,6 @@ int main() {
   };
 
   run_benchmark(kDeltaDBPath, true, "DELTA MODE");
-  // 70w
   run_benchmark(kNativeDBPath, false, "NATIVE MODE");
 
   return 0;

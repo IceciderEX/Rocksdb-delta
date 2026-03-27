@@ -1,4 +1,5 @@
 #include "delta/hot_index_table.h"
+
 #include "util/extract_cuid.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -87,29 +88,44 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
 
     if (overlaps) {
       found_overlap = true;
-      if (seg.file_number == static_cast<uint64_t>(-1)) {
-        // 内存段：切分并保留剩余部分
-        // 1. 左侧剩余
-        if (icmp->Compare(seg.first_key, new_segment.first_key) < 0) {
-          if (HasActualDataInBuffer(cuid, seg.first_key, new_segment.first_key, buffer, icmp)) {
-            DataSegment left = seg;
-            left.last_key = new_segment.first_key;
-            next_segments.push_back(left);
-          }
+      // Solution X: 无差别切分物理与内存段
+      // 1. 左侧剩余: [seg.first, new.first)
+      if (icmp->Compare(seg.first_key, new_segment.first_key) < 0) {
+        bool keep = true;
+        if (seg.file_number == static_cast<uint64_t>(-1)) {
+          keep = HasActualDataInBuffer(cuid, seg.first_key, new_segment.first_key,
+                                       buffer, icmp);
         }
-        // 2. 右侧剩余
-        if (icmp->Compare(seg.last_key, new_segment.last_key) > 0) {
-          if (HasActualDataInBuffer(cuid, new_segment.last_key, seg.last_key, buffer, icmp)) {
-            DataSegment right = seg;
-            right.first_key = new_segment.last_key;
-            next_segments.push_back(right);
-          }
+        if (keep) {
+          DataSegment left = seg;
+          left.last_key = new_segment.first_key;
+          next_segments.push_back(left);
         }
-        // 该内存段主体被 physical SST 覆盖，不再 push
-      } else {
-        // 物理段：如果发生重叠，说明新 SST 是该区域的更新/整理，替换掉旧的
-        // 这里直接不 push，由循环外的 new_segment 替代
       }
+      // 2. 右侧剩余: [new.last, seg.last)
+      if (icmp->Compare(seg.last_key, new_segment.last_key) > 0) {
+        bool keep = true;
+        if (seg.file_number == static_cast<uint64_t>(-1)) {
+          keep = HasActualDataInBuffer(cuid, new_segment.last_key, seg.last_key,
+                                       buffer, icmp);
+        }
+        if (keep) {
+          DataSegment right = seg;
+          right.first_key = new_segment.last_key;
+          next_segments.push_back(right);
+        }
+      }
+
+      // [DIAG] 打印重叠处理情况
+      fprintf(stderr,
+              "[DIAG_PROMOTE] CUID %lu: %s Segment %lu [%s - %s] split by SST "
+              "%lu [%s - %s]\n",
+              cuid,
+              seg.file_number == static_cast<uint64_t>(-1) ? "Mem" : "Phys",
+              seg.file_number, FormatKeyDisplay(seg.first_key).c_str(),
+              FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
+              FormatKeyDisplay(new_segment.first_key).c_str(),
+              FormatKeyDisplay(new_segment.last_key).c_str());
     } else {
       next_segments.push_back(seg);
     }
@@ -124,9 +140,10 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
                 return icmp->Compare(a.first_key, b.first_key) < 0;
               });
     // for (const auto& seg : next_segments) {
-    //   fprintf(stderr, "[HotIndexTable] Next snapshot segment: [%s - %s], file_number: %lu\n",
-    //           FormatKeyDisplay(seg.first_key).c_str(), FormatKeyDisplay(seg.last_key).c_str(),
-    //           seg.file_number);
+    //   fprintf(stderr, "[HotIndexTable] Next snapshot segment: [%s - %s],
+    //   file_number: %lu\n",
+    //           FormatKeyDisplay(seg.first_key).c_str(),
+    //           FormatKeyDisplay(seg.last_key).c_str(), seg.file_number);
     // }
     entry.snapshot_segments = std::move(next_segments);
 
@@ -377,13 +394,15 @@ void HotIndexTable::ReplaceOverlappingSegments(
       bool is_right = (seg_start > new_end);
 
       if (!is_left && !is_right) {
-        // 重叠的情况: 无论物理段还是内存段，都保留不重叠的边缘部分（防止 scope 缩小导致数据丢失）
+        // 重叠的情况: 无论物理段还是内存段，都保留不重叠的边缘部分（防止 scope
+        // 缩小导致数据丢失）
         // 1. 左侧剩余部分
         if (seg_start < new_start) {
           DataSegment left_seg = *it;
           left_seg.last_key = new_segment.first_key;
           next_segments.push_back(left_seg);
-          if (it->file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+          if (it->file_number != static_cast<uint64_t>(-1) &&
+              lifecycle_manager_) {
             lifecycle_manager_->Ref(it->file_number);
           }
         }
@@ -392,11 +411,12 @@ void HotIndexTable::ReplaceOverlappingSegments(
           DataSegment right_seg = *it;
           right_seg.first_key = new_segment.last_key;
           next_segments.push_back(right_seg);
-          if (it->file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+          if (it->file_number != static_cast<uint64_t>(-1) &&
+              lifecycle_manager_) {
             lifecycle_manager_->Ref(it->file_number);
           }
         }
-        
+
         // 原来的段如果包含物理文件，则需要放入 unref 列表
         if (it->file_number != static_cast<uint64_t>(-1)) {
           segments_to_unref.push_back(*it);
@@ -418,17 +438,18 @@ void HotIndexTable::ReplaceOverlappingSegments(
     snapshots = std::move(next_segments);
 
     // 插入这个新的 buffer snapshot，重新寻找插入位置进行合并相邻的内存段 (-1)
-    auto insert_pos = std::find_if(snapshots.begin(), snapshots.end(),
-                                   [&](const DataSegment& s) {
-                                     return s.first_key == new_segment.first_key &&
-                                            s.last_key == new_segment.last_key &&
-                                            s.file_number == static_cast<uint64_t>(-1);
-                                   });
+    auto insert_pos = std::find_if(
+        snapshots.begin(), snapshots.end(), [&](const DataSegment& s) {
+          return s.first_key == new_segment.first_key &&
+                 s.last_key == new_segment.last_key &&
+                 s.file_number == static_cast<uint64_t>(-1);
+        });
 
     // 合并相邻的内存段 (-1)，因为之前切分+排序插入过了
     // 直接检查前后buffer segment，如果存在就合并成一个更大的 segment
     // MARK：多个 buffer segment 的情况？
-    if (insert_pos != snapshots.end() && insert_pos->file_number == static_cast<uint64_t>(-1)) {
+    if (insert_pos != snapshots.end() &&
+        insert_pos->file_number == static_cast<uint64_t>(-1)) {
       // 检查后一个
       auto next = std::next(insert_pos);
       if (next != snapshots.end()) {

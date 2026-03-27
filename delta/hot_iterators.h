@@ -79,6 +79,10 @@ class HotSnapshotIterator : public InternalIterator {
   // 初始化特定 index 的 segment iterator，返回是否由于底层 Segments 被重定位而导致 index 失效
   bool InitIterForSegment(size_t segment_index);
 
+  // 当 Reader 因为后台 Flush 导致 segment 列表变化而越界时，
+  // 重新定位；返回 true 表示成功重新定位
+  bool ReSyncToLatestSegments(const Slice& prev_key);
+
   // 切换到下一个 Segment
   void SwitchToNextSegment();
   void SwitchToPrevSegment();
@@ -105,6 +109,10 @@ class HotSnapshotIterator : public InternalIterator {
   Slice current_upper_bound_slice_;
 
   Status status_;
+
+  // Solution W: 防止无限重同步
+  int resync_count_ = 0;
+  static constexpr int kMaxResyncRetries = 3;
 };
 
 class DeltaSwitchingIterator : public InternalIterator {

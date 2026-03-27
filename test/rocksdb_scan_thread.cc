@@ -17,6 +17,8 @@ using namespace ROCKSDB_NAMESPACE;
 
 const std::string kDBPath = "/home/wam/Rocksdb-delta/db_tmp";
 std::atomic<bool> stop_test{false};
+constexpr int kPutIntervalSeconds = 5;
+constexpr int kScanIntervalSeconds = 5;
 
 struct TestStats {
   std::atomic<uint64_t> total_writes{0};
@@ -81,25 +83,26 @@ void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
   WriteOptions wo;
   while (!stop_test) {
     for (size_t i = 0; i < cuids.size(); ++i) {
-      uint64_t cuid = 1003;
+      uint64_t cuid = cuids[i];
       {
         std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
-        for (int k = 0; k < 20; ++k) {
+        for (int k = 0; k < 100; ++k) {
           uint64_t rid = next_row_per_cuid[i]++;
-          db->Put(wo, GenerateKey(cuid, rid), "val");
+          db->Put(wo, GenerateKey(cuid, rid), "val_xxxxxxxxxxxxxxxxx");
           ground_truths[cuid]->row_ids.insert(rid);
         }
       }
-      global_stats.total_writes += 20;
+      // db->Flush(FlushOptions());
+      global_stats.total_writes += 100;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::this_thread::sleep_for(std::chrono::seconds(kPutIntervalSeconds));
   }
 }
 
 void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
   ReadOptions ro;
   while (!stop_test) {
-    uint64_t cuid = 1003;
+    uint64_t cuid = cuids[rand() % cuids.size()];
     ro.delta_full_scan = (rand() % 2 == 0);
     std::cout << "[Reader " << id << "] Starting scan for CUID " << cuid
               << ", delta_full_scan=" << ro.delta_full_scan << std::endl;
@@ -200,18 +203,56 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
           //             << buf_count << std::endl;
           //   delete buf_iter;
           // }
-          int count = 0;
-          for (it->Seek(start_key); it->Valid(); it->Next()) {
-            if (ExtractCUID(it->key()) != cuid) break;
-            if (count % 100 == 0) std::cout << FormatKeyDisplay(it->key()) << std::endl;
-            found.insert(ExtractRowID(it->key()));
-            count++;
-          }
+          
+
+          // int count = 0;
+          // std::unique_ptr<Iterator> it2(db->NewIterator(ro));
+          // for (it2->Seek(start_key); it2->Valid(); it2->Next()) {
+          //   if (ExtractCUID(it2->key()) != cuid) break;
+          //   if (count % 100 == 0) std::cout << "Reader " << id << ": " << FormatKeyDisplay(it2->key()) << std::endl;
+          //   found.insert(ExtractRowID(it2->key()));
+          //   count++;
+          // }
+          // int i = 0;
+          // count = i;
         }
+      } 
+      else {
+        // if (rand() % 100 < 5) {
+        //   auto hotspot_mgr = dynamic_cast<DBImpl*>(db)->GetHotspotManager();
+        //   if (hotspot_mgr) {
+        //     HotIndexEntry diag_entry;
+        //     if (hotspot_mgr->GetHotIndexEntry(cuid, &diag_entry)) {
+        //       std::cerr << "[DIAG] CUID " << cuid << " snapshot_segments="
+        //                 << diag_entry.snapshot_segments.size()
+        //                 << " deltas=" << diag_entry.deltas.size() << std::endl;
+        //       for (size_t si = 0; si < diag_entry.snapshot_segments.size();
+        //           si++) {
+        //         const auto& seg = diag_entry.snapshot_segments[si];
+        //         std::cerr << "[DIAG]   snap[" << si
+        //                   << "] file=" << (int64_t)seg.file_number
+        //                   << " first_key=" << FormatKeyDisplay(seg.first_key)
+        //                   << " last_key=" << FormatKeyDisplay(seg.last_key)
+        //                   << std::endl;
+        //       }
+        //       for (size_t di = 0; di < diag_entry.deltas.size(); di++) {
+        //         const auto& seg = diag_entry.deltas[di];
+        //         std::cerr << "[DIAG]   delta[" << di
+        //                   << "] file=" << (int64_t)seg.file_number
+        //                   << " first_key=" << FormatKeyDisplay(seg.first_key)
+        //                   << " last_key=" << FormatKeyDisplay(seg.last_key)
+        //                   << std::endl;
+        //       }
+        //     } else {
+        //       std::cerr << "[DIAG] CUID " << cuid << " has NO HotIndexEntry!"
+        //                 << std::endl;
+        //     }
+        //   }
+        // }
       }
-    }
+    } 
     global_stats.total_scans++;
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::this_thread::sleep_for(std::chrono::seconds(kScanIntervalSeconds));
   }
 }
 
@@ -241,12 +282,17 @@ int main() {
   options.delta_options.delta_merge_threshold = 3;
   options.delta_options.sac_delta_count_threshold = 5;
   options.delta_options.sharding_count = 64; // Power of 2 recommended
-  options.delta_options.hot_data_buffer_threshold_bytes = 2 * 1024 * 1024;
+  options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
   options.delta_options.hot_data_buffer_shards = 128;
   options.delta_options.compaction_l0_trigger_count = 20;
   options.delta_options.compaction_l0_trigger_age_sec = 3600;
   options.delta_options.compaction_l0_files_to_pick = 10;
   // -------------------------------------------------------------
+  options.level0_slowdown_writes_trigger = 1000; // l0 file count thres
+  options.level0_stop_writes_trigger = 2000; // l0 file count thres
+  options.level0_file_num_compaction_trigger = 100; // l0 file count thres
+  options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
+  options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
   options.num_levels = 1;
   options.level0_file_num_compaction_trigger = 20;
   options.level_compaction_dynamic_level_bytes = false;
@@ -287,7 +333,7 @@ int main() {
   writer.join();
   reader1.join();
   reader2.join();
-  reader3.join();
+  // reader3.join();
   manager.join();
 
   std::cout << "Stress Test Completed." << std::endl;
