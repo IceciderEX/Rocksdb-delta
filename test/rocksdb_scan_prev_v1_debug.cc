@@ -12,7 +12,6 @@
 #include "delta/hotspot_manager.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
-#include "rocksdb/write_batch.h"
 
 using namespace ROCKSDB_NAMESPACE;
 
@@ -82,20 +81,16 @@ void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
   WriteOptions wo;
   while (!stop_test) {
     for (size_t i = 0; i < cuids.size(); ++i) {
-      uint64_t cuid = 1003; // User hardcoded CUID
-      WriteBatch batch;
+      uint64_t cuid = 1003;
       {
         std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
         for (int k = 0; k < 1024; ++k) {
           uint64_t rid = next_row_per_cuid[i]++;
-          batch.Put(GenerateKey(cuid, rid), "val_xxxxxxxxxxxxxxxxxxxx");
-          // ground_truths[cuid]->row_ids.insert(rid);
+          db->Put(wo, GenerateKey(cuid, rid), "val");
+          ground_truths[cuid]->row_ids.insert(rid);
         }
       }
-      db->Write(wo, &batch);
-      for (uint64_t rid = next_row_per_cuid[i] - 1024; rid < next_row_per_cuid[i]; ++rid) {
-        ground_truths[cuid]->row_ids.insert(rid);
-      }
+      // db->Flush(FlushOptions());
       global_stats.total_writes += 1024;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -148,13 +143,13 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
                       << " for cuid " << cuid << std::endl;
           }
         } else {
-          for (int i = 0; i < 3; i++) {
+          for (int i = 0; i < 5; i++) {
             std::cerr << "Reader " << id << " error: Missing row " << missing[i]
                       << " for cuid " << cuid << std::endl;
           }
           std::cerr << "Reader " << id << " error: ... (skipped "
                     << (missing.size() - 40) << " entries) ..." << std::endl;
-          for (size_t i = missing.size() - 3; i < missing.size(); i++) {
+          for (size_t i = missing.size() - 5; i < missing.size(); i++) {
             std::cerr << "Reader " << id << " error: Missing row " << missing[i]
                       << " for cuid " << cuid << std::endl;
           }
@@ -209,11 +204,10 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
           
 
           int count = 0;
-          int mod = ground_truths[cuid]->row_ids.size() / 40;
           std::unique_ptr<Iterator> it2(db->NewIterator(ro));
           for (it2->Seek(start_key); it2->Valid(); it2->Next()) {
             if (ExtractCUID(it2->key()) != cuid) break;
-            if (count % mod == 0) std::cout << "Reader " << id << ": " << FormatKeyDisplay(it2->key()) << std::endl;
+            if (count % 100 == 0) std::cout << "Reader " << id << ": " << FormatKeyDisplay(it2->key()) << std::endl;
             found.insert(ExtractRowID(it2->key()));
             count++;
           }
@@ -278,17 +272,15 @@ int main() {
   Options options;
   options.create_if_missing = true;
   options.enable_delta = true;
-  options.write_buffer_size = 16 * 1024 * 1024;
-  options.target_file_size_base = 16 * 1024 * 1024;
 
   // --- Example 1: Programmatic Configuration of DeltaOptions ---
   // These can be set directly on the options object before opening the DB.
-  options.delta_options.hotspot_scan_threshold = 3;
+  options.delta_options.hotspot_scan_threshold = 200;
   options.delta_options.hotspot_scan_window_sec = 300;
   options.delta_options.delta_merge_threshold = 3;
   options.delta_options.sac_delta_count_threshold = 5;
   options.delta_options.sharding_count = 64; // Power of 2 recommended
-  options.delta_options.hot_data_buffer_threshold_bytes = 16 * 1024 * 1024;
+  options.delta_options.hot_data_buffer_threshold_bytes = 1 * 1024 * 1024;
   options.delta_options.hot_data_buffer_shards = 128;
   options.delta_options.compaction_l0_trigger_count = 20;
   options.delta_options.compaction_l0_trigger_age_sec = 3600;

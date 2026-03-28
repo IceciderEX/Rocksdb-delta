@@ -117,15 +117,15 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
       }
 
       // [DIAG] 打印重叠处理情况
-      // fprintf(stderr,
-      //         "[DIAG_PROMOTE] CUID %lu: %s Segment %lu [%s - %s] split by SST "
-      //         "%lu [%s - %s]\n",
-      //         cuid,
-      //         seg.file_number == static_cast<uint64_t>(-1) ? "Mem" : "Phys",
-      //         seg.file_number, FormatKeyDisplay(seg.first_key).c_str(),
-      //         FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
-      //         FormatKeyDisplay(new_segment.first_key).c_str(),
-      //         FormatKeyDisplay(new_segment.last_key).c_str());
+      fprintf(stderr,
+              "[DIAG_PROMOTE] CUID %lu: %s Segment %lu [%s - %s] split by SST "
+              "%lu [%s - %s]\n",
+              cuid,
+              seg.file_number == static_cast<uint64_t>(-1) ? "Mem" : "Phys",
+              seg.file_number, FormatKeyDisplay(seg.first_key).c_str(),
+              FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
+              FormatKeyDisplay(new_segment.first_key).c_str(),
+              FormatKeyDisplay(new_segment.last_key).c_str());
     } else {
       next_segments.push_back(seg);
     }
@@ -139,12 +139,11 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
               [icmp](const DataSegment& a, const DataSegment& b) {
                 return icmp->Compare(a.first_key, b.first_key) < 0;
               });
-    // for (const auto& seg : next_segments) {
-    //   fprintf(stderr, "[HotIndexTable] Next snapshot segment: [%s - %s],
-    //   file_number: %lu\n",
-    //           FormatKeyDisplay(seg.first_key).c_str(),
-    //           FormatKeyDisplay(seg.last_key).c_str(), seg.file_number);
-    // }
+    for (const auto& seg : next_segments) {
+      fprintf(stderr, "[HotIndexTable] Next snapshot segment: [%s - %s], file_number: %lu\n",
+              FormatKeyDisplay(seg.first_key).c_str(),
+              FormatKeyDisplay(seg.last_key).c_str(), seg.file_number);
+    }
     entry.snapshot_segments = std::move(next_segments);
 
     if (lifecycle_manager_) {

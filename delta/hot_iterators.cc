@@ -364,21 +364,21 @@ void HotSnapshotIterator::Seek(const Slice& target) {
   // segment seek
   if (current_iter_) {
     current_iter_->Seek(target);
-    // if (cuid_ == 1003) {
-    //   std::string landed_key = current_iter_->Valid()
-    //                                ? FormatKeyDisplay(current_iter_->key())
-    //                                : "N/A";
-    //   std::string landed_hex =
-    //       current_iter_->Valid()
-    //           ? Slice(current_iter_->key()).ToString(true).substr(0, 60)
-    //           : "";
-    //   fprintf(stderr,
-    //           "[DIAG_SEEK] CUID %lu Initial Seek to Segment %d (File %lu). "
-    //           "Valid: %d, Landed: %s, Hex: %s\n",
-    //           cuid_, current_segment_index_,
-    //           segments_[current_segment_index_].file_number,
-    //           current_iter_->Valid(), landed_key.c_str(), landed_hex.c_str());
-    // }
+    if (true) {
+      std::string landed_key = current_iter_->Valid()
+                                   ? FormatKeyDisplay(current_iter_->key())
+                                   : "N/A";
+      std::string landed_hex =
+          current_iter_->Valid()
+              ? Slice(current_iter_->key()).ToString(true).substr(0, 60)
+              : "";
+      fprintf(stderr,
+              "[DIAG_SEEK] CUID %lu Initial Seek to Segment %d (File %lu). "
+              "Valid: %d, Landed: %s, Hex: %s\n",
+              cuid_, current_segment_index_,
+              segments_[current_segment_index_].file_number,
+              current_iter_->Valid(), landed_key.c_str(), landed_hex.c_str());
+    }
 
     if (!Valid()) {
       SwitchToNextSegment();
@@ -392,11 +392,11 @@ void HotSnapshotIterator::Seek(const Slice& target) {
               current_iter_->Valid()
                   ? Slice(current_iter_->key()).ToString(true).substr(0, 60)
                   : "";
-          // fprintf(stderr,
-          //         "[DIAG_SWITCH] CUID %lu (Seek-Fallback) to Seg %d. Valid: "
-          //         "%d, Landed: %s, Hex: %s\n",
-          //         cuid_, current_segment_index_, current_iter_->Valid(),
-          //         landed_key.c_str(), landed_hex.c_str());
+          fprintf(stderr,
+                  "[DIAG_SWITCH] CUID %lu (Seek-Fallback) to Seg %d. Valid: "
+                  "%d, Landed: %s, Hex: %s\n",
+                  cuid_, current_segment_index_, current_iter_->Valid(),
+                  landed_key.c_str(), landed_hex.c_str());
         }
       }
     }
@@ -424,20 +424,20 @@ void HotSnapshotIterator::Next() {
   while (!Valid()) {
     int next_index = current_segment_index_ + 1;
     if (next_index >= static_cast<int>(segments_.size())) {
-      // if (cuid_ == 1003) {
-      //   fprintf(stderr,
-      //           "[DIAG_EOF] CUID %lu reached EOF after Seg %d. Total Segments: "
-      //           "%zu. Last Key: %s\n",
-      //           cuid_, current_segment_index_, segments_.size(),
-      //           FormatKeyDisplay(prev_key_debug).c_str());
-      //   for (size_t i = 0; i < segments_.size(); ++i) {
-      //     fprintf(stderr,
-      //             "  [DIAG_EOF] Seg[%zu]: File %lu, Range [%s - %s]\n", i,
-      //             segments_[i].file_number,
-      //             FormatKeyDisplay(segments_[i].first_key).c_str(),
-      //             FormatKeyDisplay(segments_[i].last_key).c_str());
-      //   }
-      // }
+      if (true) {
+        fprintf(stderr,
+                "[DIAG_EOF] CUID %lu reached EOF after Seg %d. Total Segments: "
+                "%zu. Last Key: %s\n",
+                cuid_, current_segment_index_, segments_.size(),
+                FormatKeyDisplay(prev_key_debug).c_str());
+        for (size_t i = 0; i < segments_.size(); ++i) {
+          fprintf(stderr,
+                  "  [DIAG_EOF] Seg[%zu]: File %lu, Range [%s - %s]\n", i,
+                  segments_[i].file_number,
+                  FormatKeyDisplay(segments_[i].first_key).c_str(),
+                  FormatKeyDisplay(segments_[i].last_key).c_str());
+        }
+      }
       // 尝试动态重同步
       if (ReSyncToLatestSegments(prev_key_debug)) {
         // 成功重定位。如果现在 Valid()，说明找到了新数；
@@ -461,12 +461,12 @@ void HotSnapshotIterator::Next() {
             current_iter_->Valid()
                 ? Slice(current_iter_->key()).ToString(true).substr(0, 60)
                 : "";
-        // fprintf(stderr,
-        //         "[DIAG_SWITCH] CUID %lu Index %d -> %d (File %lu). Valid: %d, "
-        //         "Landed: %s, Hex: %s\n",
-        //         cuid_, old_segment, current_segment_index_,
-        //         segments_[current_segment_index_].file_number,
-        //         current_iter_->Valid(), landed_key.c_str(), landed_hex.c_str());
+        fprintf(stderr,
+                "[DIAG_SWITCH] CUID %lu Index %d -> %d (File %lu). Valid: %d, "
+                "Landed: %s, Hex: %s\n",
+                cuid_, old_segment, current_segment_index_,
+                segments_[current_segment_index_].file_number,
+                current_iter_->Valid(), landed_key.c_str(), landed_hex.c_str());
       }
     }
 
@@ -481,21 +481,23 @@ void HotSnapshotIterator::Next() {
       fprintf(stderr, "PrevHex: %s\n",
               Slice(prev_key_debug).ToString(true).c_str());
       fprintf(stderr, "CurrHex: %s\n", key().ToString(true).c_str());
-      fprintf(
-          stderr,
-          "Old Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
-          segments_[old_segment].file_number,
-          FormatKeyDisplay(segments_[old_segment].first_key).c_str(),
-          FormatKeyDisplay(segments_[old_segment].last_key).c_str());
-      fprintf(
-          stderr,
-          "New Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
-          segments_[current_segment_index_].file_number,
-          FormatKeyDisplay(segments_[current_segment_index_].first_key).c_str(),
-          FormatKeyDisplay(segments_[current_segment_index_].last_key).c_str());
-      fprintf(stderr, "Old Segment: %d, New Segment: %d\n", old_segment,
-              current_segment_index_);
-      assert(true);
+      if (old_segment >= 0 && current_segment_index_ >= 0) {
+        fprintf(
+            stderr,
+            "Old Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
+            segments_[old_segment].file_number,
+            FormatKeyDisplay(segments_[old_segment].first_key).c_str(),
+            FormatKeyDisplay(segments_[old_segment].last_key).c_str());
+        fprintf(
+            stderr,
+            "New Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
+            segments_[current_segment_index_].file_number,
+            FormatKeyDisplay(segments_[current_segment_index_].first_key).c_str(),
+            FormatKeyDisplay(segments_[current_segment_index_].last_key).c_str());
+        fprintf(stderr, "Old Segment: %d, New Segment: %d\n", old_segment,
+                current_segment_index_);
+        assert(true);
+      }
     }
   }
 }
@@ -525,14 +527,14 @@ bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
     if (same) return false; 
   }
 
-  // if (cuid_ == 1003) {
-  //   fprintf(stderr,
-  //           "[DIAG_RESYNC] CUID %lu: Map changed! Old segs: %zu, New segs: "
-  //           "%zu. Relocating from prev_key: %s\n",
-  //           cuid_, segments_.size(),
-  //           latest_entry.snapshot_segments.size(),
-  //           FormatKeyDisplay(prev_key).c_str());
-  // }
+  if (true) {
+    fprintf(stderr,
+            "[DIAG_RESYNC] CUID %lu: Map changed! Old segs: %zu, New segs: "
+            "%zu. Relocating from prev_key: %s\n",
+            cuid_, segments_.size(),
+            latest_entry.snapshot_segments.size(),
+            FormatKeyDisplay(prev_key).c_str());
+  }
 
   segments_ = latest_entry.snapshot_segments;
   resync_count_++;
