@@ -548,6 +548,11 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
               uint64_t cuid =
                   hotspot_manager_->ExtractCUID(saved_key_.GetUserKey());
               if (cuid != 0) {
+                // [DIAG_KEY] Log buffered key size
+                if (cuid == 1003 && read_options_.delta_full_scan) {
+                  fprintf(stderr, "[DIAG_BUFFER] CUID 1003 buffering key size: %zu, UserKey size: %zu\n", 
+                          iter_.key().size(), saved_key_.GetUserKey().size());
+                }
                 // 如果 CUID 已被删除，跳过
                 // 缓存 deleted 状态：同一 CUID optimization
                 if (delta_ctx_.cached_deleted_check_cuid != cuid) {
@@ -678,10 +683,6 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                 if (delta_ctx_.trigger_scan_as_compaction) {
                   // Full Scan / Init Scan: 缓冲数据
                   delta_ctx_.scan_last_key = delta_ctx_.key_encode_buf;
-                  if (cuid == 1003) {
-                      fprintf(stderr, "[DEBUG_SAC] CUID %lu Buffering KeySize: %zu, UserKeySize: %zu, ValueSize: %zu\n",
-                              cuid, delta_ctx_.key_encode_buf.size(), saved_key_.GetUserKey().size(), value().size());
-                  }
                   bool buffer_full = hotspot_manager_->BufferHotData(
                       cuid, Slice(delta_ctx_.key_encode_buf), value());
                   if (buffer_full) {

@@ -255,6 +255,11 @@ bool HotSnapshotIterator::InitIterForSegment(size_t index) {
       InternalIterator* mem_iter =
           hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
 
+      if (cuid_ == 1003) {
+          fprintf(stderr, "[DIAG_INIT] CUID 1003 Seg %zu (Mem) first_key size: %zu, last_key size: %zu\n",
+                  index, seg.first_key.size(), seg.last_key.size());
+      }
+
       // 防止buffer data在线程调度时清空，或者头部已经下刷为 SST，再检查一次
       mem_iter->Seek(seg.first_key);
       if (!mem_iter->Valid() ||
@@ -296,12 +301,9 @@ bool HotSnapshotIterator::InitIterForSegment(size_t index) {
       current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
       current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
 
-      // DEBUG: Verify key truncation
       if (cuid_ == 1003) {
-          fprintf(stderr, "[DEBUG_BOUNDS] CUID %lu Seg %d File %lu: RawLastKeySize: %zu, ExtractedLastKeySize: %zu, UpperBound (Hex): %s\n",
-                  cuid_, current_segment_index_, seg.file_number,
-                  seg.last_key.size(), current_upper_bound_str_.size(),
-                  Slice(current_upper_bound_str_).ToString(true).c_str());
+          fprintf(stderr, "[DIAG_BOUNDS] CUID 1003 Seg %zu (Phys) Original last_key size: %zu, Extracted size: %zu, UpperBound: %s\n",
+                  index, seg.last_key.size(), current_upper_bound_str_.size(), FormatKeyDisplay(current_upper_bound_str_).c_str());
       }
 
       current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
@@ -609,16 +611,8 @@ bool HotSnapshotIterator::Valid() const {
   const auto& seg = segments_[current_segment_index_];
   bool ret = true;
   if (!seg.last_key.empty()) {
-    Slice cur_user = ExtractUserKey(current_iter_->key());
-    Slice seg_limit_user = ExtractUserKey(seg.last_key);
-    if (icmp_.user_comparator()->Compare(cur_user, seg_limit_user) > 0) {
-      if (cuid_ == 1003) {
-          fprintf(stderr, "[DEBUG_VALID] CUID %lu Seg %d Filtered: CurKey %s > Limit %s (RawLimitSize: %zu)\n",
-                  cuid_, current_segment_index_, 
-                  FormatKeyDisplay(current_iter_->key()).c_str(),
-                  FormatKeyDisplay(seg.last_key).c_str(),
-                  seg.last_key.size());
-      }
+    if (icmp_.user_comparator()->Compare(ExtractUserKey(current_iter_->key()),
+                                         ExtractUserKey(seg.last_key)) > 0) {
       ret = false;
     }
   }

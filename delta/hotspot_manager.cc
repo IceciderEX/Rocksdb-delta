@@ -88,8 +88,14 @@ bool HotspotManager::RegisterScan(uint64_t cuid, bool is_full_scan,
   return is_hot;
 }
 
+bool HotspotManager::BufferHotData(uint64_t cuid, const Slice& key,
+                                   const Slice& value) {
+  {
+    std::lock_guard<std::mutex> lock(buffered_cuids_mutex_);
+    active_buffered_cuids_.insert(cuid);
+  }
   if (cuid == 1003) {
-    fprintf(stderr, "[DEBUG_BUFFER] CUID %lu Buffering KeySize: %zu\n", cuid, key.size());
+    fprintf(stderr, "[DIAG_APPEND] CUID 1003 appending key size: %zu\n", key.size());
   }
   return buffer_.Append(cuid, key, value);
 }
@@ -426,11 +432,6 @@ Status HotspotManager::FlushBlockToSharedSST(
       s = sst_writer.Put(current_user_key_slice, entry_value);
       if (!s.ok()) return s;
 
-      if (current_cuid == 1003 && written_count < 5) {
-          fprintf(stderr, "[DEBUG_FLUSH] CUID %lu Writing: RawKeySize: %zu, UserKeySize: %zu\n",
-                  current_cuid, entry_key.size(), current_user_key_slice.size());
-      }
-
       last_written_key_in_segment = current_user_key;
       segment_last_key = entry_key.ToString();
       written_count++;
@@ -600,6 +601,11 @@ void HotspotManager::FinalizeScanAsCompaction(
   // 确保拼接逻辑不会发生区间倒置
   bool has_valid_tail =
       internal_comparator_->Compare(tail_min, scan_last_key) <= 0;
+
+  if (cuid == 1003) {
+      fprintf(stderr, "[DIAG_FINALIZE] CUID 1003 Finalize: scan_first_key size: %zu, scan_last_key size: %zu\n",
+              scan_first_key.size(), scan_last_key.size());
+  }
   if (has_buffered_data && has_valid_tail) {
     DataSegment tail_segment;
     tail_segment.file_number = static_cast<uint64_t>(-1);  // 标记为内存段
