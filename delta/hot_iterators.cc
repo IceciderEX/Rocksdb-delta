@@ -295,6 +295,15 @@ bool HotSnapshotIterator::InitIterForSegment(size_t index) {
       current_read_options_ = read_options_;
       current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
       current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
+
+      // DEBUG: Verify key truncation
+      if (cuid_ == 1003) {
+          fprintf(stderr, "[DEBUG_BOUNDS] CUID %lu Seg %d File %lu: RawLastKeySize: %zu, ExtractedLastKeySize: %zu, UpperBound (Hex): %s\n",
+                  cuid_, current_segment_index_, seg.file_number,
+                  seg.last_key.size(), current_upper_bound_str_.size(),
+                  Slice(current_upper_bound_str_).ToString(true).c_str());
+      }
+
       current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
       current_lower_bound_slice_ = Slice(current_lower_bound_str_);
       current_upper_bound_slice_ = Slice(current_upper_bound_str_);
@@ -600,8 +609,16 @@ bool HotSnapshotIterator::Valid() const {
   const auto& seg = segments_[current_segment_index_];
   bool ret = true;
   if (!seg.last_key.empty()) {
-    if (icmp_.user_comparator()->Compare(ExtractUserKey(current_iter_->key()),
-                                         ExtractUserKey(seg.last_key)) > 0) {
+    Slice cur_user = ExtractUserKey(current_iter_->key());
+    Slice seg_limit_user = ExtractUserKey(seg.last_key);
+    if (icmp_.user_comparator()->Compare(cur_user, seg_limit_user) > 0) {
+      if (cuid_ == 1003) {
+          fprintf(stderr, "[DEBUG_VALID] CUID %lu Seg %d Filtered: CurKey %s > Limit %s (RawLimitSize: %zu)\n",
+                  cuid_, current_segment_index_, 
+                  FormatKeyDisplay(current_iter_->key()).c_str(),
+                  FormatKeyDisplay(seg.last_key).c_str(),
+                  seg.last_key.size());
+      }
       ret = false;
     }
   }

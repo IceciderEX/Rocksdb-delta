@@ -88,11 +88,8 @@ bool HotspotManager::RegisterScan(uint64_t cuid, bool is_full_scan,
   return is_hot;
 }
 
-bool HotspotManager::BufferHotData(uint64_t cuid, const Slice& key,
-                                   const Slice& value) {
-  {
-    std::lock_guard<std::mutex> lock(buffered_cuids_mutex_);
-    active_buffered_cuids_.insert(cuid);
+  if (cuid == 1003) {
+    fprintf(stderr, "[DEBUG_BUFFER] CUID %lu Buffering KeySize: %zu\n", cuid, key.size());
   }
   return buffer_.Append(cuid, key, value);
 }
@@ -428,6 +425,11 @@ Status HotspotManager::FlushBlockToSharedSST(
       Slice entry_value(entry.value);
       s = sst_writer.Put(current_user_key_slice, entry_value);
       if (!s.ok()) return s;
+
+      if (current_cuid == 1003 && written_count < 5) {
+          fprintf(stderr, "[DEBUG_FLUSH] CUID %lu Writing: RawKeySize: %zu, UserKeySize: %zu\n",
+                  current_cuid, entry_key.size(), current_user_key_slice.size());
+      }
 
       last_written_key_in_segment = current_user_key;
       segment_last_key = entry_key.ToString();

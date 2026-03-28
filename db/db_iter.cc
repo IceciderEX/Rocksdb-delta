@@ -678,6 +678,10 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                 if (delta_ctx_.trigger_scan_as_compaction) {
                   // Full Scan / Init Scan: 缓冲数据
                   delta_ctx_.scan_last_key = delta_ctx_.key_encode_buf;
+                  if (cuid == 1003) {
+                      fprintf(stderr, "[DEBUG_SAC] CUID %lu Buffering KeySize: %zu, UserKeySize: %zu, ValueSize: %zu\n",
+                              cuid, delta_ctx_.key_encode_buf.size(), saved_key_.GetUserKey().size(), value().size());
+                  }
                   bool buffer_full = hotspot_manager_->BufferHotData(
                       cuid, Slice(delta_ctx_.key_encode_buf), value());
                   if (buffer_full) {
