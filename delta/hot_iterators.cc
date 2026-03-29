@@ -1,880 +1,2147 @@
-#include "delta/hot_iterators.h"
+//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
+//
+// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include <time.h>
+#include "db/db_iter.h"
 
+#include <limits>
+#include <iostream>
 #include <chrono>
+#include <string>
 
-#include "table/merging_iterator.h"
-#include "util/cast_util.h"
+namespace ROCKSDB_NAMESPACE {
+extern thread_local double tl_hot_next_extract_ms;
+extern thread_local double tl_hot_next_advance_ms;
+extern thread_local double tl_hot_next_compare_ms;
+extern thread_local double tl_hot_child_next_ms;
+extern thread_local double tl_hot_switch_seg_ms;
+extern thread_local double tl_hot_dedup_loop_ms;
+extern thread_local double tl_hot_next_cpu_ms;
+extern thread_local double tl_hot_valid_ms;
+extern thread_local double tl_hot_db_iter_total_ms;
+extern thread_local double tl_hot_db_iter_logic_ms;
+extern thread_local double tl_hot_extract_cuid_ms;
+extern thread_local double tl_hot_snapshot_self_ms;
+}
+
+#include "db/dbformat.h"
+#include "db/merge_context.h"
+#include "db/merge_helper.h"
+#include "db/pinned_iterators_manager.h"
+#include "db/wide/wide_column_serialization.h"
+#include "db/wide/wide_columns_helper.h"
+#include "delta/global_delete_count_table.h"
+#include "delta/hotspot_manager.h"
+#include "file/filename.h"
+#include "logging/logging.h"
+#include "memory/arena.h"
+#include "monitoring/perf_context_imp.h"
+#include "rocksdb/env.h"
+#include "rocksdb/iterator.h"
+#include "rocksdb/merge_operator.h"
+#include "rocksdb/options.h"
+#include "rocksdb/system_clock.h"
+#include "table/internal_iterator.h"
+#include "table/iterator_wrapper.h"
+#include "trace_replay/trace_replay.h"
+#include "util/mutexlock.h"
+#include "util/string_util.h"
+#include "util/user_comparator_wrapper.h"
 #include "util/extract_cuid.h"
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 namespace ROCKSDB_NAMESPACE {
 
-static FileMetaData MakeFileMetaFromSegment(const DataSegment& seg,
-                                            bool is_delta = true) {
-  FileMetaData meta;
-  // file_number, path_id=0, file_size
-  meta.fd = FileDescriptor(seg.file_number, 0, seg.file_size);
-  // file_size = 0 对于 delta 来说会 Cache Hit，直接返回 FileReader
-  if (seg.file_size <= 0 && !is_delta) {
-    std::cerr << "[ERROR] Invalid file size " << seg.file_size
-              << " for segment with file number " << seg.file_number
-              << std::endl;
-  }
-  // internal key
-  meta.smallest.DecodeFrom(seg.first_key);
-  meta.largest.DecodeFrom(seg.last_key);
-  return meta;
-}
-
-// ======================= HotDeltaIterator ==========================
-
-HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
-                                   TableCache* table_cache,
-                                   const ReadOptions& read_options,
-                                   const FileOptions& file_options,
-                                   const InternalKeyComparator& icmp,
-                                   const MutableCFOptions& mutable_cf_options,
-                                   bool allow_unprepared_value)
-    : merging_iter_(nullptr), deltas_(deltas) {  // Copy deltas
-  if (deltas_.empty()) {
-    merging_iter_ = NewEmptyInternalIterator<Slice>(nullptr);
-    return;
-  }
-
-  bounds_storage_.reserve(deltas_.size() * 2);
-  bounds_slices_.reserve(deltas_.size() * 2);
-  read_options_storage_.reserve(deltas_.size());
-
-  std::vector<InternalIterator*> children;
-  children.reserve(deltas_.size());
-
-  // slices for bounds
-  for (const auto& delta : deltas_) {
-    bounds_storage_.push_back(ExtractUserKey(delta.first_key).ToString());
-    std::string upper = ExtractUserKey(delta.last_key).ToString();
-    upper.push_back('\0');  // Make it an exclusive bound
-    bounds_storage_.push_back(upper);
-  }
-  for (size_t i = 0; i < bounds_storage_.size(); ++i) {
-    bounds_slices_.emplace_back(bounds_storage_[i]);
-  }
-
-  for (size_t i = 0; i < deltas_.size(); ++i) {
-    const auto& delta = deltas_[i];
-    // ReadOptions
-    read_options_storage_.emplace_back(read_options);
-    ReadOptions& ro = read_options_storage_.back();
-    ro.iterate_lower_bound = &bounds_slices_[i * 2];
-    ro.iterate_upper_bound = &bounds_slices_[i * 2 + 1];
-
-    FileMetaData meta = MakeFileMetaFromSegment(delta, true);
-
-    InternalIterator* iter = table_cache->NewIterator(
-        ro, file_options, icmp,  // InternalKeyComparator
-        meta,                    // FileMetaData
-        nullptr, mutable_cf_options, nullptr, nullptr,
-        TableReaderCaller::kUserIterator, nullptr, false,
-        0,  // L0
-        0, nullptr, nullptr, allow_unprepared_value, nullptr, nullptr);
-
-    if (iter) {
-      children.push_back(iter);
-    }
-  }
-
-  merging_iter_ = NewMergingIterator(&icmp, children.data(),
-                                     static_cast<int>(children.size()));
-}
-
-HotDeltaIterator::~HotDeltaIterator() {
-  if (merging_iter_) {
-    delete merging_iter_;
-  }
-}
-
-// agent
-bool HotDeltaIterator::Valid() const { return merging_iter_->Valid(); }
-void HotDeltaIterator::SeekToFirst() { merging_iter_->SeekToFirst(); }
-void HotDeltaIterator::SeekToLast() { merging_iter_->SeekToLast(); }
-void HotDeltaIterator::Seek(const Slice& target) {
-  merging_iter_->Seek(target);
-}
-void HotDeltaIterator::SeekForPrev(const Slice& target) {
-  merging_iter_->SeekForPrev(target);
-}
-void HotDeltaIterator::Next() { merging_iter_->Next(); }
-void HotDeltaIterator::Prev() { merging_iter_->Prev(); }
-Slice HotDeltaIterator::key() const { return merging_iter_->key(); }
-Slice HotDeltaIterator::value() const { return merging_iter_->value(); }
-Status HotDeltaIterator::status() const { return merging_iter_->status(); }
-uint64_t HotDeltaIterator::GetPhysicalId() {
-  return merging_iter_->GetPhysicalId();
-}
-
-namespace {
-
-class BoundedMemIterator : public InternalIterator {
- public:
-  BoundedMemIterator(InternalIterator* iter, const std::string& lower_bound,
-                     const std::string& upper_bound,
-                     const InternalKeyComparator* icmp)
-      : iter_(iter),
-        lower_bound_(lower_bound),
-        upper_bound_(upper_bound),
-        icmp_(icmp) {
-    UpdateValid();
-  }
-
-  ~BoundedMemIterator() override { delete iter_; }
-
-  bool Valid() const override { return valid_; }
-
-  void SeekToFirst() override {
-    if (!lower_bound_.empty()) {
-      iter_->Seek(lower_bound_);
-    } else {
-      iter_->SeekToFirst();
-    }
-    UpdateValid();
-  }
-
-  void SeekToLast() override {
-    if (!upper_bound_.empty()) {
-      iter_->SeekForPrev(upper_bound_);
-    } else {
-      iter_->SeekToLast();
-    }
-    UpdateValid();
-  }
-
-  void Seek(const Slice& target) override {
-    if (!lower_bound_.empty() && icmp_->Compare(target, lower_bound_) < 0) {
-      iter_->Seek(lower_bound_);
-    } else if (!upper_bound_.empty() &&
-               icmp_->Compare(target, upper_bound_) > 0) {
-      valid_ = false;
-      return;
-    } else {
-      iter_->Seek(target);
-    }
-    UpdateValid();
-  }
-
-  void SeekForPrev(const Slice& target) override {
-    if (!upper_bound_.empty() && icmp_->Compare(target, upper_bound_) > 0) {
-      iter_->SeekForPrev(upper_bound_);
-    } else if (!lower_bound_.empty() &&
-               icmp_->Compare(target, lower_bound_) < 0) {
-      valid_ = false;
-      return;
-    } else {
-      iter_->SeekForPrev(target);
-    }
-    UpdateValid();
-  }
-
-  void Next() override {
-    iter_->Next();
-    UpdateValid();
-  }
-
-  void Prev() override {
-    iter_->Prev();
-    UpdateValid();
-  }
-
-  Slice key() const override { return iter_->key(); }
-  Slice value() const override { return iter_->value(); }
-  Status status() const override { return iter_->status(); }
-
-  bool PrepareValue() override { return iter_->PrepareValue(); }
-
- private:
-  void UpdateValid() {
-    valid_ = iter_->Valid() && IsWithinBounds(iter_->key());
-  }
-
-  bool IsWithinBounds(const Slice& k) const {
-    if (!lower_bound_.empty() && icmp_->Compare(k, lower_bound_) < 0)
-      return false;
-    if (!upper_bound_.empty() && icmp_->Compare(k, upper_bound_) > 0)
-      return false;
-    return true;
-  }
-
-  InternalIterator* iter_;
-  std::string lower_bound_;
-  std::string upper_bound_;
-  const InternalKeyComparator* icmp_;
-  bool valid_ = false;
-};
-
-}  // namespace
-
-// ====================== HotSnapshotIterator ============================
-
-HotSnapshotIterator::HotSnapshotIterator(
-    const std::vector<DataSegment>& segments, uint64_t cuid,
-    HotspotManager* hotspot_manager, TableCache* table_cache,
-    const ReadOptions& read_options, const FileOptions& file_options,
-    const InternalKeyComparator& icmp,
-    const MutableCFOptions& mutable_cf_options)
-    : segments_(segments),
-      cuid_(cuid),
+DBIter::DBIter(Env* _env, const ReadOptions& read_options,
+               const ImmutableOptions& ioptions,
+               const MutableCFOptions& mutable_cf_options,
+               const Comparator* cmp, InternalIterator* iter,
+               const Version* version, SequenceNumber s, bool arena_mode,
+               ReadCallback* read_callback, ColumnFamilyHandleImpl* cfh,
+               bool expose_blob_index, ReadOnlyMemTable* active_mem,
+               std::shared_ptr<HotspotManager> hotspot_manager)
+    : prefix_extractor_(mutable_cf_options.prefix_extractor.get()),
+      env_(_env),
+      clock_(ioptions.clock),
+      logger_(ioptions.logger),
+      user_comparator_(cmp),
+      merge_operator_(ioptions.merge_operator.get()),
+      iter_(iter),
+      blob_reader_(version, read_options.read_tier,
+                   read_options.verify_checksums, read_options.fill_cache,
+                   read_options.io_activity),
+      read_callback_(read_callback),
+      sequence_(s),
+      statistics_(ioptions.stats),
+      max_skip_(mutable_cf_options.max_sequential_skip_in_iterations),
+      max_skippable_internal_keys_(read_options.max_skippable_internal_keys),
+      num_internal_keys_skipped_(0),
+      iterate_lower_bound_(read_options.iterate_lower_bound),
+      iterate_upper_bound_(read_options.iterate_upper_bound),
+      cfh_(cfh),
+      timestamp_ub_(read_options.timestamp),
+      timestamp_lb_(read_options.iter_start_ts),
+      timestamp_size_(timestamp_ub_ ? timestamp_ub_->size() : 0),
+      active_mem_(active_mem),
+      memtable_seqno_lb_(kMaxSequenceNumber),
+      memtable_op_scan_flush_trigger_(0),
+      avg_op_scan_flush_trigger_(0),
+      iter_step_since_seek_(1),
+      mem_hidden_op_scanned_since_seek_(0),
+      direction_(kForward),
+      valid_(false),
+      current_entry_is_merged_(false),
+      is_key_seqnum_zero_(false),
+      prefix_same_as_start_(
+          prefix_extractor_ ? read_options.prefix_same_as_start : false),
+      pin_thru_lifetime_(read_options.pin_data),
+      expect_total_order_inner_iter_(prefix_extractor_ == nullptr ||
+                                     read_options.total_order_seek ||
+                                     read_options.auto_prefix_mode),
+      expose_blob_index_(expose_blob_index),
+      allow_unprepared_value_(read_options.allow_unprepared_value),
+      is_blob_(false),
+      arena_mode_(arena_mode),
       hotspot_manager_(hotspot_manager),
-      table_cache_(table_cache),
-      read_options_(read_options),
-      file_options_(file_options),
-      icmp_(icmp),
-      mutable_cf_options_(mutable_cf_options),
-      current_segment_index_(-1),
-      status_(Status::OK()) {}
-
-HotSnapshotIterator::~HotSnapshotIterator() {
-  // current_iter_ unique_ptr auto released
-}
-
-HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
-    size_t index) {
-  if (index >= segments_.size()) {
-    current_iter_.reset(nullptr);
-    current_segment_index_ = -1;
-    return SegmentInitStatus::kError;
+      read_options_(read_options) {
+  RecordTick(statistics_, NO_ITERATOR_CREATED);
+  if (pin_thru_lifetime_) {
+    pinned_iters_mgr_.StartPinning();
   }
-
-  const auto& seg = segments_[index];
-  current_segment_index_ = static_cast<int>(index);
-
-  if (seg.file_number == static_cast<uint64_t>(-1)) {
-    // Case A: 内存 Buffer fileid -1
-    InternalIterator* mem_iter =
-        hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
-
-    // 检查 buffer 是否还有数据。如果为空，由于 SAC 机制，很可能是发生了 Flush
-    // 导致 segments changed 
-    mem_iter->Seek(seg.first_key);
-    if (!mem_iter->Valid() ||
-        icmp_.Compare(mem_iter->key(), seg.first_key) > 0) {
-      HotIndexEntry latest_entry;
-      if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry) &&
-          latest_entry.HasSnapshot()) {
-        bool snapshot_changed = false;
-        if (segments_.size() != latest_entry.snapshot_segments.size()) {
-          snapshot_changed = true;
-        } else {
-          for (size_t i = 0; i < segments_.size(); ++i) {
-            if (segments_[i].file_number !=
-                latest_entry.snapshot_segments[i].file_number) {
-              snapshot_changed = true;
-              break;
-            }
-          }
-        }
-
-        if (snapshot_changed) {
-          delete mem_iter;
-          // 不在这里更新 segments_，交给 Next() 循环处理 ReSync
-          return SegmentInitStatus::kSnapshotChanged;
-        }
-      }
+  if (iter_.iter()) {
+    iter_.iter()->SetPinnedItersMgr(&pinned_iters_mgr_);
+  }
+  status_.PermitUncheckedError();
+  assert(timestamp_size_ ==
+         user_comparator_.user_comparator()->timestamp_size());
+  // prefix_seek_opt_in_only should force total_order_seek whereever the caller
+  // is duplicating the original ReadOptions
+  assert(!ioptions.prefix_seek_opt_in_only || read_options.total_order_seek);
+  if (active_mem_) {
+    // FIXME: GetEarliestSequenceNumber() may return a seqno that is one smaller
+    // than the smallest seqno in the memtable. This violates its comment and
+    // entries with that seqno may not be in the active memtable. Before it's
+    // fixed, we use GetFirstSequenceNumber() for more accurate result.
+    memtable_seqno_lb_ = active_mem_->IsEmpty()
+                             ? active_mem_->GetEarliestSequenceNumber()
+                             : active_mem_->GetFirstSequenceNumber();
+    memtable_op_scan_flush_trigger_ =
+        mutable_cf_options.memtable_op_scan_flush_trigger;
+    if (memtable_op_scan_flush_trigger_) {
+      // avg_op_scan_flush_trigger_ requires memtable_op_scan_flush_trigger_ > 0
+      avg_op_scan_flush_trigger_ =
+          mutable_cf_options.memtable_avg_op_scan_flush_trigger;
     }
-    current_iter_.reset(new BoundedMemIterator(mem_iter, seg.first_key,
-                                               seg.last_key, &icmp_));
-    return SegmentInitStatus::kSuccess;
   } else {
-    // Case B: 物理 SST
-    FileMetaData meta = MakeFileMetaFromSegment(seg, false);
-
-    current_read_options_ = read_options_;
-    current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
-    current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
-
-    current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
-    current_lower_bound_slice_ = Slice(current_lower_bound_str_);
-    current_upper_bound_slice_ = Slice(current_upper_bound_str_);
-    current_read_options_.iterate_lower_bound = &current_lower_bound_slice_;
-    current_read_options_.iterate_upper_bound = &current_upper_bound_slice_;
-
-    InternalIterator* iter = table_cache_->NewIterator(
-        current_read_options_, file_options_, icmp_, meta, nullptr,
-        mutable_cf_options_, nullptr, nullptr, TableReaderCaller::kUserIterator,
-        nullptr, false,
-        1,  // L1+
-        0, nullptr, nullptr,
-        false,  // allow_unprepared_value
-        nullptr, nullptr);
-
-    current_iter_.reset(iter);
-    return SegmentInitStatus::kSuccess;
+    // memtable_op_scan_flush_trigger_ and avg_op_scan_flush_trigger_ are
+    // initialized to 0(disabled) as default.
   }
 }
 
-void HotSnapshotIterator::Seek(const Slice& target) {
-  if (segments_.empty()) {
-    current_iter_.reset(nullptr);
-    return;
+Status DBIter::GetProperty(std::string prop_name, std::string* prop) {
+  if (prop == nullptr) {
+    return Status::InvalidArgument("prop is nullptr");
   }
-
-  while (true) {
-    // EndKey >= Target 的 Segment
-    auto it = std::lower_bound(
-        segments_.begin(), segments_.end(), target,
-        [&](const DataSegment& seg, const Slice& val) {
-          if (seg.last_key.empty()) {
-            fprintf(stderr,
-                    "Warning: Empty last_key in segment. This should not "
-                    "happen.\n");
-            return false;
-          }
-          // 比较 seg.last_key < val
-          return icmp_.user_comparator()->Compare(ExtractUserKey(seg.last_key),
-                                                  ExtractUserKey(val)) < 0;
-        });
-
-    size_t index = std::distance(segments_.begin(), it);
-
-    if (it == segments_.end()) {
-      current_iter_.reset(nullptr);
-      current_segment_index_ = -1;
-      return;
+  if (prop_name == "rocksdb.iterator.super-version-number") {
+    // First try to pass the value returned from inner iterator.
+    return iter_.iter()->GetProperty(prop_name, prop);
+  } else if (prop_name == "rocksdb.iterator.is-key-pinned") {
+    if (valid_) {
+      *prop = (pin_thru_lifetime_ && saved_key_.IsKeyPinned()) ? "1" : "0";
+    } else {
+      *prop = "Iterator is not valid.";
     }
-
-    if (static_cast<int>(index) != current_segment_index_) {
-      SegmentInitStatus status = InitIterForSegment(index);
-      if (status == SegmentInitStatus::kSnapshotChanged) {
-        // snapshots 已变，重新获取并定位
-        HotIndexEntry latest_entry;
-        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
-          segments_ = latest_entry.snapshot_segments;
-          current_segment_index_ = -1;
-          continue;  // 重新进行 lower_bound
-        }
-      } else if (status == SegmentInitStatus::kError) {
-        current_iter_.reset(nullptr);
-        current_segment_index_ = -1;
-        return;
-      }
+    return Status::OK();
+  } else if (prop_name == "rocksdb.iterator.is-value-pinned") {
+    if (valid_) {
+      *prop = (pin_thru_lifetime_ && iter_.Valid() &&
+               iter_.value().data() == value_.data())
+                  ? "1"
+                  : "0";
+    } else {
+      *prop = "Iterator is not valid.";
     }
-
-    break;
+    return Status::OK();
+  } else if (prop_name == "rocksdb.iterator.internal-key") {
+    *prop = saved_key_.GetUserKey().ToString();
+    return Status::OK();
+  } else if (prop_name == "rocksdb.iterator.write-time") {
+    PutFixed64(prop, saved_write_unix_time_);
+    return Status::OK();
   }
-
-
-  // segment seek
-  if (current_iter_) {
-    current_iter_->Seek(target);
-      /*
-      std::string landed_key = current_iter_->Valid()
-                                   ? FormatKeyDisplay(current_iter_->key())
-                                   : "N/A";
-      std::string landed_hex =
-          current_iter_->Valid()
-              ? Slice(current_iter_->key()).ToString(true).substr(0, 60)
-              : "";
-      fprintf(stderr,
-              "[DIAG_SEEK] CUID %lu Initial Seek to Segment %d (File %lu). "
-              "Valid: %d, Landed: %s, Hex: %s\n",
-              cuid_, current_segment_index_,
-              segments_[current_segment_index_].file_number,
-              current_iter_->Valid(), landed_key.c_str(), landed_hex.c_str());
-      */
-
-
-    if (!Valid()) {
-      SwitchToNextSegment();
-      if (current_iter_) {
-        current_iter_->Seek(segments_[current_segment_index_].first_key);
-      }
-    }
-
-  }
+  return Status::InvalidArgument("Unidentified property.");
 }
 
-void HotSnapshotIterator::Next() {
-  if (!current_iter_) return;
-
-  std::string prev_key_debug = key().ToString();
-  current_iter_->Next();
-
-  int resync_count = 0;
-  while (!Valid()) {
-    if (++resync_count > 1000) {
-        fprintf(stderr, "[ERROR] HotSnapshotIterator stuck in ReSync loop for CUID %lu. segments=%zu, idx=%d\n", 
-                cuid_, segments_.size(), current_segment_index_);
-        current_iter_.reset(nullptr);
-        break;
-    }
-
-    int target_index = current_segment_index_ + 1;
-
-    // 检查是否由于越界或者其他原因需要强制 ReSync
-    if (target_index >= static_cast<int>(segments_.size())) {
-      if (ReSyncToLatestSegments(prev_key_debug)) {
-         if (Valid()) break;
-         // Relocated 到新图后，current_segment_index_ 已经更新
-         // 从这个新的 index 继续检查，所以 continue
-         continue; 
-      }
-      break; // EOF
-    }
-
-    // 尝试初始化下一段
-    SegmentInitStatus status = InitIterForSegment(target_index);
-    if (status == SegmentInitStatus::kSnapshotChanged) {
-      if (ReSyncToLatestSegments(prev_key_debug)) {
-        if (Valid()) break;
-        continue;
-      }
-      break;
-    }
- else if (status == SegmentInitStatus::kError) {
-      current_iter_.reset(nullptr);
-      current_segment_index_ = -1;
-      break;
-    }
-
-    // 正常跨段，来到新的 Seg 的起点
-    if (current_iter_) {
-      current_iter_->Seek(segments_[current_segment_index_].first_key);
-    }
-  }
-
-
-  // Regression 检查：捕捉跨段/同步后的逻辑回退
-  if (Valid() &&
-      icmp_.user_comparator()->Compare(ExtractUserKey(Slice(prev_key_debug)),
-                                       ExtractUserKey(key())) > 0) {
-    fprintf(stderr, "[FATAL] HotSnapshotIterator Regression detected!\n");
-    fprintf(stderr, "Prev: %s\n", FormatKeyDisplay(prev_key_debug).c_str());
-    fprintf(stderr, "Curr: %s\n", FormatKeyDisplay(key()).c_str());
-    // 强制失效以停止错误数据产出
-    current_iter_.reset(nullptr);
-  }
-}
-
-// 当 Reader 因后台 Flush/Promote 导致 segment 变化时
-// 从最新索引重新获取段列表，并利用 prev_key 定位到正确的位置继续读
-bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
-  HotIndexEntry latest_entry;
-  if (!hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry) ||
-      !latest_entry.HasSnapshot()) {
+bool DBIter::ParseKey(ParsedInternalKey* ikey) {
+  Status s = ParseInternalKey(iter_.key(), ikey, false /* log_err_key */);
+  if (!s.ok()) {
+    status_ = Status::Corruption("In DBIter: ", s.getState());
+    valid_ = false;
+    ROCKS_LOG_ERROR(logger_, "In DBIter: %s", status_.getState());
     return false;
-  }
-
-  // segments 没变 => EOF
-  const auto& new_segs = latest_entry.snapshot_segments;
-  if (!segments_.empty() && segments_.size() == new_segs.size()) {
-    bool identical = true;
-    for (size_t i = 0; i < segments_.size(); ++i) {
-      if (segments_[i].file_number != new_segs[i].file_number ||
-          segments_[i].first_key != new_segs[i].first_key ||
-          segments_[i].last_key != new_segs[i].last_key) {
-        identical = false;
-        break;
-      }
-    }
-    if (identical) return false;
-  }
-
-  segments_ = new_segs;
-
-  //如果segments_空了 => EOF
-  if (segments_.empty()) {
-    current_iter_.reset(nullptr);
-    current_segment_index_ = -1;
-    return false;
-  }
-
-  // 寻找包含或紧邻 prev_key 的段
-  auto it = std::lower_bound(
-      segments_.begin(), segments_.end(), prev_key,
-      [&](const DataSegment& seg, const Slice& val) {
-        return icmp_.user_comparator()->Compare(ExtractUserKey(seg.last_key),
-                                                ExtractUserKey(val)) < 0;
-      });
-
-  if (it == segments_.end()) {
-    current_iter_.reset(nullptr);
-    current_segment_index_ = static_cast<int>(segments_.size());
-    return false;  // 定位到了 all segments 之后 -> EOF
-  }
-
-  size_t new_index = std::distance(segments_.begin(), it);
-  current_segment_index_ = -1;
-  SegmentInitStatus status = InitIterForSegment(new_index);
-
-  if (status != SegmentInitStatus::kSuccess) {
-    // 如果又是 snapshot changed，由外部 Next() 循环再次重试
+  } else {
     return true;
   }
-
-  if (!current_iter_) return true;
-
-  // 定位到 prev_key 及其之后
-  current_iter_->Seek(prev_key);
-
-  // 重要：跳过已读过的 prev_key 自身，确保单调前进
-  while (current_iter_->Valid() &&
-         icmp_.user_comparator()->Compare(ExtractUserKey(current_iter_->key()),
-                                          ExtractUserKey(prev_key)) <= 0) {
-    current_iter_->Next();
-  }
-
-  /*
-  if (cuid_ == 1003) {
-    fprintf(stderr,
-            "[DIAG_RESYNC] CUID %lu: Relocated to Seg %d. Valid: %d, "
-            "Landed: %s\n",
-            cuid_, current_segment_index_,
-            current_iter_->Valid(),
-            current_iter_->Valid()
-                ? FormatKeyDisplay(current_iter_->key()).c_str()
-                : "N/A");
-  }
-  */
-
-  return true; // 地图已经更新，无论当前段是否 Valid 都要返回 true 让外层继续
 }
 
-void HotSnapshotIterator::SwitchToNextSegment() {
-  int target_index = current_segment_index_ + 1;
-  int retry = 0;
-  while (true) {
-    if (++retry > 20) break;
-    SegmentInitStatus status = InitIterForSegment(target_index);
-    if (status == SegmentInitStatus::kSnapshotChanged) {
-      HotIndexEntry latest_entry;
-      if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
-        segments_ = latest_entry.snapshot_segments;
-        continue;
-      }
+void DBIter::Next() {
+  assert(valid_);
+  assert(status_.ok());
+
+  PERF_COUNTER_ADD(iter_next_count, 1);
+  PERF_CPU_TIMER_GUARD(iter_next_cpu_nanos, clock_);
+  // Release temporarily pinned blocks from last operation
+  ReleaseTempPinnedData();
+  ResetBlobData();
+  ResetValueAndColumns();
+  local_stats_.skip_count_ += num_internal_keys_skipped_;
+  local_stats_.skip_count_--;
+  num_internal_keys_skipped_ = 0;
+  iter_step_since_seek_++;
+  bool ok = true;
+  if (direction_ == kReverse) {
+    is_key_seqnum_zero_ = false;
+    if (!ReverseToForward()) {
+      ok = false;
     }
-    break;
+  } else if (!current_entry_is_merged_) {
+    // If the current value is not a merge, the iter position is the
+    // current key, which is already returned. We can safely issue a
+    // Next() without checking the current key.
+    // If the current key is a merge, very likely iter already points
+    // to the next internal position.
+    assert(iter_.Valid());
+    iter_.Next();
+    PERF_COUNTER_ADD(internal_key_skipped_count, 1);
   }
-}
 
-bool HotSnapshotIterator::Valid() const {
-  if (!current_iter_ || !current_iter_->Valid()) {
-    return false;
-  }
+  local_stats_.next_count_++;
+  if (ok && iter_.Valid()) {
+    ClearSavedValue();
 
-  // 边界检查：需要在 Segment 范围内
-  const auto& seg = segments_[current_segment_index_];
-  bool ret = true;
-  if (!seg.last_key.empty()) {
-    if (icmp_.user_comparator()->Compare(ExtractUserKey(current_iter_->key()),
-                                         ExtractUserKey(seg.last_key)) > 0) {
-      ret = false;
+    if (prefix_same_as_start_) {
+      assert(prefix_extractor_ != nullptr);
+      const Slice prefix = prefix_.GetUserKey();
+      FindNextUserEntry(true /* skipping the current user key */, &prefix);
+    } else {
+      FindNextUserEntry(true /* skipping the current user key */, nullptr);
     }
+  } else {
+    is_key_seqnum_zero_ = false;
+    valid_ = false;
   }
-  return ret;
+  if (statistics_ != nullptr && valid_) {
+    local_stats_.next_found_count_++;
+    local_stats_.bytes_read_ += (key().size() + value().size());
+  }
 }
 
-Slice HotSnapshotIterator::key() const { return current_iter_->key(); }
-Slice HotSnapshotIterator::value() const { return current_iter_->value(); }
-Status HotSnapshotIterator::status() const {
-  if (!status_.ok()) return status_;
-  if (current_iter_) return current_iter_->status();
+Status DBIter::BlobReader::RetrieveAndSetBlobValue(const Slice& user_key,
+                                                   const Slice& blob_index) {
+  assert(blob_value_.empty());
+
+  if (!version_) {
+    return Status::Corruption("Encountered unexpected blob index.");
+  }
+
+  // TODO: consider moving ReadOptions from ArenaWrappedDBIter to DBIter to
+  // avoid having to copy options back and forth.
+  // TODO: plumb Env::IOPriority
+  ReadOptions read_options;
+  read_options.read_tier = read_tier_;
+  read_options.verify_checksums = verify_checksums_;
+  read_options.fill_cache = fill_cache_;
+  read_options.io_activity = io_activity_;
+  constexpr FilePrefetchBuffer* prefetch_buffer = nullptr;
+  constexpr uint64_t* bytes_read = nullptr;
+
+  const Status s = version_->GetBlob(read_options, user_key, blob_index,
+                                     prefetch_buffer, &blob_value_, bytes_read);
+
+  if (!s.ok()) {
+    return s;
+  }
+
   return Status::OK();
 }
 
-void HotSnapshotIterator::SeekToFirst() {
-  int retry = 0;
-  while (true) {
-    if (++retry > 20) break;
-    SegmentInitStatus status = InitIterForSegment(0);
-
-    if (status == SegmentInitStatus::kSnapshotChanged) {
-        HotIndexEntry latest_entry;
-        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
-            segments_ = latest_entry.snapshot_segments;
-            continue;
-        }
-    }
-    break;
-  }
-  if (current_iter_)
-    current_iter_->Seek(segments_[current_segment_index_].first_key);
-}
-
-void HotSnapshotIterator::SeekToLast() {
-  int retry = 0;
-  while (true) {
-    if (++retry > 20) break;
-    SegmentInitStatus status = InitIterForSegment(segments_.size() - 1);
-
-    if (status == SegmentInitStatus::kSnapshotChanged) {
-        HotIndexEntry latest_entry;
-        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
-            segments_ = latest_entry.snapshot_segments;
-            continue;
-        }
-    }
-    break;
-  }
-  if (current_iter_) {
-    if (segments_[current_segment_index_].file_number ==
-        static_cast<uint64_t>(-1)) {
-      current_iter_->SeekForPrev(segments_[current_segment_index_].last_key);
-    } else {
-      current_iter_->SeekToLast();
-    }
-  }
-}
-
-void HotSnapshotIterator::Prev() {
-  if (!current_iter_) return;
-  current_iter_->Prev();
-  if (!Valid()) {
-    SwitchToPrevSegment();
-    if (Valid()) {
-      if (segments_[current_segment_index_].file_number ==
-          static_cast<uint64_t>(-1)) {
-        current_iter_->SeekForPrev(segments_[current_segment_index_].last_key);
-      } else {
-        current_iter_->SeekToLast();
-      }
-    }
-  }
-}
-
-void HotSnapshotIterator::SwitchToPrevSegment() {
-  if (current_segment_index_ > 0) {
-    int target_index = current_segment_index_ - 1;
-    int retry = 0;
-    while (true) {
-      if (++retry > 20) break;
-      SegmentInitStatus status = InitIterForSegment(target_index);
-
-      if (status == SegmentInitStatus::kSnapshotChanged) {
-        HotIndexEntry latest_entry;
-        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
-          segments_ = latest_entry.snapshot_segments;
-          continue;
-        }
-      }
-      break;
-    }
-  } else {
-    current_iter_.reset(nullptr);
-    current_segment_index_ = -1;
-  }
-}
-
-void HotSnapshotIterator::SeekForPrev(const Slice& target) {
-  // simplified
-  Seek(target);
-  if (!Valid()) {
-    SeekToLast();
-  }
-  while (Valid() && icmp_.Compare(key(), target) > 0) {
-    Prev();
-  }
-}
-
-uint64_t HotSnapshotIterator::GetPhysicalId() {
-  if (current_iter_) return current_iter_->GetPhysicalId();
-  return 0;
-}
-
-// ===================================================================
-// DeltaSwitchingIterator Implementation
-// ===================================================================
-
-DeltaSwitchingIterator::DeltaSwitchingIterator(
-    Version* version, HotspotManager* hotspot_manager,
-    const ReadOptions& read_options, const FileOptions& file_options,
-    const InternalKeyComparator& icmp,
-    const MutableCFOptions& mutable_cf_options, Arena* arena)
-    : version_(version),
-      hotspot_manager_(hotspot_manager),
-      read_options_(read_options),
-      file_options_(file_options),
-      icmp_(icmp),
-      mutable_cf_options_(mutable_cf_options),
-      arena_(arena),
-      current_iter_(nullptr),
-      cold_iter_(nullptr),
-      hot_iter_(nullptr),
-      current_hot_cuid_(0),
-      is_hot_mode_(false) {}
-
-DeltaSwitchingIterator::~DeltaSwitchingIterator() {
-  if (hot_iter_) {
-    delete hot_iter_;
-  }
-  // rocksdb 会在 arena 中分配内存，不需要手动删除
-  if (cold_iter_) {
-    if (arena_) {
-      cold_iter_->~InternalIterator();
-    } else {
-      delete cold_iter_;
-    }
-  }
-}
-
-void DeltaSwitchingIterator::InitColdIter() {
-  if (cold_iter_) return;
-
-  // L0~Ln 所有文件的 MergingIterator
-  // Arena=nullptr, skip_filters=false
-  MergeIteratorBuilder builder(&icmp_, arena_);
-  version_->AddIterators(read_options_, file_options_, &builder,
-                         /*allow_unprepared*/ false);
-  // get MergingIterator
-  cold_iter_ = builder.Finish();
-
-  if (!cold_iter_) {
-    cold_iter_ = NewEmptyInternalIterator<Slice>(arena_);
-  }
-}
-
-bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
-  if (hot_iter_ && current_hot_cuid_ == cuid) return true;
-
-  if (hot_iter_) {
-    delete hot_iter_;
-    hot_iter_ = nullptr;
-  }
-
-  // 1. 获取元数据
-  HotIndexEntry entry;
-  if (!hotspot_manager_->GetHotIndexEntry(cuid, &entry) ||
-      !entry.HasSnapshot()) {
-    // 如果没有 Snapshot，使用 cold path
+bool DBIter::SetValueAndColumnsFromBlobImpl(const Slice& user_key,
+                                            const Slice& blob_index) {
+  const Status s = blob_reader_.RetrieveAndSetBlobValue(user_key, blob_index);
+  if (!s.ok()) {
+    status_ = s;
+    valid_ = false;
+    is_blob_ = false;
     return false;
   }
 
-  // snapshot and delta
-  InternalIterator* snapshot_iter =
-      new HotSnapshotIterator(entry.snapshot_segments, cuid, hotspot_manager_,
-                              version_->cfd()->table_cache(), read_options_,
-                              file_options_, icmp_, mutable_cf_options_);
+  SetValueAndColumnsFromPlain(blob_reader_.GetBlobValue());
 
-  InternalIterator* delta_iter = new HotDeltaIterator(
-      entry.deltas, version_->cfd()->table_cache(), read_options_,
-      file_options_, icmp_, mutable_cf_options_, false);
-
-  std::vector<InternalIterator*> children = {delta_iter, snapshot_iter};
-  hot_iter_ = NewMergingIterator(&icmp_, children.data(), 2);
-  current_hot_cuid_ = cuid;
   return true;
 }
 
-void DeltaSwitchingIterator::Seek(const Slice& target) {
-  uint64_t cuid = hotspot_manager_->ExtractCUID(target);
-  if (read_options_.skip_hot_path) {
-    InitColdIter();
-    current_iter_ = cold_iter_;
-    is_hot_mode_ = false;
+bool DBIter::SetValueAndColumnsFromBlob(const Slice& user_key,
+                                        const Slice& blob_index) {
+  assert(!is_blob_);
+  is_blob_ = true;
+
+  if (expose_blob_index_) {
+    SetValueAndColumnsFromPlain(blob_index);
+    return true;
   }
-  // 否则，不论是点查还是全扫描(delta_full_scan)，只要是热点，全部走热点路径
-  else if (cuid != 0 && hotspot_manager_->IsHot(cuid)) {
-    if (InitHotIter(cuid)) {
-      current_iter_ = hot_iter_;
-      is_hot_mode_ = true;
+
+  if (allow_unprepared_value_) {
+    assert(value_.empty());
+    assert(wide_columns_.empty());
+
+    assert(lazy_blob_index_.empty());
+    lazy_blob_index_ = blob_index;
+
+    return true;
+  }
+
+  return SetValueAndColumnsFromBlobImpl(user_key, blob_index);
+}
+
+bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
+  assert(value_.empty());
+  assert(wide_columns_.empty());
+
+  const Status s = WideColumnSerialization::Deserialize(slice, wide_columns_);
+
+  if (!s.ok()) {
+    status_ = s;
+    valid_ = false;
+    wide_columns_.clear();
+    return false;
+  }
+
+  if (WideColumnsHelper::HasDefaultColumn(wide_columns_)) {
+    value_ = WideColumnsHelper::GetDefaultColumn(wide_columns_);
+  }
+
+  return true;
+}
+
+bool DBIter::SetValueAndColumnsFromMergeResult(const Status& merge_status,
+                                               ValueType result_type) {
+  if (!merge_status.ok()) {
+    valid_ = false;
+    status_ = merge_status;
+    return false;
+  }
+
+  if (result_type == kTypeWideColumnEntity) {
+    if (!SetValueAndColumnsFromEntity(saved_value_)) {
+      assert(!valid_);
+      return false;
+    }
+
+    valid_ = true;
+    return true;
+  }
+
+  assert(result_type == kTypeValue);
+  SetValueAndColumnsFromPlain(pinned_value_.data() ? pinned_value_
+                                                   : saved_value_);
+  valid_ = true;
+  return true;
+}
+
+bool DBIter::PrepareValue() {
+  assert(valid_);
+
+  if (lazy_blob_index_.empty()) {
+    return true;
+  }
+
+  assert(allow_unprepared_value_);
+  assert(is_blob_);
+
+  const bool result =
+      SetValueAndColumnsFromBlobImpl(saved_key_.GetUserKey(), lazy_blob_index_);
+
+  lazy_blob_index_.clear();
+
+  return result;
+}
+
+// for delta physical
+uint64_t GetCurrentPhysUnitId(InternalIterator* internal_iter) {
+  if (internal_iter == nullptr) return 0;
+  return internal_iter->GetPhysicalId();
+}
+
+// PRE: saved_key_ has the current user key if skipping_saved_key
+// POST: saved_key_ should have the next user key if valid_,
+//       if the current entry is a result of merge
+//           current_entry_is_merged_ => true
+//           saved_value_             => the merged value
+//
+// NOTE: In between, saved_key_ can point to a user key that has
+//       a delete marker or a sequence number higher than sequence_
+//       saved_key_ MUST have a proper user_key before calling this function
+//
+// The prefix parameter, if not null, indicates that we need to iterate
+// within the prefix, and the iterator needs to be made invalid, if no
+// more entry for the prefix can be found.
+bool DBIter::FindNextUserEntry(bool skipping_saved_key, const Slice* prefix) {
+  PERF_TIMER_GUARD(find_next_user_entry_time);
+  return FindNextUserEntryInternal(skipping_saved_key, prefix);
+}
+
+// Actual implementation of DBIter::FindNextUserEntry()
+bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
+                                       const Slice* prefix) {
+  return FindNextUserEntryInternalImpl(skipping_saved_key, prefix);
+}
+
+bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
+                                           const Slice* prefix) {
+  // Loop until we hit an acceptable entry to yield
+  assert(iter_.Valid());
+  assert(status_.ok());
+  assert(direction_ == kForward);
+  current_entry_is_merged_ = false;
+
+  // How many times in a row we have skipped an entry with user key less than
+  // or equal to saved_key_. We could skip these entries either because
+  // sequence numbers were too high or because skipping_saved_key = true.
+  // What saved_key_ contains throughout this method:
+  //  - if skipping_saved_key : saved_key_ contains the key that we need
+  //                            to skip, and we haven't seen any keys greater
+  //                            than that,
+  //  - if num_skipped > 0    : saved_key_ contains the key that we have skipped
+  //                            num_skipped times, and we haven't seen any keys
+  //                            greater than that,
+  //  - none of the above     : saved_key_ can contain anything, it doesn't
+  //                            matter.
+  uint64_t num_skipped = 0;
+  // For write unprepared, the target sequence number in reseek could be larger
+  // than the snapshot, and thus needs to be skipped again. This could result in
+  // an infinite loop of reseeks. To avoid that, we limit the number of reseeks
+  // to one.
+  bool reseek_done = false;
+
+  uint64_t mem_hidden_op_scanned = 0;
+  do {
+    // Will update is_key_seqnum_zero_ as soon as we parsed the current key
+    // but we need to save the previous value to be used in the loop.
+    bool is_prev_key_seqnum_zero = is_key_seqnum_zero_;
+    if (!ParseKey(&ikey_)) {
+      is_key_seqnum_zero_ = false;
+      return false;
+    }
+    Slice user_key_without_ts =
+        StripTimestampFromUserKey(ikey_.user_key, timestamp_size_);
+
+    is_key_seqnum_zero_ = (ikey_.sequence == 0);
+
+    assert(iterate_upper_bound_ == nullptr ||
+           iter_.UpperBoundCheckResult() != IterBoundCheck::kInbound ||
+           user_comparator_.CompareWithoutTimestamp(
+               user_key_without_ts, /*a_has_ts=*/false, *iterate_upper_bound_,
+               /*b_has_ts=*/false) < 0);
+    if (iterate_upper_bound_ != nullptr &&
+        iter_.UpperBoundCheckResult() != IterBoundCheck::kInbound &&
+        user_comparator_.CompareWithoutTimestamp(
+            user_key_without_ts, /*a_has_ts=*/false, *iterate_upper_bound_,
+            /*b_has_ts=*/false) >= 0) {
+      break;
+    }
+
+    assert(prefix == nullptr || prefix_extractor_ != nullptr);
+    if (prefix != nullptr &&
+        prefix_extractor_->Transform(user_key_without_ts).compare(*prefix) !=
+            0) {
+      assert(prefix_same_as_start_);
+      break;
+    }
+
+    if (TooManyInternalKeysSkipped()) {
+      return false;
+    }
+
+    assert(ikey_.user_key.size() >= timestamp_size_);
+    Slice ts = timestamp_size_ > 0 ? ExtractTimestampFromUserKey(
+                                         ikey_.user_key, timestamp_size_)
+                                   : Slice();
+    bool more_recent = false;
+    if (IsVisible(ikey_.sequence, ts, &more_recent)) {
+      // If the previous entry is of seqnum 0, the current entry will not
+      // possibly be skipped. This condition can potentially be relaxed to
+      // prev_key.seq <= ikey_.sequence. We are cautious because it will be more
+      // prone to bugs causing the same user key with the same sequence number.
+      // Note that with current timestamp implementation, the same user key can
+      // have different timestamps and zero sequence number on the bottommost
+      // level. This may change in the future.
+      if ((!is_prev_key_seqnum_zero || timestamp_size_ > 0) &&
+          skipping_saved_key &&
+          CompareKeyForSkip(ikey_.user_key, saved_key_.GetUserKey()) <= 0) {
+        num_skipped++;  // skip this entry
+        PERF_COUNTER_ADD(internal_key_skipped_count, 1);
+        MarkMemtableForFlushForPerOpTrigger(mem_hidden_op_scanned);
+      } else {
+        assert(!skipping_saved_key ||
+               CompareKeyForSkip(ikey_.user_key, saved_key_.GetUserKey()) > 0);
+        num_skipped = 0;
+        reseek_done = false;
+        switch (ikey_.type) {
+          case kTypeDeletion:
+          case kTypeDeletionWithTimestamp:
+          case kTypeSingleDeletion:
+            // Arrange to skip all upcoming entries for this key since
+            // they are hidden by this deletion.
+            if (timestamp_lb_) {
+              saved_key_.SetInternalKey(ikey_);
+              valid_ = true;
+              return true;
+            } else {
+              saved_key_.SetUserKey(
+                  ikey_.user_key, !pin_thru_lifetime_ ||
+                                      !iter_.iter()->IsKeyPinned() /* copy */);
+              skipping_saved_key = true;
+              PERF_COUNTER_ADD(internal_delete_skipped_count, 1);
+              MarkMemtableForFlushForPerOpTrigger(mem_hidden_op_scanned);
+            }
+            break;
+          case kTypeValue:
+          case kTypeValuePreferredSeqno:
+          case kTypeBlobIndex:
+          case kTypeWideColumnEntity:
+            if (!PrepareValueInternal()) {
+              return false;
+            }
+            if (timestamp_lb_) {
+              saved_key_.SetInternalKey(ikey_);
+            } else {
+              saved_key_.SetUserKey(
+                  ikey_.user_key, !pin_thru_lifetime_ ||
+                                      !iter_.iter()->IsKeyPinned() /* copy */);
+            }
+
+            if (ikey_.type == kTypeBlobIndex) {
+              if (!SetValueAndColumnsFromBlob(ikey_.user_key, iter_.value())) {
+                return false;
+              }
+            } else if (ikey_.type == kTypeWideColumnEntity) {
+              if (!SetValueAndColumnsFromEntity(iter_.value())) {
+                return false;
+              }
+            } else {
+              assert(ikey_.type == kTypeValue ||
+                     ikey_.type == kTypeValuePreferredSeqno);
+              Slice value = iter_.value();
+              saved_write_unix_time_ = iter_.write_unix_time();
+              if (ikey_.type == kTypeValuePreferredSeqno) {
+                value = ParsePackedValueForValue(value);
+              }
+              SetValueAndColumnsFromPlain(value);
+            }
+
+            valid_ = true;
+            // for delta
+            if (hotspot_manager_) {
+              uint64_t cuid =
+                  hotspot_manager_->ExtractCUID(saved_key_.GetUserKey());
+              if (cuid != 0) {
+                // [DIAG_KEY] Log buffered key size
+                // if (cuid == 1003 && read_options_.delta_full_scan) {
+                //   fprintf(stderr, "[DIAG_BUFFER] CUID 1003 buffering key size: %zu, UserKey size: %zu\n", 
+                //           iter_.key().size(), saved_key_.GetUserKey().size());
+                // }
+                // 如果 CUID 已被删除，跳过
+                // 缓存 deleted 状态：同一 CUID optimization
+                if (delta_ctx_.cached_deleted_check_cuid != cuid) {
+                  // cuid change，查询 GDCT 一次，引入 sequence_ -> mvcc
+                  delta_ctx_.cached_cuid_is_deleted = hotspot_manager_->IsCuidDeleted(cuid, sequence_);
+                  delta_ctx_.cached_deleted_check_cuid = cuid;
+                }
+                if (delta_ctx_.cached_cuid_is_deleted) {
+                  valid_ = false;
+                  ResetValueAndColumns();  // 这个函数用于清理 value_
+                  // RecordTick(statistics_, DELTA_LOGICAL_DELETE_SKIPPED);
+                  iter_.Next();
+                  continue;
+                }
+
+                // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
+                if (delta_ctx_.last_cuid != cuid) {
+                  // 将上个 cuid 的扫描结果提交
+                  if (delta_ctx_.last_cuid != 0 &&
+                      !read_options_.is_metadata_scan) {
+                    // 只有非 metadata_scan 才需要评估和触发后续动作
+                    auto strategy =
+                        hotspot_manager_->EvaluateScanAsCompactionStrategy(
+                            delta_ctx_.last_cuid, read_options_.delta_full_scan,
+                            delta_ctx_.scan_first_key,
+                            delta_ctx_.GetScanLastKey());
+
+                    // 如果决定要 kFullReplace，但其实并未发生缓冲
+                    bool execute = true;
+                    if (strategy == ScanAsCompactionStrategy::kFullReplace &&
+                        !delta_ctx_.trigger_scan_as_compaction) {
+                      execute = false;
+                    }
+
+                    if (execute) {
+                      hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
+                          delta_ctx_.last_cuid, strategy,
+                          delta_ctx_.scan_first_key, delta_ctx_.GetScanLastKey(),
+                          delta_ctx_.visited_units_for_cuid,
+                          delta_ctx_.scan_data);  // 本次 scan 的数据(for partial merge)
+                    }
+                  }
+
+                  // fullscan 需要进行一次coldpath，更新GDCT
+                  if (read_options_.delta_full_scan &&
+                      delta_ctx_.is_current_hot && delta_ctx_.last_cuid != 0) {
+                    hotspot_manager_->EnqueueMetadataScan(delta_ctx_.last_cuid);
+                  }
+
+                  delta_ctx_.last_cuid = cuid;
+                  delta_ctx_.visited_units_for_cuid.clear();
+                  delta_ctx_.scan_first_key.clear();
+                  delta_ctx_.scan_last_key.clear();
+                  delta_ctx_.scan_data.clear();  // 清除上个 CUID 的 scan 数据
+                  delta_ctx_.cached_deleted_check_cuid = 0;  // 清空 deleted 缓存，下次会重新查询
+                  delta_ctx_.cached_phys_id = 0; // 重置 phys_id 缓存
+    
+                  // 对这个 cuid 进行一次访问计数，用于判断是否为热点
+                  bool became_hot = false;
+                  delta_ctx_.is_current_hot = hotspot_manager_->RegisterScan(
+                      cuid, read_options_.delta_full_scan, &became_hot);
+
+                  // 如果首次成为热点，加入待初始化队列（由后台线程处理）
+                  if (became_hot) {
+                    hotspot_manager_->EnqueueForInitScan(cuid);
+                    delta_ctx_.trigger_scan_as_compaction = false;
+                  } else if (delta_ctx_.is_current_hot &&
+                             read_options_.skip_hot_path &&
+                             !read_options_.is_metadata_scan) {
+                    // 冷路径 scan（如 Init Scan）触发 SAC（全量缓冲）
+                    // trylock cuid
+                    if (hotspot_manager_->ShouldTriggerScanAsCompaction(cuid)) {
+                      if (hotspot_manager_->PrepareForFullReplace(cuid)) {
+                        delta_ctx_.trigger_scan_as_compaction = true;
+                      }
+                    }
+                  } else if (delta_ctx_.is_current_hot &&
+                             !read_options_.skip_hot_path &&
+                             read_options_.delta_full_scan) {
+                    // 用户热路径 Full Scan：同样根据条件触发 SAC
+                    // 条件：已有 snapshot 且 delta 数 >= threshold
+                    // trylock cuid
+                    if (hotspot_manager_->ShouldTriggerScanAsCompaction(cuid)) {
+                      if (hotspot_manager_->PrepareForFullReplace(cuid)) {
+                         delta_ctx_.trigger_scan_as_compaction = true;
+                      }
+                    }
+                  } else {
+                    // 小 Scan 或其他情况：不缓冲数据，PartialMerge 依赖
+                    // scan_data
+                    delta_ctx_.trigger_scan_as_compaction = false;
+                  }
+                }
+
+                // 维护引用计数
+                if (read_options_.delta_full_scan) {
+                  uint64_t phys_id = GetCurrentPhysUnitId(iter_.iter());
+                  // 排除：phys_id=0（热点存储区的数据）+ 重复scan
+                  // [OPTIMIZATION] 只有当 unit ID 发生真正变化时才请求 GDCT 锁
+                  if (phys_id != 0 && delta_ctx_.cached_phys_id != phys_id) {
+                    if (delta_ctx_.visited_units_for_cuid.find(phys_id) ==
+                        delta_ctx_.visited_units_for_cuid.end()) {
+                      // 仅在 Full Scan 时更新
+                      hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(
+                          cuid, phys_id);
+                      delta_ctx_.visited_units_for_cuid.insert(phys_id);
+                    }
+                    delta_ctx_.cached_phys_id = phys_id;
+                  }
+                }
+
+                // [OPTIMIZATION] 只有当真正需要内部 Key 编码用于后续操作时才进行一次编码
+                bool need_internal_key = (delta_ctx_.scan_first_key.empty() || 
+                                          delta_ctx_.trigger_scan_as_compaction || 
+                                          (!read_options_.is_metadata_scan && !read_options_.delta_full_scan));
+                
+                if (need_internal_key) {
+                  delta_ctx_.key_encode_buf.clear();
+                  AppendInternalKey(&delta_ctx_.key_encode_buf,
+                      ParsedInternalKey(saved_key_.GetUserKey(), ikey_.sequence, ikey_.type));
+                }
+    
+                // 记录 scan 的 key 范围（finalize 定位）
+                if (delta_ctx_.scan_first_key.empty()) {
+                  delta_ctx_.scan_first_key = delta_ctx_.key_encode_buf;
+                }
+    
+                if (delta_ctx_.trigger_scan_as_compaction) {
+                  // Full Scan / Init Scan: 缓冲数据
+                  delta_ctx_.scan_last_key = delta_ctx_.key_encode_buf;
+                  bool buffer_full = hotspot_manager_->BufferHotData(
+                      cuid, Slice(delta_ctx_.key_encode_buf), value());
+                  if (buffer_full) {
+                    hotspot_manager_->TriggerBufferFlush();
+                  }
+                } else if (!read_options_.is_metadata_scan &&
+                           !read_options_.delta_full_scan) {
+                  // 小 Scan：not full/metadata -> partial merge
+                  delta_ctx_.scan_data.emplace_back(delta_ctx_.key_encode_buf,
+                                                    value().ToString());
+                }
+              }
+            }
+            return true;
+          // TODO：这个 merge 怎么处理？
+          case kTypeMerge:
+            if (!PrepareValueInternal()) {
+              return false;
+            }
+            saved_key_.SetUserKey(
+                ikey_.user_key,
+                !pin_thru_lifetime_ || !iter_.iter()->IsKeyPinned() /* copy */);
+            // By now, we are sure the current ikey is going to yield a value
+            current_entry_is_merged_ = true;
+            valid_ = true;
+            return MergeValuesNewToOld();  // Go to a different state machine
+          default:
+            valid_ = false;
+            status_ = Status::Corruption(
+                "Unknown value type: " +
+                std::to_string(static_cast<unsigned int>(ikey_.type)));
+            return false;
+        }
+      }
     } else {
-      // 热点索引尚未建立（如 Init Scan 还在进行中），回退到 Cold Path
-      InitColdIter();
-      current_iter_ = cold_iter_;
-      is_hot_mode_ = false;
+      if (more_recent) {
+        PERF_COUNTER_ADD(internal_recent_skipped_count, 1);
+      }
+
+      // This key was inserted after our snapshot was taken or skipped by
+      // timestamp range. If this happens too many times in a row for the same
+      // user key, we want to seek to the target sequence number.
+      int cmp = user_comparator_.CompareWithoutTimestamp(
+          ikey_.user_key, saved_key_.GetUserKey());
+      if (cmp == 0 || (skipping_saved_key && cmp < 0)) {
+        num_skipped++;
+      } else {
+        saved_key_.SetUserKey(
+            ikey_.user_key,
+            !iter_.iter()->IsKeyPinned() || !pin_thru_lifetime_ /* copy */);
+        skipping_saved_key = false;
+        num_skipped = 0;
+        reseek_done = false;
+      }
+    }
+
+    // If we have sequentially iterated via numerous equal keys, then it's
+    // better to seek so that we can avoid too many key comparisons.
+    //
+    // To avoid infinite loops, do not reseek if we have already attempted to
+    // reseek previously.
+    //
+    // TODO(lth): If we reseek to sequence number greater than ikey_.sequence,
+    // then it does not make sense to reseek as we would actually land further
+    // away from the desired key. There is opportunity for optimization here.
+    if (num_skipped > max_skip_ && !reseek_done) {
+      is_key_seqnum_zero_ = false;
+      num_skipped = 0;
+      reseek_done = true;
+      std::string last_key;
+      if (skipping_saved_key) {
+        // We're looking for the next user-key but all we see are the same
+        // user-key with decreasing sequence numbers. Fast forward to
+        // sequence number 0 and type deletion (the smallest type).
+        if (timestamp_size_ == 0) {
+          AppendInternalKey(
+              &last_key,
+              ParsedInternalKey(saved_key_.GetUserKey(), 0, kTypeDeletion));
+        } else {
+          const std::string kTsMin(timestamp_size_, '\0');
+          AppendInternalKeyWithDifferentTimestamp(
+              &last_key,
+              ParsedInternalKey(saved_key_.GetUserKey(), 0, kTypeDeletion),
+              kTsMin);
+        }
+        // Don't set skipping_saved_key = false because we may still see more
+        // user-keys equal to saved_key_.
+      } else {
+        // We saw multiple entries with this user key and sequence numbers
+        // higher than sequence_. Fast forward to sequence_.
+        // Note that this only covers a case when a higher key was overwritten
+        // many times since our snapshot was taken, not the case when a lot of
+        // different keys were inserted after our snapshot was taken.
+        if (timestamp_size_ == 0) {
+          AppendInternalKey(
+              &last_key, ParsedInternalKey(saved_key_.GetUserKey(), sequence_,
+                                           kValueTypeForSeek));
+        } else {
+          AppendInternalKeyWithDifferentTimestamp(
+              &last_key,
+              ParsedInternalKey(saved_key_.GetUserKey(), sequence_,
+                                kValueTypeForSeek),
+              *timestamp_ub_);
+        }
+      }
+      iter_.Seek(last_key);
+      RecordTick(statistics_, NUMBER_OF_RESEEKS_IN_ITERATION);
+    } else {
+      iter_.Next();
+    }
+
+    // This could be a long-running operation due to tombstones, etc.
+    bool aborted = ROCKSDB_THREAD_YIELD_CHECK_ABORT();
+    if (aborted) {
+      valid_ = false;
+      status_ = Status::Aborted("Query abort.");
+      return false;
+    }
+  } while (iter_.Valid());
+
+  // for delta, this scan ends
+  if (hotspot_manager_) {
+    // 最后一个 CUID 扫描结束，需要决定是否发起后台 Compaction (FullReplace
+    // 或 PartialMerge)
+    if (delta_ctx_.last_cuid != 0 && !read_options_.is_metadata_scan) {
+      auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
+          delta_ctx_.last_cuid, read_options_.delta_full_scan,
+          delta_ctx_.scan_first_key, delta_ctx_.GetScanLastKey());
+
+      bool execute = true;
+      if (strategy == ScanAsCompactionStrategy::kFullReplace &&
+          !delta_ctx_.trigger_scan_as_compaction) {
+        execute = false;
+      }
+
+      if (execute) {
+        hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
+            delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
+            delta_ctx_.GetScanLastKey(), delta_ctx_.visited_units_for_cuid,
+            delta_ctx_.scan_data);
+      }
+    }
+
+    // 如果是 Full Scan 且允许跳入冷数据，入队更新 GDCT 的 Metadata Scan
+    if (read_options_.delta_full_scan && delta_ctx_.is_current_hot &&
+        !read_options_.skip_hot_path && delta_ctx_.last_cuid != 0) {
+      hotspot_manager_->EnqueueMetadataScan(delta_ctx_.last_cuid);
+    }
+
+    delta_ctx_.Reset();
+  }
+
+  valid_ = false;
+  return iter_.status().ok();
+}
+
+// Merge values of the same user key starting from the current iter_ position
+// Scan from the newer entries to older entries.
+// PRE: iter_.key() points to the first merge type entry
+//      saved_key_ stores the user key
+//      iter_.PrepareValue() has been called
+// POST: saved_value_ has the merged value for the user key
+//       iter_ points to the next entry (or invalid)
+bool DBIter::MergeValuesNewToOld() {
+  if (!merge_operator_) {
+    ROCKS_LOG_ERROR(logger_, "Options::merge_operator is null.");
+    status_ = Status::InvalidArgument("merge_operator_ must be set.");
+    valid_ = false;
+    return false;
+  }
+
+  // Temporarily pin the blocks that hold merge operands
+  TempPinData();
+  merge_context_.Clear();
+  // Start the merge process by pushing the first operand
+  merge_context_.PushOperand(
+      iter_.value(), iter_.iter()->IsValuePinned() /* operand_pinned */);
+  PERF_COUNTER_ADD(internal_merge_count, 1);
+
+  TEST_SYNC_POINT("DBIter::MergeValuesNewToOld:PushedFirstOperand");
+
+  ParsedInternalKey ikey;
+  for (iter_.Next(); iter_.Valid(); iter_.Next()) {
+    TEST_SYNC_POINT("DBIter::MergeValuesNewToOld:SteppedToNextOperand");
+    if (!ParseKey(&ikey)) {
+      return false;
+    }
+
+    if (!user_comparator_.EqualWithoutTimestamp(ikey.user_key,
+                                                saved_key_.GetUserKey())) {
+      // hit the next user key, stop right here
+      break;
+    }
+    if (kTypeDeletion == ikey.type || kTypeSingleDeletion == ikey.type ||
+        kTypeDeletionWithTimestamp == ikey.type) {
+      // hit a delete with the same user key, stop right here
+      // iter_ is positioned after delete
+      iter_.Next();
+      break;
+    }
+    if (!PrepareValueInternal()) {
+      return false;
+    }
+
+    if (kTypeValue == ikey.type || kTypeValuePreferredSeqno == ikey.type) {
+      Slice value = iter_.value();
+      saved_write_unix_time_ = iter_.write_unix_time();
+      if (kTypeValuePreferredSeqno == ikey.type) {
+        value = ParsePackedValueForValue(value);
+      }
+      // hit a put or put equivalent, merge the put value with operands and
+      // store the final result in saved_value_. We are done!
+      if (!MergeWithPlainBaseValue(value, ikey.user_key)) {
+        return false;
+      }
+      // iter_ is positioned after put
+      iter_.Next();
+      if (!iter_.status().ok()) {
+        valid_ = false;
+        return false;
+      }
+      return true;
+    } else if (kTypeMerge == ikey.type) {
+      // hit a merge, add the value as an operand and run associative merge.
+      // when complete, add result to operands and continue.
+      merge_context_.PushOperand(
+          iter_.value(), iter_.iter()->IsValuePinned() /* operand_pinned */);
+      PERF_COUNTER_ADD(internal_merge_count, 1);
+    } else if (kTypeBlobIndex == ikey.type) {
+      if (!MergeWithBlobBaseValue(iter_.value(), ikey.user_key)) {
+        return false;
+      }
+
+      // iter_ is positioned after put
+      iter_.Next();
+      if (!iter_.status().ok()) {
+        valid_ = false;
+        return false;
+      }
+
+      return true;
+    } else if (kTypeWideColumnEntity == ikey.type) {
+      if (!MergeWithWideColumnBaseValue(iter_.value(), ikey.user_key)) {
+        return false;
+      }
+
+      // iter_ is positioned after put
+      iter_.Next();
+      if (!iter_.status().ok()) {
+        valid_ = false;
+        return false;
+      }
+
+      return true;
+    } else {
+      valid_ = false;
+      status_ = Status::Corruption(
+          "Unrecognized value type: " +
+          std::to_string(static_cast<unsigned int>(ikey.type)));
+      return false;
     }
   }
-  // 既不是 skip_hot_path 也不是热点，默认走冷路径
-  else {
-    InitColdIter();
-    current_iter_ = cold_iter_;
-    is_hot_mode_ = false;
+
+  if (!iter_.status().ok()) {
+    valid_ = false;
+    return false;
   }
 
-  if (current_iter_) {
-    current_iter_->Seek(target);
+  // we either exhausted all internal keys under this user key, or hit
+  // a deletion marker.
+  // feed null as the existing value to the merge operator, such that
+  // client can differentiate this scenario and do things accordingly.
+  if (!MergeWithNoBaseValue(saved_key_.GetUserKey())) {
+    return false;
+  }
+  assert(status_.ok());
+  return true;
+}
+
+void DBIter::Prev() {
+  assert(valid_);
+  assert(status_.ok());
+
+  PERF_COUNTER_ADD(iter_prev_count, 1);
+  PERF_CPU_TIMER_GUARD(iter_prev_cpu_nanos, clock_);
+  ReleaseTempPinnedData();
+  ResetBlobData();
+  ResetValueAndColumns();
+  ResetInternalKeysSkippedCounter();
+  bool ok = true;
+  if (direction_ == kForward) {
+    if (!ReverseToBackward()) {
+      ok = false;
+    }
+  }
+  if (ok) {
+    ClearSavedValue();
+
+    Slice prefix;
+    if (prefix_same_as_start_) {
+      assert(prefix_extractor_ != nullptr);
+      prefix = prefix_.GetUserKey();
+    }
+    PrevInternal(prefix_same_as_start_ ? &prefix : nullptr);
+  }
+
+  if (statistics_ != nullptr) {
+    local_stats_.prev_count_++;
+    if (valid_) {
+      local_stats_.prev_found_count_++;
+      local_stats_.bytes_read_ += (key().size() + value().size());
+    }
   }
 }
 
-// 全表扫描或未知方向，强制回退到 Cold Mode
-void DeltaSwitchingIterator::SeekToFirst() {
-  if (read_options_.skip_hot_path) {
-    InitColdIter();
-    current_iter_ = cold_iter_;
-    is_hot_mode_ = false;
+bool DBIter::ReverseToForward() {
+  assert(iter_.status().ok());
+
+  // When moving backwards, iter_ is positioned on _previous_ key, which may
+  // not exist or may have different prefix than the current key().
+  // If that's the case, seek iter_ to current key.
+  if (!expect_total_order_inner_iter() || !iter_.Valid()) {
+    std::string last_key;
+    if (timestamp_size_ == 0) {
+      AppendInternalKey(
+          &last_key, ParsedInternalKey(saved_key_.GetUserKey(),
+                                       kMaxSequenceNumber, kValueTypeForSeek));
+    } else {
+      // TODO: pre-create kTsMax.
+      const std::string kTsMax(timestamp_size_, '\xff');
+      AppendInternalKeyWithDifferentTimestamp(
+          &last_key,
+          ParsedInternalKey(saved_key_.GetUserKey(), kMaxSequenceNumber,
+                            kValueTypeForSeek),
+          kTsMax);
+    }
+    iter_.Seek(last_key);
+    RecordTick(statistics_, NUMBER_OF_RESEEKS_IN_ITERATION);
   }
-  // InitColdIter();
-  // current_iter_ = cold_iter_;
-  // is_hot_mode_ = false;
-  if (current_iter_) current_iter_->SeekToFirst();
+
+  direction_ = kForward;
+  // Skip keys less than the current key() (a.k.a. saved_key_).
+  while (iter_.Valid()) {
+    ParsedInternalKey ikey;
+    if (!ParseKey(&ikey)) {
+      return false;
+    }
+    if (user_comparator_.Compare(ikey.user_key, saved_key_.GetUserKey()) >= 0) {
+      return true;
+    }
+    iter_.Next();
+  }
+
+  if (!iter_.status().ok()) {
+    valid_ = false;
+    return false;
+  }
+
+  return true;
 }
 
-void DeltaSwitchingIterator::SeekToLast() {
-  InitColdIter();
-  current_iter_ = cold_iter_;
-  is_hot_mode_ = false;
-  if (current_iter_) current_iter_->SeekToLast();
+// Move iter_ to the key before saved_key_.
+bool DBIter::ReverseToBackward() {
+  assert(iter_.status().ok());
+
+  // When current_entry_is_merged_ is true, iter_ may be positioned on the next
+  // key, which may not exist or may have prefix different from current.
+  // If that's the case, seek to saved_key_.
+  if (current_entry_is_merged_ &&
+      (!expect_total_order_inner_iter() || !iter_.Valid())) {
+    IterKey last_key;
+    // Using kMaxSequenceNumber and kValueTypeForSeek
+    // (not kValueTypeForSeekForPrev) to seek to a key strictly smaller
+    // than saved_key_.
+    last_key.SetInternalKey(ParsedInternalKey(
+        saved_key_.GetUserKey(), kMaxSequenceNumber, kValueTypeForSeek));
+    if (!expect_total_order_inner_iter()) {
+      iter_.SeekForPrev(last_key.GetInternalKey());
+    } else {
+      // Some iterators may not support SeekForPrev(), so we avoid using it
+      // when prefix seek mode is disabled. This is somewhat expensive
+      // (an extra Prev(), as well as an extra change of direction of iter_),
+      // so we may need to reconsider it later.
+      iter_.Seek(last_key.GetInternalKey());
+      if (!iter_.Valid() && iter_.status().ok()) {
+        iter_.SeekToLast();
+      }
+    }
+    RecordTick(statistics_, NUMBER_OF_RESEEKS_IN_ITERATION);
+  }
+
+  direction_ = kReverse;
+  return FindUserKeyBeforeSavedKey();
 }
 
-bool DeltaSwitchingIterator::Valid() const {
-  return current_iter_ && current_iter_->Valid();
+void DBIter::PrevInternal(const Slice* prefix) {
+  while (iter_.Valid()) {
+    saved_key_.SetUserKey(
+        ExtractUserKey(iter_.key()),
+        !iter_.iter()->IsKeyPinned() || !pin_thru_lifetime_ /* copy */);
+
+    assert(prefix == nullptr || prefix_extractor_ != nullptr);
+    if (prefix != nullptr &&
+        prefix_extractor_
+                ->Transform(StripTimestampFromUserKey(saved_key_.GetUserKey(),
+                                                      timestamp_size_))
+                .compare(*prefix) != 0) {
+      assert(prefix_same_as_start_);
+      // Current key does not have the same prefix as start
+      valid_ = false;
+      return;
+    }
+
+    assert(iterate_lower_bound_ == nullptr || iter_.MayBeOutOfLowerBound() ||
+           user_comparator_.CompareWithoutTimestamp(
+               saved_key_.GetUserKey(), /*a_has_ts=*/true,
+               *iterate_lower_bound_, /*b_has_ts=*/false) >= 0);
+    if (iterate_lower_bound_ != nullptr && iter_.MayBeOutOfLowerBound() &&
+        user_comparator_.CompareWithoutTimestamp(
+            saved_key_.GetUserKey(), /*a_has_ts=*/true, *iterate_lower_bound_,
+            /*b_has_ts=*/false) < 0) {
+      // We've iterated earlier than the user-specified lower bound.
+      valid_ = false;
+      return;
+    }
+
+    if (!FindValueForCurrentKey()) {  // assigns valid_
+      return;
+    }
+
+    // Whether or not we found a value for current key, we need iter_ to end up
+    // on a smaller key.
+    if (!FindUserKeyBeforeSavedKey()) {
+      return;
+    }
+
+    if (valid_) {
+      // Found the value.
+      return;
+    }
+
+    if (TooManyInternalKeysSkipped(false)) {
+      return;
+    }
+  }
+
+  // We haven't found any key - iterator is not valid
+  valid_ = false;
 }
-// void DeltaSwitchingIterator::Next() {
-//   if (current_iter_) current_iter_->Next();
-// }
 
-void DeltaSwitchingIterator::Next() {
-  if (!current_iter_) return;
+// Used for backwards iteration.
+// Looks at the entries with user key saved_key_ and finds the most up-to-date
+// value for it, or executes a merge, or determines that the value was deleted.
+// Sets valid_ to true if the value is found and is ready to be presented to
+// the user through value().
+// Sets valid_ to false if the value was deleted, and we should try another key.
+// Returns false if an error occurred, and !status().ok() and !valid_.
+//
+// PRE: iter_ is positioned on the last entry with user key equal to saved_key_.
+// POST: iter_ is positioned on one of the entries equal to saved_key_, or on
+//       the entry just before them, or on the entry just after them.
+bool DBIter::FindValueForCurrentKey() {
+  assert(iter_.Valid());
+  merge_context_.Clear();
+  current_entry_is_merged_ = false;
+  // last entry before merge (could be kTypeDeletion,
+  // kTypeDeletionWithTimestamp, kTypeSingleDeletion, kTypeValue
+  // kTypeBlobIndex, kTypeWideColumnEntity or kTypeValuePreferredSeqno)
+  ValueType last_not_merge_type = kTypeDeletion;
+  ValueType last_key_entry_type = kTypeDeletion;
 
-  if (is_hot_mode_ && current_iter_->Valid()) {
-    Slice cur_key = current_iter_->key();
-    Slice prev_user_key = ExtractUserKey(cur_key);
-    prev_user_key_buf_.assign(prev_user_key.data(), prev_user_key.size());
+  // If false, it indicates that we have not seen any valid entry, even though
+  // last_key_entry_type is initialized to kTypeDeletion.
+  bool valid_entry_seen = false;
 
-    current_iter_->Next();
+  // Temporarily pin blocks that hold (merge operands / the value)
+  ReleaseTempPinnedData();
+  TempPinData();
+  size_t num_skipped = 0;
+  while (iter_.Valid()) {
+    ParsedInternalKey ikey;
+    if (!ParseKey(&ikey)) {
+      return false;
+    }
 
-    // 跳过 <= 上一条 UserKey 的所有条目，否则FindNextUserEntryInternalImpl会
-    // 出现错误Assertion `!skipping_saved_key ||
-    // CompareKeyForSkip(ikey_.user_key, saved_key_.GetUserKey()) > 0' failed.
-    while (current_iter_->Valid()) {
-      Slice cur_user_key = ExtractUserKey(current_iter_->key());
-      int cmp = icmp_.user_comparator()->Compare(cur_user_key,
-                                                 Slice(prev_user_key_buf_));
+    if (!user_comparator_.EqualWithoutTimestamp(ikey.user_key,
+                                                saved_key_.GetUserKey())) {
+      // Found a smaller user key, thus we are done with current user key.
+      break;
+    }
 
-      if (cmp > 0) {
+    assert(ikey.user_key.size() >= timestamp_size_);
+    Slice ts;
+    if (timestamp_size_ > 0) {
+      ts = Slice(ikey.user_key.data() + ikey.user_key.size() - timestamp_size_,
+                 timestamp_size_);
+    }
+
+    bool visible = IsVisible(ikey.sequence, ts);
+    if (!visible &&
+        (timestamp_lb_ == nullptr ||
+         user_comparator_.CompareTimestamp(ts, *timestamp_ub_) > 0)) {
+      // Found an invisible version of the current user key, and it must have
+      // a higher sequence number or timestamp. Therefore, we are done with the
+      // current user key.
+      break;
+    }
+
+    if (!ts.empty()) {
+      saved_timestamp_.assign(ts.data(), ts.size());
+    }
+
+    if (TooManyInternalKeysSkipped()) {
+      return false;
+    }
+
+    // This user key has lots of entries.
+    // We're going from old to new, and it's taking too long. Let's do a Seek()
+    // and go from new to old. This helps when a key was overwritten many times.
+    if (num_skipped >= max_skip_) {
+      return FindValueForCurrentKeyUsingSeek();
+    }
+
+    if (!PrepareValueInternal()) {
+      return false;
+    }
+
+    if (timestamp_lb_ != nullptr) {
+      // Only needed when timestamp_lb_ is not null
+      [[maybe_unused]] const bool ret = ParseKey(&ikey_);
+      // Since the preceding ParseKey(&ikey) succeeds, so must this.
+      assert(ret);
+      saved_key_.SetInternalKey(ikey);
+    } else if (user_comparator_.Compare(ikey.user_key,
+                                        saved_key_.GetUserKey()) < 0) {
+      saved_key_.SetUserKey(
+          ikey.user_key,
+          !pin_thru_lifetime_ || !iter_.iter()->IsKeyPinned() /* copy */);
+    }
+
+    valid_entry_seen = true;
+    last_key_entry_type = ikey.type;
+    switch (last_key_entry_type) {
+      case kTypeValue:
+      case kTypeValuePreferredSeqno:
+      case kTypeBlobIndex:
+      case kTypeWideColumnEntity:
+        if (iter_.iter()->IsValuePinned()) {
+          saved_write_unix_time_ = iter_.write_unix_time();
+          if (last_key_entry_type == kTypeValuePreferredSeqno) {
+            pinned_value_ = ParsePackedValueForValue(iter_.value());
+          } else {
+            pinned_value_ = iter_.value();
+          }
+        } else {
+          valid_ = false;
+          status_ = Status::NotSupported(
+              "Backward iteration not supported if underlying iterator's value "
+              "cannot be pinned.");
+        }
+        merge_context_.Clear();
+        last_not_merge_type = last_key_entry_type;
+        if (!status_.ok()) {
+          return false;
+        }
+        break;
+      case kTypeDeletion:
+      case kTypeDeletionWithTimestamp:
+      case kTypeSingleDeletion:
+        merge_context_.Clear();
+        last_not_merge_type = last_key_entry_type;
+        PERF_COUNTER_ADD(internal_delete_skipped_count, 1);
+        break;
+      case kTypeMerge: {
+        assert(merge_operator_ != nullptr);
+        merge_context_.PushOperandBack(
+            iter_.value(), iter_.iter()->IsValuePinned() /* operand_pinned */);
+        PERF_COUNTER_ADD(internal_merge_count, 1);
+      } break;
+      default:
+        valid_ = false;
+        status_ = Status::Corruption(
+            "Unknown value type: " +
+            std::to_string(static_cast<unsigned int>(last_key_entry_type)));
+        return false;
+    }
+
+    PERF_COUNTER_ADD(internal_key_skipped_count, 1);
+    iter_.Prev();
+    ++num_skipped;
+
+    if (visible && timestamp_lb_ != nullptr) {
+      // If timestamp_lb_ is not nullptr, we do not have to look further for
+      // another internal key. We can return this current internal key. Yet we
+      // still keep the invariant that iter_ is positioned before the returned
+      // key.
+      break;
+    }
+  }
+
+  if (!iter_.status().ok()) {
+    valid_ = false;
+    return false;
+  }
+
+  if (!valid_entry_seen) {
+    // Since we haven't seen any valid entry, last_key_entry_type remains
+    // unchanged and the same as its initial value.
+    assert(last_key_entry_type == kTypeDeletion);
+    assert(last_not_merge_type == kTypeDeletion);
+    valid_ = false;
+    return true;
+  }
+
+  if (timestamp_lb_ != nullptr) {
+    assert(last_key_entry_type == ikey_.type);
+  }
+
+  switch (last_key_entry_type) {
+    case kTypeDeletion:
+    case kTypeDeletionWithTimestamp:
+    case kTypeSingleDeletion:
+      if (timestamp_lb_ == nullptr) {
+        valid_ = false;
+      } else {
+        valid_ = true;
+      }
+      return true;
+    case kTypeMerge:
+      current_entry_is_merged_ = true;
+      if (last_not_merge_type == kTypeDeletion ||
+          last_not_merge_type == kTypeSingleDeletion ||
+          last_not_merge_type == kTypeDeletionWithTimestamp) {
+        if (!MergeWithNoBaseValue(saved_key_.GetUserKey())) {
+          return false;
+        }
+        return true;
+      } else if (last_not_merge_type == kTypeBlobIndex) {
+        if (!MergeWithBlobBaseValue(pinned_value_, saved_key_.GetUserKey())) {
+          return false;
+        }
+
+        return true;
+      } else if (last_not_merge_type == kTypeWideColumnEntity) {
+        if (!MergeWithWideColumnBaseValue(pinned_value_,
+                                          saved_key_.GetUserKey())) {
+          return false;
+        }
+
+        return true;
+      } else {
+        assert(last_not_merge_type == kTypeValue ||
+               last_not_merge_type == kTypeValuePreferredSeqno);
+        if (!MergeWithPlainBaseValue(pinned_value_, saved_key_.GetUserKey())) {
+          return false;
+        }
+        return true;
+      }
+    case kTypeValue:
+    case kTypeValuePreferredSeqno:
+      SetValueAndColumnsFromPlain(pinned_value_);
+
+      break;
+    case kTypeBlobIndex:
+      if (!SetValueAndColumnsFromBlob(saved_key_.GetUserKey(), pinned_value_)) {
+        return false;
+      }
+      break;
+    case kTypeWideColumnEntity:
+      if (!SetValueAndColumnsFromEntity(pinned_value_)) {
+        return false;
+      }
+      break;
+    default:
+      valid_ = false;
+      status_ = Status::Corruption(
+          "Unknown value type: " +
+          std::to_string(static_cast<unsigned int>(last_key_entry_type)));
+      return false;
+  }
+  valid_ = true;
+  return true;
+}
+
+// This function is used in FindValueForCurrentKey.
+// We use Seek() function instead of Prev() to find necessary value
+// TODO: This is very similar to FindNextUserEntry() and MergeValuesNewToOld().
+//       Would be nice to reuse some code.
+bool DBIter::FindValueForCurrentKeyUsingSeek() {
+  // FindValueForCurrentKey will enable pinning before calling
+  // FindValueForCurrentKeyUsingSeek()
+  assert(pinned_iters_mgr_.PinningEnabled());
+  std::string last_key;
+  if (0 == timestamp_size_) {
+    AppendInternalKey(&last_key,
+                      ParsedInternalKey(saved_key_.GetUserKey(), sequence_,
+                                        kValueTypeForSeek));
+  } else {
+    AppendInternalKeyWithDifferentTimestamp(
+        &last_key,
+        ParsedInternalKey(saved_key_.GetUserKey(), sequence_,
+                          kValueTypeForSeek),
+        timestamp_lb_ == nullptr ? *timestamp_ub_ : *timestamp_lb_);
+  }
+  iter_.Seek(last_key);
+  RecordTick(statistics_, NUMBER_OF_RESEEKS_IN_ITERATION);
+
+  // In case read_callback presents, the value we seek to may not be visible.
+  // Find the next value that's visible.
+  ParsedInternalKey ikey;
+
+  while (true) {
+    if (!iter_.Valid()) {
+      valid_ = false;
+      return iter_.status().ok();
+    }
+
+    if (!ParseKey(&ikey)) {
+      return false;
+    }
+    assert(ikey.user_key.size() >= timestamp_size_);
+    Slice ts;
+    if (timestamp_size_ > 0) {
+      ts = Slice(ikey.user_key.data() + ikey.user_key.size() - timestamp_size_,
+                 timestamp_size_);
+    }
+
+    if (!user_comparator_.EqualWithoutTimestamp(ikey.user_key,
+                                                saved_key_.GetUserKey())) {
+      // No visible values for this key, even though FindValueForCurrentKey()
+      // has seen some. This is possible if we're using a tailing iterator, and
+      // the entries were discarded in a compaction.
+      valid_ = false;
+      return true;
+    }
+
+    if (IsVisible(ikey.sequence, ts)) {
+      break;
+    }
+
+    iter_.Next();
+  }
+
+  if (ikey.type == kTypeDeletion || ikey.type == kTypeSingleDeletion ||
+      kTypeDeletionWithTimestamp == ikey.type) {
+    if (timestamp_lb_ == nullptr) {
+      valid_ = false;
+    } else {
+      valid_ = true;
+      saved_key_.SetInternalKey(ikey);
+    }
+    return true;
+  }
+  if (!PrepareValueInternal()) {
+    return false;
+  }
+  if (timestamp_size_ > 0) {
+    Slice ts = ExtractTimestampFromUserKey(ikey.user_key, timestamp_size_);
+    saved_timestamp_.assign(ts.data(), ts.size());
+  }
+  if (ikey.type == kTypeValue || ikey.type == kTypeValuePreferredSeqno ||
+      ikey.type == kTypeBlobIndex || ikey.type == kTypeWideColumnEntity) {
+    assert(iter_.iter()->IsValuePinned());
+    saved_write_unix_time_ = iter_.write_unix_time();
+    if (ikey.type == kTypeValuePreferredSeqno) {
+      pinned_value_ = ParsePackedValueForValue(iter_.value());
+    } else {
+      pinned_value_ = iter_.value();
+    }
+    if (ikey.type == kTypeBlobIndex) {
+      if (!SetValueAndColumnsFromBlob(ikey.user_key, pinned_value_)) {
+        return false;
+      }
+    } else if (ikey.type == kTypeWideColumnEntity) {
+      if (!SetValueAndColumnsFromEntity(pinned_value_)) {
+        return false;
+      }
+    } else {
+      assert(ikey.type == kTypeValue || ikey.type == kTypeValuePreferredSeqno);
+      SetValueAndColumnsFromPlain(pinned_value_);
+    }
+
+    if (timestamp_lb_ != nullptr) {
+      saved_key_.SetInternalKey(ikey);
+    } else {
+      saved_key_.SetUserKey(ikey.user_key);
+    }
+
+    valid_ = true;
+    return true;
+  }
+
+  // kTypeMerge. We need to collect all kTypeMerge values and save them
+  // in operands
+  assert(ikey.type == kTypeMerge);
+  current_entry_is_merged_ = true;
+  merge_context_.Clear();
+  merge_context_.PushOperand(
+      iter_.value(), iter_.iter()->IsValuePinned() /* operand_pinned */);
+  PERF_COUNTER_ADD(internal_merge_count, 1);
+
+  while (true) {
+    iter_.Next();
+
+    if (!iter_.Valid()) {
+      if (!iter_.status().ok()) {
+        valid_ = false;
+        return false;
+      }
+      break;
+    }
+    if (!ParseKey(&ikey)) {
+      return false;
+    }
+    if (!user_comparator_.EqualWithoutTimestamp(ikey.user_key,
+                                                saved_key_.GetUserKey())) {
+      break;
+    }
+    if (ikey.type == kTypeDeletion || ikey.type == kTypeSingleDeletion ||
+        ikey.type == kTypeDeletionWithTimestamp) {
+      break;
+    }
+    if (!PrepareValueInternal()) {
+      return false;
+    }
+
+    if (ikey.type == kTypeValue || ikey.type == kTypeValuePreferredSeqno) {
+      Slice value = iter_.value();
+      if (ikey.type == kTypeValuePreferredSeqno) {
+        value = ParsePackedValueForValue(value);
+      }
+      if (!MergeWithPlainBaseValue(value, saved_key_.GetUserKey())) {
+        return false;
+      }
+      return true;
+    } else if (ikey.type == kTypeMerge) {
+      merge_context_.PushOperand(
+          iter_.value(), iter_.iter()->IsValuePinned() /* operand_pinned */);
+      PERF_COUNTER_ADD(internal_merge_count, 1);
+    } else if (ikey.type == kTypeBlobIndex) {
+      if (!MergeWithBlobBaseValue(iter_.value(), saved_key_.GetUserKey())) {
+        return false;
+      }
+
+      return true;
+    } else if (ikey.type == kTypeWideColumnEntity) {
+      if (!MergeWithWideColumnBaseValue(iter_.value(),
+                                        saved_key_.GetUserKey())) {
+        return false;
+      }
+
+      return true;
+    } else {
+      valid_ = false;
+      status_ = Status::Corruption(
+          "Unknown value type: " +
+          std::to_string(static_cast<unsigned int>(ikey.type)));
+      return false;
+    }
+  }
+
+  if (!MergeWithNoBaseValue(saved_key_.GetUserKey())) {
+    return false;
+  }
+
+  // Make sure we leave iter_ in a good state. If it's valid and we don't care
+  // about prefixes, that's already good enough. Otherwise it needs to be
+  // seeked to the current key.
+  if (!expect_total_order_inner_iter() || !iter_.Valid()) {
+    if (!expect_total_order_inner_iter()) {
+      iter_.SeekForPrev(last_key);
+    } else {
+      iter_.Seek(last_key);
+      if (!iter_.Valid() && iter_.status().ok()) {
+        iter_.SeekToLast();
+      }
+    }
+    RecordTick(statistics_, NUMBER_OF_RESEEKS_IN_ITERATION);
+  }
+
+  valid_ = true;
+  return true;
+}
+
+bool DBIter::MergeWithNoBaseValue(const Slice& user_key) {
+  // `op_failure_scope` (an output parameter) is not provided (set to nullptr)
+  // since a failure must be propagated regardless of its value.
+  ValueType result_type;
+  const Status s = MergeHelper::TimedFullMerge(
+      merge_operator_, user_key, MergeHelper::kNoBaseValue,
+      merge_context_.GetOperands(), logger_, statistics_, clock_,
+      /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr,
+      &saved_value_, &pinned_value_, &result_type);
+  return SetValueAndColumnsFromMergeResult(s, result_type);
+}
+
+bool DBIter::MergeWithPlainBaseValue(const Slice& value,
+                                     const Slice& user_key) {
+  // `op_failure_scope` (an output parameter) is not provided (set to nullptr)
+  // since a failure must be propagated regardless of its value.
+  ValueType result_type;
+  const Status s = MergeHelper::TimedFullMerge(
+      merge_operator_, user_key, MergeHelper::kPlainBaseValue, value,
+      merge_context_.GetOperands(), logger_, statistics_, clock_,
+      /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr,
+      &saved_value_, &pinned_value_, &result_type);
+  return SetValueAndColumnsFromMergeResult(s, result_type);
+}
+
+bool DBIter::MergeWithBlobBaseValue(const Slice& blob_index,
+                                    const Slice& user_key) {
+  assert(!is_blob_);
+
+  if (expose_blob_index_) {
+    status_ =
+        Status::NotSupported("Legacy BlobDB does not support merge operator.");
+    valid_ = false;
+    return false;
+  }
+
+  const Status s = blob_reader_.RetrieveAndSetBlobValue(user_key, blob_index);
+  if (!s.ok()) {
+    status_ = s;
+    valid_ = false;
+    return false;
+  }
+
+  valid_ = true;
+
+  if (!MergeWithPlainBaseValue(blob_reader_.GetBlobValue(), user_key)) {
+    return false;
+  }
+
+  blob_reader_.ResetBlobValue();
+
+  return true;
+}
+
+bool DBIter::MergeWithWideColumnBaseValue(const Slice& entity,
+                                          const Slice& user_key) {
+  // `op_failure_scope` (an output parameter) is not provided (set to nullptr)
+  // since a failure must be propagated regardless of its value.
+  ValueType result_type;
+  const Status s = MergeHelper::TimedFullMerge(
+      merge_operator_, user_key, MergeHelper::kWideBaseValue, entity,
+      merge_context_.GetOperands(), logger_, statistics_, clock_,
+      /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr,
+      &saved_value_, &pinned_value_, &result_type);
+  return SetValueAndColumnsFromMergeResult(s, result_type);
+}
+
+// Move backwards until the key smaller than saved_key_.
+// Changes valid_ only if return value is false.
+bool DBIter::FindUserKeyBeforeSavedKey() {
+  assert(status_.ok());
+  size_t num_skipped = 0;
+  while (iter_.Valid()) {
+    ParsedInternalKey ikey;
+    if (!ParseKey(&ikey)) {
+      return false;
+    }
+
+    if (CompareKeyForSkip(ikey.user_key, saved_key_.GetUserKey()) < 0) {
+      return true;
+    }
+
+    if (TooManyInternalKeysSkipped()) {
+      return false;
+    }
+
+    assert(ikey.sequence != kMaxSequenceNumber);
+    assert(ikey.user_key.size() >= timestamp_size_);
+    Slice ts;
+    if (timestamp_size_ > 0) {
+      ts = Slice(ikey.user_key.data() + ikey.user_key.size() - timestamp_size_,
+                 timestamp_size_);
+    }
+    if (!IsVisible(ikey.sequence, ts)) {
+      PERF_COUNTER_ADD(internal_recent_skipped_count, 1);
+    } else {
+      PERF_COUNTER_ADD(internal_key_skipped_count, 1);
+    }
+
+    if (num_skipped >= max_skip_) {
+      num_skipped = 0;
+      std::string last_key;
+      if (timestamp_size_ == 0) {
+        AppendInternalKey(&last_key, ParsedInternalKey(saved_key_.GetUserKey(),
+                                                       kMaxSequenceNumber,
+                                                       kValueTypeForSeek));
+      } else {
+        // TODO: pre-create kTsMax.
+        const std::string kTsMax(timestamp_size_, '\xff');
+        AppendInternalKeyWithDifferentTimestamp(
+            &last_key,
+            ParsedInternalKey(saved_key_.GetUserKey(), kMaxSequenceNumber,
+                              kValueTypeForSeek),
+            kTsMax);
+      }
+      // It would be more efficient to use SeekForPrev() here, but some
+      // iterators may not support it.
+      iter_.Seek(last_key);
+      RecordTick(statistics_, NUMBER_OF_RESEEKS_IN_ITERATION);
+      if (!iter_.Valid()) {
         break;
       }
-      current_iter_->Next();
+    } else {
+      ++num_skipped;
     }
-  } else {
-    current_iter_->Next();
+
+    iter_.Prev();
+  }
+
+  if (!iter_.status().ok()) {
+    valid_ = false;
+    return false;
+  }
+
+  return true;
+}
+
+bool DBIter::TooManyInternalKeysSkipped(bool increment) {
+  if ((max_skippable_internal_keys_ > 0) &&
+      (num_internal_keys_skipped_ > max_skippable_internal_keys_)) {
+    valid_ = false;
+    status_ = Status::Incomplete("Too many internal keys skipped.");
+    return true;
+  } else if (increment) {
+    num_internal_keys_skipped_++;
+  }
+  return false;
+}
+
+bool DBIter::IsVisible(SequenceNumber sequence, const Slice& ts,
+                       bool* more_recent) {
+  // Remember that comparator orders preceding timestamp as larger.
+  // TODO(yanqin): support timestamp in read_callback_.
+  bool visible_by_seq = (read_callback_ == nullptr)
+                            ? sequence <= sequence_
+                            : read_callback_->IsVisible(sequence);
+
+  bool visible_by_ts =
+      (timestamp_ub_ == nullptr ||
+       user_comparator_.CompareTimestamp(ts, *timestamp_ub_) <= 0) &&
+      (timestamp_lb_ == nullptr ||
+       user_comparator_.CompareTimestamp(ts, *timestamp_lb_) >= 0);
+
+  if (more_recent) {
+    *more_recent = !visible_by_seq;
+  }
+  return visible_by_seq && visible_by_ts;
+}
+
+void DBIter::SetSavedKeyToSeekTarget(const Slice& target) {
+  is_key_seqnum_zero_ = false;
+  SequenceNumber seq = sequence_;
+  saved_key_.Clear();
+  saved_key_.SetInternalKey(target, seq, kValueTypeForSeek, timestamp_ub_);
+
+  if (iterate_lower_bound_ != nullptr &&
+      user_comparator_.CompareWithoutTimestamp(
+          saved_key_.GetUserKey(), /*a_has_ts=*/true, *iterate_lower_bound_,
+          /*b_has_ts=*/false) < 0) {
+    // Seek key is smaller than the lower bound.
+    saved_key_.Clear();
+    saved_key_.SetInternalKey(*iterate_lower_bound_, seq, kValueTypeForSeek,
+                              timestamp_ub_);
   }
 }
 
-void DeltaSwitchingIterator::Prev() {
-  if (current_iter_) current_iter_->Prev();
-}
-void DeltaSwitchingIterator::SeekForPrev(const Slice& target) {
-  // 逻辑同 Seek
-  Seek(target);
-  if (!Valid()) SeekToLast();
-  while (Valid() && icmp_.Compare(key(), target) > 0) Prev();
+void DBIter::SetSavedKeyToSeekForPrevTarget(const Slice& target) {
+  is_key_seqnum_zero_ = false;
+  saved_key_.Clear();
+  // now saved_key is used to store internal key.
+  saved_key_.SetInternalKey(target, 0 /* sequence_number */,
+                            kValueTypeForSeekForPrev, timestamp_ub_);
+
+  if (timestamp_size_ > 0) {
+    const std::string kTsMin(timestamp_size_, '\0');
+    Slice ts = kTsMin;
+    saved_key_.UpdateInternalKey(
+        /*seq=*/0, kValueTypeForSeekForPrev,
+        timestamp_lb_ == nullptr ? &ts : timestamp_lb_);
+  }
+
+  if (iterate_upper_bound_ != nullptr &&
+      user_comparator_.CompareWithoutTimestamp(
+          saved_key_.GetUserKey(), /*a_has_ts=*/true, *iterate_upper_bound_,
+          /*b_has_ts=*/false) >= 0) {
+    saved_key_.Clear();
+    saved_key_.SetInternalKey(*iterate_upper_bound_, kMaxSequenceNumber,
+                              kValueTypeForSeekForPrev, timestamp_ub_);
+    if (timestamp_size_ > 0) {
+      const std::string kTsMax(timestamp_size_, '\xff');
+      Slice ts = kTsMax;
+      saved_key_.UpdateInternalKey(kMaxSequenceNumber, kValueTypeForSeekForPrev,
+                                   &ts);
+    }
+  }
 }
 
-Slice DeltaSwitchingIterator::key() const { return current_iter_->key(); }
-Slice DeltaSwitchingIterator::value() const { return current_iter_->value(); }
-Status DeltaSwitchingIterator::status() const {
-  if (current_iter_) return current_iter_->status();
+Status DBIter::ValidateScanOptions(const MultiScanArgs& multiscan_opts) const {
+  if (multiscan_opts.empty()) {
+    return Status::InvalidArgument("Empty MultiScanArgs");
+  }
+
+  const std::vector<ScanOptions>& scan_opts = multiscan_opts.GetScanRanges();
+  const bool has_limit = scan_opts.front().range.limit.has_value();
+  if (!has_limit && scan_opts.size() > 1) {
+    return Status::InvalidArgument("Scan has no upper bound");
+  }
+
+  for (size_t i = 0; i < scan_opts.size(); ++i) {
+    const auto& scan_range = scan_opts[i].range;
+    if (!scan_range.start.has_value()) {
+      return Status::InvalidArgument("Scan has no start key at index " +
+                                     std::to_string(i));
+    }
+
+    if (scan_range.limit.has_value()) {
+      if (user_comparator_.CompareWithoutTimestamp(
+              scan_range.start.value(), /*a_has_ts=*/false,
+              scan_range.limit.value(), /*b_has_ts=*/false) >= 0) {
+        return Status::InvalidArgument(
+            "Scan start key is large or equal than limit at index " +
+            std::to_string(i));
+      }
+    }
+
+    if (i > 0) {
+      if (!scan_range.limit.has_value()) {
+        // multiple scan without limit scan ranges
+        return Status::InvalidArgument("Scan has no upper bound at index " +
+                                       std::to_string(i));
+      }
+
+      const auto& last_end_key = scan_opts[i - 1].range.limit.value();
+      if (user_comparator_.CompareWithoutTimestamp(
+              scan_range.start.value(), /*a_has_ts=*/false, last_end_key,
+              /*b_has_ts=*/false) < 0) {
+        return Status::InvalidArgument("Overlapping ranges at index " +
+                                       std::to_string(i));
+      }
+    }
+  }
   return Status::OK();
 }
-bool DeltaSwitchingIterator::PrepareValue() {
-  if (current_iter_) return current_iter_->PrepareValue();
-  return false;
-}
-uint64_t DeltaSwitchingIterator::GetPhysicalId() {
-  if (current_iter_) return current_iter_->GetPhysicalId();
-  return 0;
+
+void DBIter::Prepare(const MultiScanArgs& scan_opts) {
+  status_ = ValidateScanOptions(scan_opts);
+  if (!status_.ok()) {
+    return;
+  }
+  std::optional<MultiScanArgs> new_scan_opts;
+  new_scan_opts.emplace(scan_opts);
+  scan_opts_.swap(new_scan_opts);
+  scan_index_ = 0;
+  if (!scan_opts.empty()) {
+    iter_.Prepare(&scan_opts_.value());
+  } else {
+    iter_.Prepare(nullptr);
+  }
 }
 
+void DBIter::Seek(const Slice& target) {
+  PERF_COUNTER_ADD(iter_seek_count, 1);
+  PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
+  StopWatch sw(clock_, statistics_, DB_SEEK);
+
+  if (scan_opts_.has_value()) {
+    // Validate the seek target is as expected in the previously prepared range
+    auto const& scan_ranges = scan_opts_.value().GetScanRanges();
+    if (scan_index_ >= scan_ranges.size()) {
+      status_ = Status::InvalidArgument(
+          "Seek called after exhausting all of the scan ranges");
+      valid_ = false;
+      return;
+    }
+
+    // Validate start key of next prepare range matches the seek target
+    auto const& range = scan_ranges[scan_index_];
+    auto const& start = range.range.start;
+    assert(start.has_value());
+    if (user_comparator_.CompareWithoutTimestamp(target, *start) != 0) {
+      status_ = Status::InvalidArgument(
+          "Seek target does not match the start of the next prepared range at "
+          "index " +
+          std::to_string(scan_index_));
+      valid_ = false;
+      return;
+    }
+
+    // validate the upper bound is set to the same value of limit, if limit
+    // exists
+    auto const& limit = range.range.limit;
+    if (limit.has_value()) {
+      if (iterate_upper_bound_ == nullptr ||
+          user_comparator_.CompareWithoutTimestamp(
+              limit.value(), *iterate_upper_bound_) != 0) {
+        status_ = Status::InvalidArgument(
+            "Upper bound is not set to the same limit value of the next "
+            "prepared range at index " +
+            std::to_string(scan_index_));
+        valid_ = false;
+        return;
+      }
+    }
+    scan_index_++;
+  }
+
+  if (cfh_ != nullptr) {
+    // TODO: What do we do if this returns an error?
+    Slice lower_bound, upper_bound;
+    if (iterate_lower_bound_ != nullptr) {
+      lower_bound = *iterate_lower_bound_;
+    } else {
+      lower_bound = Slice("");
+    }
+    if (iterate_upper_bound_ != nullptr) {
+      upper_bound = *iterate_upper_bound_;
+    } else {
+      upper_bound = Slice("");
+    }
+    cfh_->db()
+        ->TraceIteratorSeek(cfh_->cfd()->GetID(), target, lower_bound,
+                            upper_bound)
+        .PermitUncheckedError();
+  }
+
+  status_ = Status::OK();
+  ReleaseTempPinnedData();
+  ResetBlobData();
+  ResetValueAndColumns();
+  ResetInternalKeysSkippedCounter();
+  MarkMemtableForFlushForAvgTrigger();
+
+  // Seek the inner iterator based on the target key.
+  {
+    PERF_TIMER_GUARD(seek_internal_seek_time);
+
+    SetSavedKeyToSeekTarget(target);
+    iter_.Seek(saved_key_.GetInternalKey());
+
+    RecordTick(statistics_, NUMBER_DB_SEEK);
+  }
+  if (!iter_.Valid()) {
+    valid_ = false;
+    return;
+  }
+  direction_ = kForward;
+
+  // Now the inner iterator is placed to the target position. From there,
+  // we need to find out the next key that is visible to the user.
+  ClearSavedValue();
+  if (prefix_same_as_start_) {
+    // The case where the iterator needs to be invalidated if it has exhausted
+    // keys within the same prefix of the seek key.
+    assert(prefix_extractor_ != nullptr);
+    Slice target_prefix = prefix_extractor_->Transform(target);
+    FindNextUserEntry(false /* not skipping saved_key */,
+                      &target_prefix /* prefix */);
+    if (valid_) {
+      // Remember the prefix of the seek key for the future Next() call to
+      // check.
+      prefix_.SetUserKey(target_prefix);
+    }
+  } else {
+    FindNextUserEntry(false /* not skipping saved_key */, nullptr);
+  }
+  if (!valid_) {
+    return;
+  }
+
+  // Updating stats and perf context counters.
+  if (statistics_ != nullptr) {
+    // Decrement since we don't want to count this key as skipped
+    RecordTick(statistics_, NUMBER_DB_SEEK_FOUND);
+    RecordTick(statistics_, ITER_BYTES_READ, key().size() + value().size());
+  }
+  PERF_COUNTER_ADD(iter_read_bytes, key().size() + value().size());
+}
+
+void DBIter::SeekForPrev(const Slice& target) {
+  PERF_COUNTER_ADD(iter_seek_count, 1);
+  PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
+  StopWatch sw(clock_, statistics_, DB_SEEK);
+
+  if (cfh_ != nullptr) {
+    // TODO: What do we do if this returns an error?
+    Slice lower_bound, upper_bound;
+    if (iterate_lower_bound_ != nullptr) {
+      lower_bound = *iterate_lower_bound_;
+    } else {
+      lower_bound = Slice("");
+    }
+    if (iterate_upper_bound_ != nullptr) {
+      upper_bound = *iterate_upper_bound_;
+    } else {
+      upper_bound = Slice("");
+    }
+    cfh_->db()
+        ->TraceIteratorSeekForPrev(cfh_->cfd()->GetID(), target, lower_bound,
+                                   upper_bound)
+        .PermitUncheckedError();
+  }
+
+  status_ = Status::OK();
+  ReleaseTempPinnedData();
+  ResetBlobData();
+  ResetValueAndColumns();
+  ResetInternalKeysSkippedCounter();
+  MarkMemtableForFlushForAvgTrigger();
+
+  // Seek the inner iterator based on the target key.
+  {
+    PERF_TIMER_GUARD(seek_internal_seek_time);
+    SetSavedKeyToSeekForPrevTarget(target);
+    iter_.SeekForPrev(saved_key_.GetInternalKey());
+    RecordTick(statistics_, NUMBER_DB_SEEK);
+  }
+  if (!iter_.Valid()) {
+    valid_ = false;
+    return;
+  }
+  direction_ = kReverse;
+
+  // Now the inner iterator is placed to the target position. From there,
+  // we need to find out the first key that is visible to the user in the
+  // backward direction.
+  ClearSavedValue();
+  if (prefix_same_as_start_) {
+    // The case where the iterator needs to be invalidated if it has exhausted
+    // keys within the same prefix of the seek key.
+    assert(prefix_extractor_ != nullptr);
+    Slice target_prefix = prefix_extractor_->Transform(target);
+    PrevInternal(&target_prefix);
+    if (valid_) {
+      // Remember the prefix of the seek key for the future Prev() call to
+      // check.
+      prefix_.SetUserKey(target_prefix);
+    }
+  } else {
+    PrevInternal(nullptr);
+  }
+
+  // Report stats and perf context.
+  if (statistics_ != nullptr && valid_) {
+    RecordTick(statistics_, NUMBER_DB_SEEK_FOUND);
+    RecordTick(statistics_, ITER_BYTES_READ, key().size() + value().size());
+    PERF_COUNTER_ADD(iter_read_bytes, key().size() + value().size());
+  }
+}
+
+void DBIter::SeekToFirst() {
+  if (iterate_lower_bound_ != nullptr) {
+    Seek(*iterate_lower_bound_);
+    return;
+  }
+  PERF_COUNTER_ADD(iter_seek_count, 1);
+  PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
+  // Don't use iter_::Seek() if we set a prefix extractor
+  // because prefix seek will be used.
+  if (!expect_total_order_inner_iter()) {
+    max_skip_ = std::numeric_limits<uint64_t>::max();
+  }
+  status_ = Status::OK();
+  // if iterator is empty, this status_ could be unchecked.
+  status_.PermitUncheckedError();
+  direction_ = kForward;
+  ReleaseTempPinnedData();
+  ResetBlobData();
+  ResetValueAndColumns();
+  ResetInternalKeysSkippedCounter();
+  MarkMemtableForFlushForAvgTrigger();
+  ClearSavedValue();
+  is_key_seqnum_zero_ = false;
+
+  {
+    PERF_TIMER_GUARD(seek_internal_seek_time);
+    iter_.SeekToFirst();
+  }
+
+  RecordTick(statistics_, NUMBER_DB_SEEK);
+  if (iter_.Valid()) {
+    saved_key_.SetUserKey(
+        ExtractUserKey(iter_.key()),
+        !iter_.iter()->IsKeyPinned() || !pin_thru_lifetime_ /* copy */);
+    FindNextUserEntry(false /* not skipping saved_key */,
+                      nullptr /* no prefix check */);
+    if (statistics_ != nullptr) {
+      if (valid_) {
+        RecordTick(statistics_, NUMBER_DB_SEEK_FOUND);
+        RecordTick(statistics_, ITER_BYTES_READ, key().size() + value().size());
+        PERF_COUNTER_ADD(iter_read_bytes, key().size() + value().size());
+      }
+    }
+  } else {
+    valid_ = false;
+  }
+  if (valid_ && prefix_same_as_start_) {
+    assert(prefix_extractor_ != nullptr);
+    prefix_.SetUserKey(prefix_extractor_->Transform(
+        StripTimestampFromUserKey(saved_key_.GetUserKey(), timestamp_size_)));
+  }
+}
+
+void DBIter::SeekToLast() {
+  if (iterate_upper_bound_ != nullptr) {
+    // Seek to last key strictly less than ReadOptions.iterate_upper_bound.
+    SeekForPrev(*iterate_upper_bound_);
+#ifndef NDEBUG
+    Slice k = Valid() ? key() : Slice();
+    if (Valid() && timestamp_size_ > 0 && timestamp_lb_) {
+      k.remove_suffix(kNumInternalBytes + timestamp_size_);
+    }
+    assert(!Valid() || user_comparator_.CompareWithoutTimestamp(
+                           k, /*a_has_ts=*/false, *iterate_upper_bound_,
+                           /*b_has_ts=*/false) < 0);
+#endif
+    return;
+  }
+
+  PERF_COUNTER_ADD(iter_seek_count, 1);
+  PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
+  // Don't use iter_::Seek() if we set a prefix extractor
+  // because prefix seek will be used.
+  if (!expect_total_order_inner_iter()) {
+    max_skip_ = std::numeric_limits<uint64_t>::max();
+  }
+  status_ = Status::OK();
+  // if iterator is empty, this status_ could be unchecked.
+  status_.PermitUncheckedError();
+  direction_ = kReverse;
+  ReleaseTempPinnedData();
+  ResetBlobData();
+  ResetValueAndColumns();
+  ResetInternalKeysSkippedCounter();
+  MarkMemtableForFlushForAvgTrigger();
+  ClearSavedValue();
+  is_key_seqnum_zero_ = false;
+
+  {
+    PERF_TIMER_GUARD(seek_internal_seek_time);
+    iter_.SeekToLast();
+  }
+  PrevInternal(nullptr);
+  if (statistics_ != nullptr) {
+    RecordTick(statistics_, NUMBER_DB_SEEK);
+    if (valid_) {
+      RecordTick(statistics_, NUMBER_DB_SEEK_FOUND);
+      RecordTick(statistics_, ITER_BYTES_READ, key().size() + value().size());
+      PERF_COUNTER_ADD(iter_read_bytes, key().size() + value().size());
+    }
+  }
+  if (valid_ && prefix_same_as_start_) {
+    assert(prefix_extractor_ != nullptr);
+    prefix_.SetUserKey(prefix_extractor_->Transform(
+        StripTimestampFromUserKey(saved_key_.GetUserKey(), timestamp_size_)));
+  }
+}
 }  // namespace ROCKSDB_NAMESPACE

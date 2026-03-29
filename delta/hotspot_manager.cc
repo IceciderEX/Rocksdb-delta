@@ -444,6 +444,16 @@ Status HotspotManager::FlushBlockToSharedSST(
       segment.first_key = segment_first_key;
       segment.last_key = segment_last_key;
       (*output_segments)[current_cuid] = segment;
+
+      if (current_cuid == 1003) {
+        fprintf(stderr,
+                "[DIAG_FLUSH] CUID 1003: SST %lu written_count=%d "
+                "range=[%s - %s] bucket_size=%zu\n",
+                file_number, written_count,
+                FormatKeyDisplay(segment_first_key).c_str(),
+                FormatKeyDisplay(segment_last_key).c_str(),
+                bucket_entries.size());
+      }
     }
   }
 
@@ -505,6 +515,14 @@ void HotspotManager::TriggerBufferFlush() {
 
         // 无论是否 added_to_pending，只要发生了flush，必须同步到 index
         // 防止并发 Reader 因为 Buffer 没了而 sst segment 没更新导致的数据缺失
+        if (cuid == 1003 && added_to_pending) {
+          fprintf(stderr,
+                  "[DIAG_WARN] CUID 1003: Promoting SST %lu [%s - %s] "
+                  "while FullScan is active (added_to_pending=true)!\n",
+                  real_segment.file_number,
+                  FormatKeyDisplay(real_segment.first_key).c_str(),
+                  FormatKeyDisplay(real_segment.last_key).c_str());
+        }
         bool promoted = index_table_.PromoteSnapshot(
             cuid, real_segment, &buffer_, internal_comparator_);
 

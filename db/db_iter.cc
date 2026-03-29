@@ -52,6 +52,7 @@ extern thread_local double tl_hot_snapshot_self_ms;
 #include "util/mutexlock.h"
 #include "util/string_util.h"
 #include "util/user_comparator_wrapper.h"
+#include "util/extract_cuid.h"
 
 namespace ROCKSDB_NAMESPACE {
 

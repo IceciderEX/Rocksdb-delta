@@ -73,7 +73,8 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   }
 
   auto& entry = it->second;
-  bool found_overlap = false;
+  bool found_mem_overlap = false;   // 是否找到了可替换的 -1 内存段
+  bool found_phys_overlap = false;  // 是否有物理段与新 SST 重叠
   std::vector<DataSegment> next_segments;
 
   std::string new_start = ExtractUserKey(new_segment.first_key).ToString();
@@ -87,15 +88,23 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
     bool overlaps = !(new_end < seg_start_user || new_start > seg_end_user);
 
     if (overlaps) {
-      found_overlap = true;
-      // Solution X: 无差别切分物理与内存段
+      if (seg.file_number != static_cast<uint64_t>(-1)) {
+        // [IMPORTANT]: NEVER cut a physical snapshot segment.
+        // Physical segments contain dense historical data that may be needed by
+        // older MVCC readers. The new SST from buffer flush may be sparse
+        // (cross-scan contamination) and must not destroy dense data.
+        next_segments.push_back(seg);
+        found_phys_overlap = true;
+        continue;
+      }
+
+      found_mem_overlap = true; // We found a -1 segment to replace
+
+      // 只针对 Memory 段 (-1) 进行切分
       // 1. 左侧剩余: [seg.first, new.first)
       if (icmp->Compare(seg.first_key, new_segment.first_key) < 0) {
-        bool keep = true;
-        if (seg.file_number == static_cast<uint64_t>(-1)) {
-          keep = HasActualDataInBuffer(cuid, seg.first_key, new_segment.first_key,
+        bool keep = HasActualDataInBuffer(cuid, seg.first_key, new_segment.first_key,
                                        buffer, icmp);
-        }
         if (keep) {
           DataSegment left = seg;
           left.last_key = new_segment.first_key;
@@ -104,11 +113,8 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
       }
       // 2. 右侧剩余: [new.last, seg.last)
       if (icmp->Compare(seg.last_key, new_segment.last_key) > 0) {
-        bool keep = true;
-        if (seg.file_number == static_cast<uint64_t>(-1)) {
-          keep = HasActualDataInBuffer(cuid, new_segment.last_key, seg.last_key,
+        bool keep = HasActualDataInBuffer(cuid, new_segment.last_key, seg.last_key,
                                        buffer, icmp);
-        }
         if (keep) {
           DataSegment right = seg;
           right.first_key = new_segment.last_key;
@@ -116,34 +122,33 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
         }
       }
 
-      // [DIAG] 打印重叠处理情况
+      // 3. 填入重叠部分的物理段，严格 clip 到原 mem segment 的边界
+      DataSegment replacement = new_segment;
+      if (icmp->Compare(seg.first_key, replacement.first_key) > 0) {
+         replacement.first_key = seg.first_key;
+      }
+      if (icmp->Compare(seg.last_key, replacement.last_key) < 0) {
+         replacement.last_key = seg.last_key;
+      }
+      next_segments.push_back(replacement);
+
       fprintf(stderr,
-              "[DIAG_PROMOTE] CUID %lu: %s Segment %lu [%s - %s] split by SST "
-              "%lu [%s - %s]\n",
-              cuid,
-              seg.file_number == static_cast<uint64_t>(-1) ? "Mem" : "Phys",
-              seg.file_number, FormatKeyDisplay(seg.first_key).c_str(),
+              "[DIAG_PROMOTE] CUID %lu: Mem Segment [%s - %s] replaced by SST "
+              "%lu clipped to [%s - %s]\n",
+              cuid, FormatKeyDisplay(seg.first_key).c_str(),
               FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
-              FormatKeyDisplay(new_segment.first_key).c_str(),
-              FormatKeyDisplay(new_segment.last_key).c_str());
+              FormatKeyDisplay(replacement.first_key).c_str(),
+              FormatKeyDisplay(replacement.last_key).c_str());
     } else {
       next_segments.push_back(seg);
     }
   }
 
-  if (found_overlap) {
-    // 新 SST 只添加一次
-    next_segments.push_back(new_segment);
-    // sort segments (Solution G: used icmp for correct internal key order)
+  if (found_mem_overlap) {
     std::sort(next_segments.begin(), next_segments.end(),
               [icmp](const DataSegment& a, const DataSegment& b) {
                 return icmp->Compare(a.first_key, b.first_key) < 0;
               });
-    // for (const auto& seg : next_segments) {
-    //   fprintf(stderr, "[HotIndexTable] Next snapshot segment: [%s - %s], file_number: %lu\n",
-    //           FormatKeyDisplay(seg.first_key).c_str(),
-    //           FormatKeyDisplay(seg.last_key).c_str(), seg.file_number);
-    // }
     entry.snapshot_segments = std::move(next_segments);
 
     if (lifecycle_manager_) {
@@ -151,7 +156,9 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
     }
   }
 
-  return found_overlap;
+  // 返回 true 的条件：找到了可替换的 -1 段，或者虽然只有物理段重叠但我们选择保护它们。
+  // 两种情况都不应走到 AppendSnapshotSegment 的 fallback 路径。
+  return found_mem_overlap || found_phys_overlap;
 }
 
 void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {
