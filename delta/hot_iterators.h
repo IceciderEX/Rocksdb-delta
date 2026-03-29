@@ -76,12 +76,20 @@ class HotSnapshotIterator : public InternalIterator {
   uint64_t GetPhysicalId() override;
 
  private:
-  // 初始化特定 index 的 segment iterator，返回是否由于底层 Segments 被重定位而导致 index 失效
-  bool InitIterForSegment(size_t segment_index);
+  enum class SegmentInitStatus {
+    kSuccess,
+    kError,
+    kSnapshotChanged
+  };
 
-  // 当 Reader 因为后台 Flush 导致 segment 列表变化而越界时，
-  // 重新定位；返回 true 表示成功重新定位
+  // 根据 index 初始化 current_iter_
+  // 返回状态标识SegmentInitStatus
+  SegmentInitStatus InitIterForSegment(size_t index);
+
+  // 根据当前位置重新同步到最新地图
+  // 返回 true 表示成功定位（可能是 newdata/EOF）
   bool ReSyncToLatestSegments(const Slice& prev_key);
+
 
   // 切换到下一个 Segment
   void SwitchToNextSegment();

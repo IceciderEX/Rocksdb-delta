@@ -239,96 +239,79 @@ HotSnapshotIterator::~HotSnapshotIterator() {
   // current_iter_ unique_ptr auto released
 }
 
-bool HotSnapshotIterator::InitIterForSegment(size_t index) {
-  for (int retry = 0; retry < 10; ++retry) {
-    if (index >= segments_.size()) {
-      current_iter_.reset(nullptr);
-      current_segment_index_ = -1;
-      return false;
-    }
+HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
+    size_t index) {
+  if (index >= segments_.size()) {
+    current_iter_.reset(nullptr);
+    current_segment_index_ = -1;
+    return SegmentInitStatus::kError;
+  }
 
-    const auto& seg = segments_[index];
-    current_segment_index_ = static_cast<int>(index);
+  const auto& seg = segments_[index];
+  current_segment_index_ = static_cast<int>(index);
 
-    if (seg.file_number == static_cast<uint64_t>(-1)) {
-      // Case A: 内存 Buffer fileid -1
-      InternalIterator* mem_iter =
-          hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
+  if (seg.file_number == static_cast<uint64_t>(-1)) {
+    // Case A: 内存 Buffer fileid -1
+    InternalIterator* mem_iter =
+        hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
 
-      if (cuid_ == 1003) {
-          fprintf(stderr, "[DIAG_INIT] CUID 1003 Seg %zu (Mem) first_key size: %zu, last_key size: %zu\n",
-                  index, seg.first_key.size(), seg.last_key.size());
-      }
-
-      // 防止buffer data在线程调度时清空，或者头部已经下刷为 SST，再检查一次
-      mem_iter->Seek(seg.first_key);
-      if (!mem_iter->Valid() ||
-          icmp_.Compare(mem_iter->key(), seg.first_key) > 0) {
-        HotIndexEntry latest_entry;
-        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry) &&
-            latest_entry.HasSnapshot()) {
-          bool snapshot_changed = false;
-          if (segments_.size() != latest_entry.snapshot_segments.size()) {
-            snapshot_changed = true;
-          } else {
-            for (size_t i = 0; i < segments_.size(); ++i) {
-              if (segments_[i].file_number !=
-                  latest_entry.snapshot_segments[i].file_number) {
-                snapshot_changed = true;
-                break;
-              }
+    // 检查 buffer 是否还有数据。如果为空，由于 SAC 机制，很可能是发生了 Flush
+    // 导致 segments changed 
+    mem_iter->Seek(seg.first_key);
+    if (!mem_iter->Valid() ||
+        icmp_.Compare(mem_iter->key(), seg.first_key) > 0) {
+      HotIndexEntry latest_entry;
+      if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry) &&
+          latest_entry.HasSnapshot()) {
+        bool snapshot_changed = false;
+        if (segments_.size() != latest_entry.snapshot_segments.size()) {
+          snapshot_changed = true;
+        } else {
+          for (size_t i = 0; i < segments_.size(); ++i) {
+            if (segments_[i].file_number !=
+                latest_entry.snapshot_segments[i].file_number) {
+              snapshot_changed = true;
+              break;
             }
           }
+        }
 
-          if (snapshot_changed) {
-            segments_ = latest_entry.snapshot_segments;
-            delete mem_iter;
-            // 加载索引后，使用循环重试当前 index
-            continue;
-          }
+        if (snapshot_changed) {
+          delete mem_iter;
+          // 不在这里更新 segments_，交给 Next() 循环处理 ReSync
+          return SegmentInitStatus::kSnapshotChanged;
         }
       }
-      // current_iter_.reset(mem_iter);
-      // 使用 boundedIter，防止访问越界?
-      current_iter_.reset(new BoundedMemIterator(mem_iter, seg.first_key,
-                                                 seg.last_key, &icmp_));
-      return false;
-    } else {
-      // Case B: 物理 SST
-      FileMetaData meta = MakeFileMetaFromSegment(seg, false);
-
-      current_read_options_ = read_options_;
-      current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
-      current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
-
-      if (cuid_ == 1003) {
-          fprintf(stderr, "[DIAG_BOUNDS] CUID 1003 Seg %zu (Phys) Original last_key size: %zu, Extracted size: %zu, UpperBound: %s\n",
-                  index, seg.last_key.size(), current_upper_bound_str_.size(), FormatKeyDisplay(current_upper_bound_str_).c_str());
-      }
-
-      current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
-      current_lower_bound_slice_ = Slice(current_lower_bound_str_);
-      current_upper_bound_slice_ = Slice(current_upper_bound_str_);
-      current_read_options_.iterate_lower_bound = &current_lower_bound_slice_;
-      current_read_options_.iterate_upper_bound = &current_upper_bound_slice_;
-
-      InternalIterator* iter = table_cache_->NewIterator(
-          current_read_options_, file_options_, icmp_, meta, nullptr,
-          mutable_cf_options_, nullptr, nullptr,
-          TableReaderCaller::kUserIterator, nullptr, false,
-          1,  // L1+
-          0, nullptr, nullptr,
-          false,  // allow_unprepared_value
-          nullptr, nullptr);
-
-      current_iter_.reset(iter);
-      return false;
     }
+    current_iter_.reset(new BoundedMemIterator(mem_iter, seg.first_key,
+                                               seg.last_key, &icmp_));
+    return SegmentInitStatus::kSuccess;
+  } else {
+    // Case B: 物理 SST
+    FileMetaData meta = MakeFileMetaFromSegment(seg, false);
+
+    current_read_options_ = read_options_;
+    current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
+    current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
+
+    current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
+    current_lower_bound_slice_ = Slice(current_lower_bound_str_);
+    current_upper_bound_slice_ = Slice(current_upper_bound_str_);
+    current_read_options_.iterate_lower_bound = &current_lower_bound_slice_;
+    current_read_options_.iterate_upper_bound = &current_upper_bound_slice_;
+
+    InternalIterator* iter = table_cache_->NewIterator(
+        current_read_options_, file_options_, icmp_, meta, nullptr,
+        mutable_cf_options_, nullptr, nullptr, TableReaderCaller::kUserIterator,
+        nullptr, false,
+        1,  // L1+
+        0, nullptr, nullptr,
+        false,  // allow_unprepared_value
+        nullptr, nullptr);
+
+    current_iter_.reset(iter);
+    return SegmentInitStatus::kSuccess;
   }
-  // 重试 10 次都没成功？
-  // 说明元数据可能真的坏了?
-  current_iter_.reset(nullptr);
-  return false;
 }
 
 void HotSnapshotIterator::Seek(const Slice& target) {
@@ -362,15 +345,25 @@ void HotSnapshotIterator::Seek(const Slice& target) {
     }
 
     if (static_cast<int>(index) != current_segment_index_) {
-      if (InitIterForSegment(index)) {  // if true, index again
-        current_segment_index_ =
-            -1;  // 必须重置，否则下一轮循环中若 index 碰巧相同则会跳过 Init
-        continue;
+      SegmentInitStatus status = InitIterForSegment(index);
+      if (status == SegmentInitStatus::kSnapshotChanged) {
+        // snapshots 已变，重新获取并定位
+        HotIndexEntry latest_entry;
+        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
+          segments_ = latest_entry.snapshot_segments;
+          current_segment_index_ = -1;
+          continue;  // 重新进行 lower_bound
+        }
+      } else if (status == SegmentInitStatus::kError) {
+        current_iter_.reset(nullptr);
+        current_segment_index_ = -1;
+        return;
       }
     }
 
     break;
   }
+
 
   // segment seek
   if (current_iter_) {
@@ -395,22 +388,9 @@ void HotSnapshotIterator::Seek(const Slice& target) {
       SwitchToNextSegment();
       if (current_iter_) {
         current_iter_->Seek(segments_[current_segment_index_].first_key);
-        if (cuid_ == 1003) {
-          std::string landed_key = current_iter_->Valid()
-                                       ? FormatKeyDisplay(current_iter_->key())
-                                       : "N/A";
-          std::string landed_hex =
-              current_iter_->Valid()
-                  ? Slice(current_iter_->key()).ToString(true).substr(0, 60)
-                  : "";
-          fprintf(stderr,
-                  "[DIAG_SWITCH] CUID %lu (Seek-Fallback) to Seg %d. Valid: "
-                  "%d, Landed: %s, Hex: %s\n",
-                  cuid_, current_segment_index_, current_iter_->Valid(),
-                  landed_key.c_str(), landed_hex.c_str());
-        }
       }
     }
+
   }
 }
 
@@ -418,138 +398,64 @@ void HotSnapshotIterator::Next() {
   if (!current_iter_) return;
 
   std::string prev_key_debug = key().ToString();
-
   current_iter_->Next();
-
-  if (Valid() &&
-      icmp_.user_comparator()->Compare(ExtractUserKey(Slice(prev_key_debug)),
-                                       ExtractUserKey(key())) > 0) {
-    fprintf(stderr, "Prev: %s\n", FormatKeyDisplay(prev_key_debug).c_str());
-    fprintf(stderr, "Curr: %s\n", FormatKeyDisplay(key()).c_str());
-    fprintf(stderr,
-            "[FATAL] HotSnapshotIterator Regression within segment %d!\n",
-            current_segment_index_);
-    assert(true);
-  }
 
   while (!Valid()) {
     int next_index = current_segment_index_ + 1;
+
+    // 检查是否需要重新同步地图（到达当前地图边界，或者地图被发现已过期）
     if (next_index >= static_cast<int>(segments_.size())) {
-      // if (true) {
-      //   fprintf(stderr,
-      //           "[DIAG_EOF] CUID %lu reached EOF after Seg %d. Total Segments: "
-      //           "%zu. Last Key: %s\n",
-      //           cuid_, current_segment_index_, segments_.size(),
-      //           FormatKeyDisplay(prev_key_debug).c_str());
-      //   for (size_t i = 0; i < segments_.size(); ++i) {
-      //     fprintf(stderr,
-      //             "  [DIAG_EOF] Seg[%zu]: File %lu, Range [%s - %s]\n", i,
-      //             segments_[i].file_number,
-      //             FormatKeyDisplay(segments_[i].first_key).c_str(),
-      //             FormatKeyDisplay(segments_[i].last_key).c_str());
-      //   }
-      // }
-      // 尝试动态重同步
       if (ReSyncToLatestSegments(prev_key_debug)) {
-        // 成功重定位。如果现在 Valid()，说明找到了新数；
-        // 如果不 Valid()，说明刚好踩在段尾，让 while 循环继续 Switch 到下一段。
         if (Valid()) break;
         continue;
       }
       break;
     }
 
-    // 当前 Segment 耗尽(或越界)，切换到下一个
-    int old_segment = current_segment_index_;
-    SwitchToNextSegment();
-    if (current_iter_) {
-      current_iter_->Seek(segments_[current_segment_index_].first_key);
-      if (cuid_ == 1003) {
-        std::string landed_key = current_iter_->Valid()
-                                     ? FormatKeyDisplay(current_iter_->key())
-                                     : "N/A";
-        std::string landed_hex =
-            current_iter_->Valid()
-                ? Slice(current_iter_->key()).ToString(true).substr(0, 60)
-                : "";
-        fprintf(stderr,
-                "[DIAG_SWITCH] CUID %lu Index %d -> %d (File %lu). Valid: %d, "
-                "Landed: %s, Hex: %s\n",
-                cuid_, old_segment, current_segment_index_,
-                segments_[current_segment_index_].file_number,
-                current_iter_->Valid(), landed_key.c_str(), landed_hex.c_str());
+    // 尝试切换到下一段
+    SegmentInitStatus status = InitIterForSegment(next_index);
+    if (status == SegmentInitStatus::kSnapshotChanged) {
+      if (ReSyncToLatestSegments(prev_key_debug)) {
+        if (Valid()) break;
+        continue;
       }
+      break;
+    } else if (status == SegmentInitStatus::kError) {
+      current_iter_.reset(nullptr);
+      current_segment_index_ = -1;
+      break;
     }
 
-    // Debug 打印跨段情况，捕捉跨段回退
-    if (Valid() &&
-        icmp_.user_comparator()->Compare(ExtractUserKey(Slice(prev_key_debug)),
-                                         ExtractUserKey(key())) > 0) {
-      fprintf(stderr,
-              "[FATAL] HotSnapshotIterator Regression across segment!\n");
-      fprintf(stderr, "Prev: %s\n", FormatKeyDisplay(prev_key_debug).c_str());
-      fprintf(stderr, "Curr: %s\n", FormatKeyDisplay(key()).c_str());
-      fprintf(stderr, "PrevHex: %s\n",
-              Slice(prev_key_debug).ToString(true).c_str());
-      fprintf(stderr, "CurrHex: %s\n", key().ToString(true).c_str());
-      if (old_segment >= 0 && current_segment_index_ >= 0) {
-        fprintf(
-            stderr,
-            "Old Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
-            segments_[old_segment].file_number,
-            FormatKeyDisplay(segments_[old_segment].first_key).c_str(),
-            FormatKeyDisplay(segments_[old_segment].last_key).c_str());
-        fprintf(
-            stderr,
-            "New Segment's info: file_number=%lu, first_key=%s, last_key=%s\n",
-            segments_[current_segment_index_].file_number,
-            FormatKeyDisplay(segments_[current_segment_index_].first_key).c_str(),
-            FormatKeyDisplay(segments_[current_segment_index_].last_key).c_str());
-        fprintf(stderr, "Old Segment: %d, New Segment: %d\n", old_segment,
-                current_segment_index_);
-        assert(true);
-      }
+    if (current_iter_) {
+      current_iter_->Seek(segments_[current_segment_index_].first_key);
     }
+  }
+
+  // Regression 检查：捕捉跨段/同步后的逻辑回退
+  if (Valid() &&
+      icmp_.user_comparator()->Compare(ExtractUserKey(Slice(prev_key_debug)),
+                                       ExtractUserKey(key())) > 0) {
+    fprintf(stderr, "[FATAL] HotSnapshotIterator Regression detected!\n");
+    fprintf(stderr, "Prev: %s\n", FormatKeyDisplay(prev_key_debug).c_str());
+    fprintf(stderr, "Curr: %s\n", FormatKeyDisplay(key()).c_str());
+    // 强制失效以停止错误数据产出
+    current_iter_.reset(nullptr);
   }
 }
 
 // 当 Reader 因后台 Flush/Promote 导致 segment 变化时
 // 从最新索引重新获取段列表，并利用 prev_key 定位到正确的位置继续读
 bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
-  if (resync_count_ >= kMaxResyncRetries) {
-    return false;  // 防止无限重同步
-  }
-
   HotIndexEntry latest_entry;
   if (!hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry) ||
       !latest_entry.HasSnapshot()) {
     return false;
   }
 
-  // 检查snapshots是否真的变了
-  if (latest_entry.snapshot_segments.size() == segments_.size()) {
-    bool same = true;
-    for (size_t i = 0; i < segments_.size(); ++i) {
-      if (segments_[i].file_number != latest_entry.snapshot_segments[i].file_number) {
-        same = false;
-        break;
-      }
-    }
-    if (same) return false; 
-  }
-
-  if (true) {
-    fprintf(stderr,
-            "[DIAG_RESYNC] CUID %lu: Map changed! Old segs: %zu, New segs: "
-            "%zu. Relocating from prev_key: %s\n",
-            cuid_, segments_.size(),
-            latest_entry.snapshot_segments.size(),
-            FormatKeyDisplay(prev_key).c_str());
-  }
-
+  // 更新 local map
   segments_ = latest_entry.snapshot_segments;
-  resync_count_++;
-  // prev_key 二分查找 new SEGS
+
+  // 寻找包含或紧邻 prev_key 的段
   auto it = std::lower_bound(
       segments_.begin(), segments_.end(), prev_key,
       [&](const DataSegment& seg, const Slice& val) {
@@ -558,24 +464,26 @@ bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
       });
 
   if (it == segments_.end()) {
-    // prev_key 超出了新地图的最大范围，定位到了最末尾
-    // 可能是因为只有一个 segment + 这个 segment 被刷新了
     current_iter_.reset(nullptr);
     current_segment_index_ = static_cast<int>(segments_.size()) - 1;
-    return true; // 返回 true 让外层重新测试看看
+    return true;
   }
 
   size_t new_index = std::distance(segments_.begin(), it);
-  // init new iter
   current_segment_index_ = -1;
-  InitIterForSegment(new_index);
-  if (!current_iter_) {
-    return true; // 返回 true 以便接下来尝试下个段
+  SegmentInitStatus status = InitIterForSegment(new_index);
+
+  if (status != SegmentInitStatus::kSuccess) {
+    // 如果又是 snapshot changed，由外部 Next() 循环再次重试
+    return true;
   }
-  // Seek 到 prev_key 的下一条数据
-  // 使用 prev_key 本身进行 Seek，因为 MergingIterator/DBIter
+
+  if (!current_iter_) return true;
+
+  // 定位到 prev_key 及其之后
   current_iter_->Seek(prev_key);
-  // 跳过 prev_key 本身
+
+  // 重要：跳过已读过的 prev_key 自身，确保单调前进
   while (current_iter_->Valid() &&
          icmp_.user_comparator()->Compare(ExtractUserKey(current_iter_->key()),
                                           ExtractUserKey(prev_key)) <= 0) {
@@ -628,14 +536,32 @@ Status HotSnapshotIterator::status() const {
 }
 
 void HotSnapshotIterator::SeekToFirst() {
-  while (InitIterForSegment(0)) {
+  while (true) {
+    SegmentInitStatus status = InitIterForSegment(0);
+    if (status == SegmentInitStatus::kSnapshotChanged) {
+        HotIndexEntry latest_entry;
+        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
+            segments_ = latest_entry.snapshot_segments;
+            continue;
+        }
+    }
+    break;
   }
   if (current_iter_)
     current_iter_->Seek(segments_[current_segment_index_].first_key);
 }
 
 void HotSnapshotIterator::SeekToLast() {
-  while (InitIterForSegment(segments_.size() - 1)) {
+  while (true) {
+    SegmentInitStatus status = InitIterForSegment(segments_.size() - 1);
+    if (status == SegmentInitStatus::kSnapshotChanged) {
+        HotIndexEntry latest_entry;
+        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
+            segments_ = latest_entry.snapshot_segments;
+            continue;
+        }
+    }
+    break;
   }
   if (current_iter_) {
     if (segments_[current_segment_index_].file_number ==
@@ -666,7 +592,14 @@ void HotSnapshotIterator::Prev() {
 void HotSnapshotIterator::SwitchToPrevSegment() {
   if (current_segment_index_ > 0) {
     int target_index = current_segment_index_ - 1;
-    while (InitIterForSegment(target_index)) {
+    while (true) {
+        SegmentInitStatus status = InitIterForSegment(target_index);
+        if (status == SegmentInitStatus::kSnapshotChanged) {
+             // 简单处理：向上重新 SeekByKey
+             // ...
+             break;
+        }
+        break;
     }
   } else {
     current_iter_.reset(nullptr);
