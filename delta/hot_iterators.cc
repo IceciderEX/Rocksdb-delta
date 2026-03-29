@@ -368,7 +368,7 @@ void HotSnapshotIterator::Seek(const Slice& target) {
   // segment seek
   if (current_iter_) {
     current_iter_->Seek(target);
-    if (true) {
+      /*
       std::string landed_key = current_iter_->Valid()
                                    ? FormatKeyDisplay(current_iter_->key())
                                    : "N/A";
@@ -382,7 +382,8 @@ void HotSnapshotIterator::Seek(const Slice& target) {
               cuid_, current_segment_index_,
               segments_[current_segment_index_].file_number,
               current_iter_->Valid(), landed_key.c_str(), landed_hex.c_str());
-    }
+      */
+
 
     if (!Valid()) {
       SwitchToNextSegment();
@@ -400,36 +401,49 @@ void HotSnapshotIterator::Next() {
   std::string prev_key_debug = key().ToString();
   current_iter_->Next();
 
+  int resync_count = 0;
   while (!Valid()) {
-    int next_index = current_segment_index_ + 1;
-
-    // 检查是否需要重新同步地图（到达当前地图边界，或者地图被发现已过期）
-    if (next_index >= static_cast<int>(segments_.size())) {
-      if (ReSyncToLatestSegments(prev_key_debug)) {
-        if (Valid()) break;
-        continue;
-      }
-      break;
+    if (++resync_count > 1000) {
+        fprintf(stderr, "[ERROR] HotSnapshotIterator stuck in ReSync loop for CUID %lu. segments=%zu, idx=%d\n", 
+                cuid_, segments_.size(), current_segment_index_);
+        current_iter_.reset(nullptr);
+        break;
     }
 
-    // 尝试切换到下一段
-    SegmentInitStatus status = InitIterForSegment(next_index);
+    int target_index = current_segment_index_ + 1;
+
+    // 检查是否由于越界或者其他原因需要强制 ReSync
+    if (target_index >= static_cast<int>(segments_.size())) {
+      if (ReSyncToLatestSegments(prev_key_debug)) {
+         if (Valid()) break;
+         // Relocated 到新图后，current_segment_index_ 已经更新
+         // 从这个新的 index 继续检查，所以 continue
+         continue; 
+      }
+      break; // EOF
+    }
+
+    // 尝试初始化下一段
+    SegmentInitStatus status = InitIterForSegment(target_index);
     if (status == SegmentInitStatus::kSnapshotChanged) {
       if (ReSyncToLatestSegments(prev_key_debug)) {
         if (Valid()) break;
         continue;
       }
       break;
-    } else if (status == SegmentInitStatus::kError) {
+    }
+ else if (status == SegmentInitStatus::kError) {
       current_iter_.reset(nullptr);
       current_segment_index_ = -1;
       break;
     }
 
+    // 正常跨段，来到新的 Seg 的起点
     if (current_iter_) {
       current_iter_->Seek(segments_[current_segment_index_].first_key);
     }
   }
+
 
   // Regression 检查：捕捉跨段/同步后的逻辑回退
   if (Valid() &&
@@ -452,8 +466,29 @@ bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
     return false;
   }
 
-  // 更新 local map
-  segments_ = latest_entry.snapshot_segments;
+  // segments 没变 => EOF
+  const auto& new_segs = latest_entry.snapshot_segments;
+  if (!segments_.empty() && segments_.size() == new_segs.size()) {
+    bool identical = true;
+    for (size_t i = 0; i < segments_.size(); ++i) {
+      if (segments_[i].file_number != new_segs[i].file_number ||
+          segments_[i].first_key != new_segs[i].first_key ||
+          segments_[i].last_key != new_segs[i].last_key) {
+        identical = false;
+        break;
+      }
+    }
+    if (identical) return false;
+  }
+
+  segments_ = new_segs;
+
+  //如果segments_空了 => EOF
+  if (segments_.empty()) {
+    current_iter_.reset(nullptr);
+    current_segment_index_ = -1;
+    return false;
+  }
 
   // 寻找包含或紧邻 prev_key 的段
   auto it = std::lower_bound(
@@ -465,8 +500,8 @@ bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
 
   if (it == segments_.end()) {
     current_iter_.reset(nullptr);
-    current_segment_index_ = static_cast<int>(segments_.size()) - 1;
-    return true;
+    current_segment_index_ = static_cast<int>(segments_.size());
+    return false;  // 定位到了 all segments 之后 -> EOF
   }
 
   size_t new_index = std::distance(segments_.begin(), it);
@@ -490,6 +525,7 @@ bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
     current_iter_->Next();
   }
 
+  /*
   if (cuid_ == 1003) {
     fprintf(stderr,
             "[DIAG_RESYNC] CUID %lu: Relocated to Seg %d. Valid: %d, "
@@ -500,13 +536,25 @@ bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
                 ? FormatKeyDisplay(current_iter_->key()).c_str()
                 : "N/A");
   }
+  */
 
   return true; // 地图已经更新，无论当前段是否 Valid 都要返回 true 让外层继续
 }
 
 void HotSnapshotIterator::SwitchToNextSegment() {
   int target_index = current_segment_index_ + 1;
-  while (InitIterForSegment(target_index)) {
+  int retry = 0;
+  while (true) {
+    if (++retry > 20) break;
+    SegmentInitStatus status = InitIterForSegment(target_index);
+    if (status == SegmentInitStatus::kSnapshotChanged) {
+      HotIndexEntry latest_entry;
+      if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
+        segments_ = latest_entry.snapshot_segments;
+        continue;
+      }
+    }
+    break;
   }
 }
 
@@ -536,8 +584,11 @@ Status HotSnapshotIterator::status() const {
 }
 
 void HotSnapshotIterator::SeekToFirst() {
+  int retry = 0;
   while (true) {
+    if (++retry > 20) break;
     SegmentInitStatus status = InitIterForSegment(0);
+
     if (status == SegmentInitStatus::kSnapshotChanged) {
         HotIndexEntry latest_entry;
         if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
@@ -552,8 +603,11 @@ void HotSnapshotIterator::SeekToFirst() {
 }
 
 void HotSnapshotIterator::SeekToLast() {
+  int retry = 0;
   while (true) {
+    if (++retry > 20) break;
     SegmentInitStatus status = InitIterForSegment(segments_.size() - 1);
+
     if (status == SegmentInitStatus::kSnapshotChanged) {
         HotIndexEntry latest_entry;
         if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
@@ -592,14 +646,19 @@ void HotSnapshotIterator::Prev() {
 void HotSnapshotIterator::SwitchToPrevSegment() {
   if (current_segment_index_ > 0) {
     int target_index = current_segment_index_ - 1;
+    int retry = 0;
     while (true) {
-        SegmentInitStatus status = InitIterForSegment(target_index);
-        if (status == SegmentInitStatus::kSnapshotChanged) {
-             // 简单处理：向上重新 SeekByKey
-             // ...
-             break;
+      if (++retry > 20) break;
+      SegmentInitStatus status = InitIterForSegment(target_index);
+
+      if (status == SegmentInitStatus::kSnapshotChanged) {
+        HotIndexEntry latest_entry;
+        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
+          segments_ = latest_entry.snapshot_segments;
+          continue;
         }
-        break;
+      }
+      break;
     }
   } else {
     current_iter_.reset(nullptr);

@@ -208,7 +208,7 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
           // }
 
           int count = 0;
-          int mod = ground_truths[cuid]->row_ids.size() / 40;
+          int mod = ground_truths[cuid]->row_ids.size() / 10;
           std::unique_ptr<Iterator> it2(db->NewIterator(ro));
           for (it2->Seek(start_key); it2->Valid(); it2->Next()) {
             if (ExtractCUID(it2->key()) != cuid) break;

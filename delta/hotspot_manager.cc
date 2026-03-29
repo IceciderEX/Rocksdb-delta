@@ -602,10 +602,10 @@ void HotspotManager::FinalizeScanAsCompaction(
   bool has_valid_tail =
       internal_comparator_->Compare(tail_min, scan_last_key) <= 0;
 
-  if (cuid == 1003) {
-      fprintf(stderr, "[DIAG_FINALIZE] CUID 1003 Finalize: scan_first_key size: %zu, scan_last_key size: %zu\n",
-              scan_first_key.size(), scan_last_key.size());
-  }
+  // if (cuid == 1003) {
+  //     fprintf(stderr, "[DIAG_FINALIZE] CUID 1003 Finalize: scan_first_key size: %zu, scan_last_key size: %zu\n",
+  //             scan_first_key.size(), scan_last_key.size());
+  // }
   if (has_buffered_data && has_valid_tail) {
     DataSegment tail_segment;
     tail_segment.file_number = static_cast<uint64_t>(-1);  // 标记为内存段
