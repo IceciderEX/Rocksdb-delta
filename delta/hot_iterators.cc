@@ -435,20 +435,20 @@ void HotSnapshotIterator::Next() {
   while (!Valid()) {
     int next_index = current_segment_index_ + 1;
     if (next_index >= static_cast<int>(segments_.size())) {
-      if (true) {
-        fprintf(stderr,
-                "[DIAG_EOF] CUID %lu reached EOF after Seg %d. Total Segments: "
-                "%zu. Last Key: %s\n",
-                cuid_, current_segment_index_, segments_.size(),
-                FormatKeyDisplay(prev_key_debug).c_str());
-        for (size_t i = 0; i < segments_.size(); ++i) {
-          fprintf(stderr,
-                  "  [DIAG_EOF] Seg[%zu]: File %lu, Range [%s - %s]\n", i,
-                  segments_[i].file_number,
-                  FormatKeyDisplay(segments_[i].first_key).c_str(),
-                  FormatKeyDisplay(segments_[i].last_key).c_str());
-        }
-      }
+      // if (true) {
+      //   fprintf(stderr,
+      //           "[DIAG_EOF] CUID %lu reached EOF after Seg %d. Total Segments: "
+      //           "%zu. Last Key: %s\n",
+      //           cuid_, current_segment_index_, segments_.size(),
+      //           FormatKeyDisplay(prev_key_debug).c_str());
+      //   for (size_t i = 0; i < segments_.size(); ++i) {
+      //     fprintf(stderr,
+      //             "  [DIAG_EOF] Seg[%zu]: File %lu, Range [%s - %s]\n", i,
+      //             segments_[i].file_number,
+      //             FormatKeyDisplay(segments_[i].first_key).c_str(),
+      //             FormatKeyDisplay(segments_[i].last_key).c_str());
+      //   }
+      // }
       // 尝试动态重同步
       if (ReSyncToLatestSegments(prev_key_debug)) {
         // 成功重定位。如果现在 Valid()，说明找到了新数；

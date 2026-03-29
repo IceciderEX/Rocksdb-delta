@@ -86,17 +86,17 @@ void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
       WriteBatch batch;
       {
         std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
-        for (int k = 0; k < 1024; ++k) {
+        for (int k = 0; k < 256; ++k) {
           uint64_t rid = next_row_per_cuid[i]++;
           batch.Put(GenerateKey(cuid, rid), "val_xxxxxxxxxxxxxxxxxxxx");
           // ground_truths[cuid]->row_ids.insert(rid);
         }
       }
       db->Write(wo, &batch);
-      for (uint64_t rid = next_row_per_cuid[i] - 1024; rid < next_row_per_cuid[i]; ++rid) {
+      for (uint64_t rid = next_row_per_cuid[i] - 256; rid < next_row_per_cuid[i]; ++rid) {
         ground_truths[cuid]->row_ids.insert(rid);
       }
-      global_stats.total_writes += 1024;
+      global_stats.total_writes += 256;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
@@ -206,7 +206,6 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
           //             << buf_count << std::endl;
           //   delete buf_iter;
           // }
-          
 
           int count = 0;
           int mod = ground_truths[cuid]->row_ids.size() / 40;
@@ -278,8 +277,8 @@ int main() {
   Options options;
   options.create_if_missing = true;
   options.enable_delta = true;
-  options.write_buffer_size = 16 * 1024 * 1024;
-  options.target_file_size_base = 16 * 1024 * 1024;
+  options.write_buffer_size = 512 * 1024;
+  options.target_file_size_base = 512 * 1024;
 
   // --- Example 1: Programmatic Configuration of DeltaOptions ---
   // These can be set directly on the options object before opening the DB.
@@ -288,7 +287,7 @@ int main() {
   options.delta_options.delta_merge_threshold = 3;
   options.delta_options.sac_delta_count_threshold = 5;
   options.delta_options.sharding_count = 64; // Power of 2 recommended
-  options.delta_options.hot_data_buffer_threshold_bytes = 16 * 1024 * 1024;
+  options.delta_options.hot_data_buffer_threshold_bytes = 2 * 1024 * 1024;
   options.delta_options.hot_data_buffer_shards = 128;
   options.delta_options.compaction_l0_trigger_count = 20;
   options.delta_options.compaction_l0_trigger_age_sec = 3600;

@@ -94,9 +94,9 @@ bool HotspotManager::BufferHotData(uint64_t cuid, const Slice& key,
     std::lock_guard<std::mutex> lock(buffered_cuids_mutex_);
     active_buffered_cuids_.insert(cuid);
   }
-  if (cuid == 1003) {
-    fprintf(stderr, "[DIAG_APPEND] CUID 1003 appending key size: %zu\n", key.size());
-  }
+  // if (cuid == 1003) {
+  //   fprintf(stderr, "[DIAG_APPEND] CUID 1003 appending key size: %zu\n", key.size());
+  // }
   return buffer_.Append(cuid, key, value);
 }
 
@@ -860,12 +860,17 @@ void HotspotManager::EnqueuePartialMerge(
     uint64_t cuid, const std::string& scan_first_key,
     const std::string& scan_last_key,
     const std::vector<std::pair<std::string, std::string>>& scan_data) {
+  if (!TryLockCuid(cuid)) {
+    return;
+  }
+
   std::lock_guard<std::mutex> lock(partial_merge_mutex_);
   // 避免重复添加相同 cuid 的任务?
   for (auto& task : partial_merge_queue_) {
     if (task.cuid == cuid) {
       // 已经有一个队列了，暂时忽略本次小的 scan触发，或者也可以用更大的
       // range更新
+      UnlockCuid(cuid);
       return;
     }
   }
@@ -889,15 +894,9 @@ bool HotspotManager::PopPendingPartialMerge(PartialMergePendingTask* task) {
     return false;
   }
 
-  for (auto it = partial_merge_queue_.begin(); it != partial_merge_queue_.end();
-       ++it) {
-    if (TryLockCuid(it->cuid)) {
-      *task = std::move(*it);
-      partial_merge_queue_.erase(it);
-      return true;
-    }
-  }
-  return false;
+  *task = std::move(partial_merge_queue_.front());
+  partial_merge_queue_.erase(partial_merge_queue_.begin());
+  return true;
 }
 
 bool HotspotManager::TryLockCuid(uint64_t cuid) {

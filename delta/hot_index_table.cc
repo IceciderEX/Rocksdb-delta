@@ -139,11 +139,11 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
               [icmp](const DataSegment& a, const DataSegment& b) {
                 return icmp->Compare(a.first_key, b.first_key) < 0;
               });
-    for (const auto& seg : next_segments) {
-      fprintf(stderr, "[HotIndexTable] Next snapshot segment: [%s - %s], file_number: %lu\n",
-              FormatKeyDisplay(seg.first_key).c_str(),
-              FormatKeyDisplay(seg.last_key).c_str(), seg.file_number);
-    }
+    // for (const auto& seg : next_segments) {
+    //   fprintf(stderr, "[HotIndexTable] Next snapshot segment: [%s - %s], file_number: %lu\n",
+    //           FormatKeyDisplay(seg.first_key).c_str(),
+    //           FormatKeyDisplay(seg.last_key).c_str(), seg.file_number);
+    // }
     entry.snapshot_segments = std::move(next_segments);
 
     if (lifecycle_manager_) {
