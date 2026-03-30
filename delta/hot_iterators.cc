@@ -223,7 +223,8 @@ HotSnapshotIterator::HotSnapshotIterator(
     HotspotManager* hotspot_manager, TableCache* table_cache,
     const ReadOptions& read_options, const FileOptions& file_options,
     const InternalKeyComparator& icmp,
-    const MutableCFOptions& mutable_cf_options)
+    const MutableCFOptions& mutable_cf_options,
+    std::shared_ptr<HotSstLifecycleManager> lifecycle_manager)
     : segments_(segments),
       cuid_(cuid),
       hotspot_manager_(hotspot_manager),
@@ -233,10 +234,45 @@ HotSnapshotIterator::HotSnapshotIterator(
       icmp_(icmp),
       mutable_cf_options_(mutable_cf_options),
       current_segment_index_(-1),
-      status_(Status::OK()) {}
+      status_(Status::OK()),
+      lifecycle_manager_(lifecycle_manager),
+      current_segment_read_count_(0) {
+  // Ref all physical segments to prevent deletion during Iterator lifetime
+  RefSegments(segments_);
+}
 
 HotSnapshotIterator::~HotSnapshotIterator() {
+  // Unref all physical segments held by this Iterator
+  UnrefSegments(segments_);
   // current_iter_ unique_ptr auto released
+}
+
+void HotSnapshotIterator::RefSegments(const std::vector<DataSegment>& segs) {
+  if (!lifecycle_manager_) return;
+  for (const auto& seg : segs) {
+    if (seg.file_number != static_cast<uint64_t>(-1)) {
+      lifecycle_manager_->Ref(seg.file_number);
+    }
+  }
+}
+
+void HotSnapshotIterator::UnrefSegments(const std::vector<DataSegment>& segs) {
+  if (!lifecycle_manager_) return;
+  for (const auto& seg : segs) {
+    if (seg.file_number != static_cast<uint64_t>(-1)) {
+      lifecycle_manager_->Unref(seg.file_number);
+    }
+  }
+}
+
+void HotSnapshotIterator::LogSegmentExit(const char* reason) {
+  if (current_segment_index_ != -1) {
+    fprintf(stderr,
+            "[DIAG_ITER] CUID %lu: Finished Segment %d (%s). File number %lu. Range [%s, %s]. Read %lu records total.\n",
+            cuid_, current_segment_index_, reason, segments_[current_segment_index_].file_number, 
+            FormatKeyDisplay(segments_[current_segment_index_].first_key).c_str(), FormatKeyDisplay(segments_[current_segment_index_].last_key).c_str(), current_segment_read_count_);
+  }
+  current_segment_read_count_ = 0;
 }
 
 HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
@@ -310,6 +346,24 @@ HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
         nullptr, nullptr);
 
     current_iter_.reset(iter);
+
+    // [DIAG] 防御性检查：如果文件打开失败，触发 ReSync
+    if (iter && !iter->status().ok()) {
+      fprintf(stderr,
+              "[ERROR] CUID %lu: Failed to open SST file %lu in Segment %zu: %s\n",
+              cuid_, seg.file_number, index,
+              iter->status().ToString().c_str());
+      current_iter_.reset(nullptr);
+      current_segment_index_ = -1;
+      return SegmentInitStatus::kSnapshotChanged;
+    }
+
+    // [DIAG] Reset count moved to caller (Next/Seek) for correct logging
+    fprintf(stderr, "[DIAG_ITER] CUID %lu: Entering Segment %zu (File %lu). Range: [%s - %s]\n",
+            cuid_, index, seg.file_number,
+            FormatKeyDisplay(segments_[index].first_key).c_str(),
+            FormatKeyDisplay(segments_[index].last_key).c_str());
+
     return SegmentInitStatus::kSuccess;
   }
 }
@@ -345,12 +399,19 @@ void HotSnapshotIterator::Seek(const Slice& target) {
     }
 
     if (static_cast<int>(index) != current_segment_index_) {
+      // [DIAG] Log jumping away from current segment
+      LogSegmentExit("Interrupted by Seek");
+
       SegmentInitStatus status = InitIterForSegment(index);
       if (status == SegmentInitStatus::kSnapshotChanged) {
         // snapshots 已变，重新获取并定位
         HotIndexEntry latest_entry;
         if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
+          // Swap refs on segment reassignment
+          std::vector<DataSegment> old_segs = std::move(segments_);
           segments_ = latest_entry.snapshot_segments;
+          RefSegments(segments_);
+          UnrefSegments(old_segs);
           current_segment_index_ = -1;
           continue;  // 重新进行 lower_bound
         }
@@ -364,25 +425,27 @@ void HotSnapshotIterator::Seek(const Slice& target) {
     break;
   }
 
-
   // segment seek
   if (current_iter_) {
     current_iter_->Seek(target);
-      /*
-      std::string landed_key = current_iter_->Valid()
-                                   ? FormatKeyDisplay(current_iter_->key())
-                                   : "N/A";
-      std::string landed_hex =
-          current_iter_->Valid()
-              ? Slice(current_iter_->key()).ToString(true).substr(0, 60)
-              : "";
-      fprintf(stderr,
-              "[DIAG_SEEK] CUID %lu Initial Seek to Segment %d (File %lu). "
-              "Valid: %d, Landed: %s, Hex: %s\n",
-              cuid_, current_segment_index_,
-              segments_[current_segment_index_].file_number,
-              current_iter_->Valid(), landed_key.c_str(), landed_hex.c_str());
-      */
+
+    // [DIAG] Landed! Start (or reset) the count for this seek position
+    current_segment_read_count_ = 0;
+    if (current_iter_->Valid()) {
+        current_segment_read_count_ = 1;
+    }
+
+    // [DIAG] Log where Seek landed
+    std::string landed_key = current_iter_->Valid()
+                                 ? FormatKeyDisplay(current_iter_->key())
+                                 : "N/A";
+    // fprintf(stderr,
+    //         "[DIAG_SEEK] CUID %lu Seek landed at Segment %d (File %lu). "
+    //         "Valid: %d, Landed: %s\n",
+    //         cuid_, current_segment_index_,
+    //         segments_[current_segment_index_].file_number,
+    //         current_iter_->Valid(), landed_key.c_str());
+
 
 
     if (!Valid()) {
@@ -403,6 +466,9 @@ void HotSnapshotIterator::Next() {
 
   int resync_count = 0;
   while (!Valid()) {
+    // [DIAG] Current segment finished, log stats before moving away
+    LogSegmentExit("End of Segment");
+
     if (++resync_count > 1000) {
         fprintf(stderr, "[ERROR] HotSnapshotIterator stuck in ReSync loop for CUID %lu. segments=%zu, idx=%d\n", 
                 cuid_, segments_.size(), current_segment_index_);
@@ -432,7 +498,7 @@ void HotSnapshotIterator::Next() {
       }
       break;
     }
- else if (status == SegmentInitStatus::kError) {
+    else if (status == SegmentInitStatus::kError) {
       current_iter_.reset(nullptr);
       current_segment_index_ = -1;
       break;
@@ -441,7 +507,13 @@ void HotSnapshotIterator::Next() {
     // 正常跨段，来到新的 Seg 的起点
     if (current_iter_) {
       current_iter_->Seek(segments_[current_segment_index_].first_key);
+      // Loop ends if Valid()
     }
+  }
+
+  // [DIAG] Increment count for the current record (landed or next)
+  if (Valid()) {
+      current_segment_read_count_++;
   }
 
 
@@ -481,7 +553,12 @@ bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
     if (identical) return false;
   }
 
+  // Save old segments for Unref, then swap refs
+  std::vector<DataSegment> old_segments = std::move(segments_);
   segments_ = new_segs;
+
+  RefSegments(segments_);
+  UnrefSegments(old_segments);
 
   //如果segments_空了 => EOF
   if (segments_.empty()) {
@@ -550,7 +627,11 @@ void HotSnapshotIterator::SwitchToNextSegment() {
     if (status == SegmentInitStatus::kSnapshotChanged) {
       HotIndexEntry latest_entry;
       if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
+        // Swap refs on segment reassignment
+        std::vector<DataSegment> old_segs = std::move(segments_);
         segments_ = latest_entry.snapshot_segments;
+        RefSegments(segments_);
+        UnrefSegments(old_segs);
         continue;
       }
     }
@@ -584,6 +665,9 @@ Status HotSnapshotIterator::status() const {
 }
 
 void HotSnapshotIterator::SeekToFirst() {
+  // [DIAG] Reset before moving to start
+  LogSegmentExit("SeekToFirst");
+
   int retry = 0;
   while (true) {
     if (++retry > 20) break;
@@ -592,17 +676,42 @@ void HotSnapshotIterator::SeekToFirst() {
     if (status == SegmentInitStatus::kSnapshotChanged) {
         HotIndexEntry latest_entry;
         if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
+            // Swap refs on segment reassignment
+            std::vector<DataSegment> old_segs = std::move(segments_);
             segments_ = latest_entry.snapshot_segments;
+            RefSegments(segments_);
+            UnrefSegments(old_segs);
             continue;
         }
     }
     break;
   }
-  if (current_iter_)
+
+  if (current_iter_) {
     current_iter_->Seek(segments_[current_segment_index_].first_key);
+
+    // [DIAG] Log SeekToFirst landing
+    std::string landed_key = current_iter_->Valid()
+                                 ? FormatKeyDisplay(current_iter_->key())
+                                 : "N/A";
+    fprintf(stderr,
+            "[DIAG_SEEK] CUID %lu SeekToFirst landed at Segment %d (File %lu). "
+            "Valid: %d, Landed: %s\n",
+            cuid_, current_segment_index_, 
+            segments_[current_segment_index_].file_number,
+            current_iter_->Valid(), landed_key.c_str());
+    
+    // [DIAG] Initialize count for the new start position
+    if (current_iter_->Valid()) {
+        current_segment_read_count_ = 1;
+    }
+  }
 }
 
 void HotSnapshotIterator::SeekToLast() {
+  // [DIAG] Reset before moving to end
+  LogSegmentExit("SeekToLast");
+
   int retry = 0;
   while (true) {
     if (++retry > 20) break;
@@ -611,7 +720,11 @@ void HotSnapshotIterator::SeekToLast() {
     if (status == SegmentInitStatus::kSnapshotChanged) {
         HotIndexEntry latest_entry;
         if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
+            // Swap refs on segment reassignment
+            std::vector<DataSegment> old_segs = std::move(segments_);
             segments_ = latest_entry.snapshot_segments;
+            RefSegments(segments_);
+            UnrefSegments(old_segs);
             continue;
         }
     }
@@ -625,12 +738,17 @@ void HotSnapshotIterator::SeekToLast() {
       current_iter_->SeekToLast();
     }
   }
+  // [DIAG] Initialize count for the new position
+  if (Valid()) {
+      current_segment_read_count_ = 1;
+  }
 }
 
 void HotSnapshotIterator::Prev() {
   if (!current_iter_) return;
   current_iter_->Prev();
   if (!Valid()) {
+    LogSegmentExit("End of Segment (Backward)");
     SwitchToPrevSegment();
     if (Valid()) {
       if (segments_[current_segment_index_].file_number ==
@@ -639,11 +757,21 @@ void HotSnapshotIterator::Prev() {
       } else {
         current_iter_->SeekToLast();
       }
+      // [DIAG] Initialize count for new segment
+      if (Valid()) {
+          current_segment_read_count_ = 1;
+      }
     }
+  } else {
+    // [DIAG] Increment count for same segment
+    current_segment_read_count_++;
   }
 }
 
 void HotSnapshotIterator::SwitchToPrevSegment() {
+  // [DIAG] Reset before moving
+  LogSegmentExit("SwitchToPrevSegment");
+
   if (current_segment_index_ > 0) {
     int target_index = current_segment_index_ - 1;
     int retry = 0;
@@ -654,7 +782,11 @@ void HotSnapshotIterator::SwitchToPrevSegment() {
       if (status == SegmentInitStatus::kSnapshotChanged) {
         HotIndexEntry latest_entry;
         if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
+          // Swap refs on segment reassignment
+          std::vector<DataSegment> old_segs = std::move(segments_);
           segments_ = latest_entry.snapshot_segments;
+          RefSegments(segments_);
+          UnrefSegments(old_segs);
           continue;
         }
       }
@@ -754,7 +886,8 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
   InternalIterator* snapshot_iter =
       new HotSnapshotIterator(entry.snapshot_segments, cuid, hotspot_manager_,
                               version_->cfd()->table_cache(), read_options_,
-                              file_options_, icmp_, mutable_cf_options_);
+                              file_options_, icmp_, mutable_cf_options_,
+                              hotspot_manager_->GetLifecycleManager());
 
   InternalIterator* delta_iter = new HotDeltaIterator(
       entry.deltas, version_->cfd()->table_cache(), read_options_,

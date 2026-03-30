@@ -7206,7 +7206,8 @@ void DBImpl::ProcessPendingPartialMerge() {
   if (!overlapping_snaps.empty()) {
     InternalIterator* snap_iter = new HotSnapshotIterator(
         overlapping_snaps, task.cuid, hotspot_manager_.get(),
-        cfd->table_cache(), read_opts, file_opts, icmp, mutable_cf_opts);
+        cfd->table_cache(), read_opts, file_opts, icmp, mutable_cf_opts,
+        hotspot_manager_->GetLifecycleManager());
     children.push_back(snap_iter);
   }
 

@@ -59,7 +59,8 @@ class HotSnapshotIterator : public InternalIterator {
                       const ReadOptions& read_options,
                       const FileOptions& file_options,
                       const InternalKeyComparator& icmp,
-                      const MutableCFOptions& mutable_cf_options);
+                      const MutableCFOptions& mutable_cf_options,
+                      std::shared_ptr<HotSstLifecycleManager> lifecycle_manager);
 
   ~HotSnapshotIterator() override;
 
@@ -116,11 +117,22 @@ class HotSnapshotIterator : public InternalIterator {
   Slice current_lower_bound_slice_;
   Slice current_upper_bound_slice_;
 
+  // Ref/Unref 生命周期管理
+  void RefSegments(const std::vector<DataSegment>& segs);
+  void UnrefSegments(const std::vector<DataSegment>& segs);
+  void LogSegmentExit(const char* reason);
+
   Status status_;
+
+  // 持有 lifecycle_manager 保证 Iterator 生命期内文件不被删除
+  std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
 
   // Solution W: 防止无限重同步
   int resync_count_ = 0;
   static constexpr int kMaxResyncRetries = 3;
+
+  // [DIAG] 调试计数：记录当前 segment 导出的数据量
+  uint64_t current_segment_read_count_ = 0;
 };
 
 class DeltaSwitchingIterator : public InternalIterator {

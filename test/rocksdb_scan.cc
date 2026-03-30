@@ -86,17 +86,17 @@ void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
       WriteBatch batch;
       {
         std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
-        for (int k = 0; k < 256; ++k) {
+        for (int k = 0; k < 512; ++k) {
           uint64_t rid = next_row_per_cuid[i]++;
-          batch.Put(GenerateKey(cuid, rid), "val_xxxxxxxxxxxxxxxxxxxx");
+          batch.Put(GenerateKey(cuid, rid), "val_xxxxxxxxxxxxxxxx_" + std::to_string(rid));
           // ground_truths[cuid]->row_ids.insert(rid);
         }
       }
       db->Write(wo, &batch);
-      for (uint64_t rid = next_row_per_cuid[i] - 256; rid < next_row_per_cuid[i]; ++rid) {
+      for (uint64_t rid = next_row_per_cuid[i] - 512; rid < next_row_per_cuid[i]; ++rid) {
         ground_truths[cuid]->row_ids.insert(rid);
       }
-      global_stats.total_writes += 256;
+      global_stats.total_writes += 512;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
@@ -277,8 +277,8 @@ int main() {
   Options options;
   options.create_if_missing = true;
   options.enable_delta = true;
-  options.write_buffer_size = 512 * 1024;
-  options.target_file_size_base = 512 * 1024;
+  options.write_buffer_size = 2 * 1024 * 1024;
+  options.target_file_size_base = 2 * 1024 * 1024;
 
   // --- Example 1: Programmatic Configuration of DeltaOptions ---
   // These can be set directly on the options object before opening the DB.
@@ -287,7 +287,7 @@ int main() {
   options.delta_options.delta_merge_threshold = 3;
   options.delta_options.sac_delta_count_threshold = 5;
   options.delta_options.sharding_count = 64; // Power of 2 recommended
-  options.delta_options.hot_data_buffer_threshold_bytes = 2 * 1024 * 1024;
+  options.delta_options.hot_data_buffer_threshold_bytes = 8 * 1024 * 1024;
   options.delta_options.hot_data_buffer_shards = 128;
   options.delta_options.compaction_l0_trigger_count = 20;
   options.delta_options.compaction_l0_trigger_age_sec = 3600;
@@ -321,7 +321,7 @@ int main() {
   std::thread writer(WriterThread, db, cuids);
   std::thread reader1(ReaderThread, db, cuids, 1);
   std::thread reader2(ReaderThread, db, cuids, 2);
-  std::thread reader3(ReaderThread, db, cuids, 3);
+  // std::thread reader3(ReaderThread, db, cuids, 3);
   std::thread manager(ManagerThread, db_impl);
 
   auto start_time = std::chrono::steady_clock::now();
