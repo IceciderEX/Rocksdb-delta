@@ -4,6 +4,27 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+
+// Keep snapshot segments in a deterministic order to avoid iterator regression
+// when multiple segments share the same start key.
+bool SegmentLess(const DataSegment& a, const DataSegment& b,
+                 const InternalKeyComparator* icmp) {
+  int cmp_first = icmp->Compare(a.first_key, b.first_key);
+  if (cmp_first != 0) {
+    return cmp_first < 0;
+  }
+
+  int cmp_last = icmp->Compare(a.last_key, b.last_key);
+  if (cmp_last != 0) {
+    return cmp_last < 0;
+  }
+
+  return a.file_number < b.file_number;
+}
+
+}  // namespace
+
 static bool HasActualDataInBuffer(uint64_t cuid, const std::string& start,
                                   const std::string& end, HotDataBuffer* buffer,
                                   const InternalKeyComparator* icmp) {
@@ -134,10 +155,10 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   if (found_overlap) {
     // 新 SST 只添加一次
     next_segments.push_back(new_segment);
-    // sort segments (Solution G: used icmp for correct internal key order)
+    // Sort segments with a stable tie-breaker for identical start keys.
     std::sort(next_segments.begin(), next_segments.end(),
               [icmp](const DataSegment& a, const DataSegment& b) {
-                return icmp->Compare(a.first_key, b.first_key) < 0;
+                return SegmentLess(a, b, icmp);
               });
     // for (const auto& seg : next_segments) {
     //   fprintf(stderr, "[HotIndexTable] Next snapshot segment: [%s - %s],
@@ -429,10 +450,16 @@ void HotIndexTable::ReplaceOverlappingSegments(
 
     next_segments.push_back(new_segment);
 
-    // 重新排序
+    // 重新排序（稳定 tie-breaker，避免同起点段顺序抖动）
     std::sort(next_segments.begin(), next_segments.end(),
               [](const DataSegment& a, const DataSegment& b) {
-                return a.first_key < b.first_key;
+                if (a.first_key != b.first_key) {
+                  return a.first_key < b.first_key;
+                }
+                if (a.last_key != b.last_key) {
+                  return a.last_key < b.last_key;
+                }
+                return a.file_number < b.file_number;
               });
 
     snapshots = std::move(next_segments);
