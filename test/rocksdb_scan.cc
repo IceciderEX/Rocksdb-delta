@@ -1,70 +1,98 @@
+/**
+ * rocksdb_perf_test.cc
+ *
+ * RocksDB-delta 高性能并发测试工具 (重构版 - 顺序生命周期模型)
+ * 场景：16线程并发, 8分钟持续运行, 10W CUID, 15/77 负载分布
+ * 逻辑：每线程领取一个 CUID 走完“增删改查”一生，所有 CUID 行数保持一致 (~2.5W行)。
+ */
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
+#include <deque>
+#include <iomanip>
 #include <iostream>
-#include <map>
 #include <mutex>
 #include <random>
-#include <set>
 #include <string>
 #include <thread>
+#include <filesystem>
 #include <vector>
 
-#include "db/db_impl/db_impl.h"
-#include "delta/hotspot_manager.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/write_batch.h"
+#include "rocksdb/statistics.h"
 
-using namespace ROCKSDB_NAMESPACE;
+// ==========================================
+// 配置常量
+// ==========================================
+const std::string kNativeDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_native";
+const std::string kDeltaDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_delta";
+const int kNumThreads = 16;
+const int kTestDurationSec = 3000;       // s
+const int kNumCuids = 1000000;           // 100W CUID 总库
+const uint64_t kDbId = 1;
+const uint64_t kNumTableIds = 256;       // 保证每个 tableid 的 CUID 数量大致相同
+const int kBatchSize = 512;             // 每次 Put 128 行
+const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
+const double kHotRatio = 0.15;          // 15% 的热点
+const int kHotScanTarget = 1000;        // 热点访问目标
+const int kColdScanTarget = 150;        // 普通访问目标
 
-namespace {
+// ==========================================
+// 辅助工具与状态管理
+// ==========================================
 
-const std::string kDBPath = "/home/jx/Rocksdb-delta/db_tmp";
-// <=0 means run without built-in time limit until externally stopped.
-const int kTestDurationSec = 0;
-const int kWorkerThreads = 8;
-const int kBatchSize = 128;
-const int kTargetPutBatches = 200;      // 25600 rows per CUID
-const int kSmallScanWindow = 500;
-const int kSmallScanEveryNBatches = 2;
-const bool kVerboseWorkerLog = false;
-const bool kEnableDeltaFullScan = false;
-
-std::atomic<bool> stop_test{false};
-std::atomic<uint64_t> next_cuid{1001};
-
-struct TestStats {
-  std::atomic<uint64_t> total_writes{0};
-  std::atomic<uint64_t> total_small_scans{0};
-  std::atomic<uint64_t> total_full_scans{0};
-  std::atomic<uint64_t> total_deletes{0};
-  std::atomic<uint64_t> total_lifecycle_completed{0};
-  std::atomic<uint64_t> total_merges{0};
-  std::atomic<uint64_t> errors{0};
-};
-
-TestStats global_stats;
+bool CleanupDBPath(const std::string& path) {
+  std::error_code ec;
+  if (path != kNativeDBPath && path != kDeltaDBPath) {
+    std::cerr << "Refusing to delete non-test path: " << path << std::endl;
+    return false;
+  }
+  std::filesystem::remove_all(path, ec);
+  return true;
+}
 
 std::string GenerateKey(uint64_t cuid, int row_id) {
   std::string key;
   key.resize(40);
   std::memset(&key[0], 0, 40);
 
+  auto encode_u64_be = [&](uint64_t value, size_t offset) {
+    for (int i = 0; i < 8; ++i) {
+      key[offset + i] = static_cast<char>((value >> (56 - 8 * i)) & 0xFF);
+    }
+  };
+
+  // Hash-based mapping keeps CUID unique while distributing them
+  // approximately evenly across tableids.
+  const uint64_t mixed = cuid * 11400714819323198485ull;
+  const uint64_t table_id = (mixed % kNumTableIds) + 1;
+  encode_u64_be(kDbId, 0);
+  encode_u64_be(table_id, 8);
+
   unsigned char* p = reinterpret_cast<unsigned char*>(&key[0]) + 16;
   for (int i = 0; i < 8; ++i) {
-    p[i] = (cuid >> (56 - 8 * i)) & 0xFF;
+    p[i] = (cuid >> (56 - 8 * i)) & 0xFF; // Big Endian
   }
-
   char row_buf[16];
   snprintf(row_buf, sizeof(row_buf), "%010d", row_id);
   std::memcpy(&key[24], row_buf, 10);
-
   return key;
 }
 
-uint64_t ExtractCUID(const Slice& key) {
+std::string GenerateCuidUpperBoundKey(uint64_t cuid) {
+  // Use per-CUID row upper bound directly (exclusive) and do not rely on
+  // table-id/cuid ordering relationships.
+  return GenerateKey(cuid, kTargetPutBatches * kBatchSize);
+}
+
+uint64_t ExtractCUID(const rocksdb::Slice& key) {
   if (key.size() < 24) return 0;
-  const unsigned char* p =
-      reinterpret_cast<const unsigned char*>(key.data()) + 16;
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(key.data()) + 16;
   uint64_t c = 0;
   for (int i = 0; i < 8; ++i) {
     c = (c << 8) | p[i];
@@ -72,327 +100,343 @@ uint64_t ExtractCUID(const Slice& key) {
   return c;
 }
 
-uint64_t ExtractRowID(const Slice& key) {
-  if (key.size() < 34) return 0;
-  std::string row_str = key.ToString().substr(24, 10);
-  return std::stoull(row_str);
-}
+struct ThreadStats {
+  uint64_t put_ops = 0;
+  uint64_t scan_ops = 0;
+  uint64_t del_ops = 0;
+  uint64_t total_rows_scanned = 0;
+  std::vector<double> put_latencies;
+  std::vector<double> scan_latencies;
+  std::vector<double> del_latencies;
 
-bool ScanRows(DB* db, uint64_t cuid, int begin_row, int end_row_exclusive,
-              bool delta_full_scan, size_t* out_count,
-              std::vector<uint64_t>* out_rows) {
-  if (begin_row < 0 || end_row_exclusive < begin_row) {
-    return false;
+  void AddPut(double ms) {
+    put_ops++;
+    if (put_latencies.size() < 1000000) put_latencies.push_back(ms);
   }
-
-  ReadOptions ro;
-  ro.delta_full_scan = delta_full_scan;
-
-  std::string start_key = GenerateKey(cuid, begin_row);
-  std::string upper_key = GenerateKey(cuid, end_row_exclusive);
-  Slice upper_slice = upper_key;
-  ro.iterate_upper_bound = &upper_slice;
-
-  std::unique_ptr<Iterator> it(db->NewIterator(ro));
-  size_t count = 0;
-  if (out_rows != nullptr) {
-    out_rows->clear();
+  void AddScan(double ms, uint64_t rows) {
+    scan_ops++;
+    total_rows_scanned += rows;
+    if (scan_latencies.size() < 1000000) scan_latencies.push_back(ms);
   }
-
-  for (it->Seek(start_key); it->Valid(); it->Next()) {
-    if (ExtractCUID(it->key()) != cuid) break;
-    ++count;
-    if (out_rows != nullptr) {
-      out_rows->push_back(ExtractRowID(it->key()));
-    }
+  void AddDelete(double ms) {
+    del_ops++;
+    if (del_latencies.size() < 1000000) del_latencies.push_back(ms);
   }
+};
 
-  if (!it->status().ok()) {
-    return false;
-  }
+class PerfRunner {
+ public:
+  PerfRunner(rocksdb::DB* db, std::atomic<uint64_t>* next_cuid) 
+      : db_(db), next_cuid_(next_cuid) {}
 
-  if (out_count != nullptr) {
-    *out_count = count;
-  }
-  return true;
-}
+    struct CuidState {
+      uint64_t cuid;
+      bool is_hot;
+      int target_scans;
+      int puts_done = 0;
+      int scans_done = 0;
+      std::chrono::steady_clock::time_point last_scan_time = std::chrono::steady_clock::now();
+    };
 
-bool VerifySmallScan(DB* db, uint64_t cuid, int written_rows, int worker_id,
-                     bool delta_full_scan) {
-  int begin_row = std::max(0, written_rows - kSmallScanWindow);
-  int end_row = written_rows;
-  const size_t expected = static_cast<size_t>(end_row - begin_row);
+  void Run(int thread_id, std::atomic<bool>* stop, ThreadStats* stats) {
+    std::default_random_engine gen(thread_id + static_cast<int>(time(0)));
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    rocksdb::ReadOptions read_opts;
+    
+    std::vector<CuidState> active_cuids;
+    std::deque<std::pair<uint64_t, int>> pending_deletes;
+    
+    // === 100GB 目标数据量计算过程 ===
+    // 单个 CUID 数据量约：512 batch * 200 rows/batch * 72 bytes/row ≈ 7.37 MB
+    // 实现 100GB 常驻数据需 100,000 / 7.37 ≈ 13,568 个 CUID
+    // 设 16 线程，则每线程需维持 13,568 / 16 ≈ 848 个 CUID (活跃 + 待删除)
+    const size_t kMaxActiveCuids = 10;   
+    const size_t kDeleteWindowSize = 50; 
 
-  size_t actual = 0;
-  std::vector<uint64_t> rows;
-  if (!ScanRows(db, cuid, begin_row, end_row, delta_full_scan, &actual, &rows)) {
-    std::cerr << "Worker " << worker_id
-              << " small-scan failed for CUID " << cuid << std::endl;
-    return false;
-  }
+    auto add_new_cuid = [&]() {
+      uint64_t cuid = next_cuid_->fetch_add(1);
+      if (cuid > kNumCuids) return false;
+      CuidState state;
+      state.cuid = cuid;
+      state.is_hot = (((cuid * 1103515245 + 12345) / 65536) % 100 < (kHotRatio * 100));
+      state.target_scans = state.is_hot ? kHotScanTarget : kColdScanTarget;
+      active_cuids.push_back(state);
+      return true;
+    };
 
-  if (actual != expected) {
-    std::cerr << "Worker " << worker_id << " small-scan count mismatch for CUID "
-              << cuid << ", expected=" << expected << ", actual=" << actual
-              << std::endl;
-    return false;
-  }
-
-  for (size_t i = 0; i < rows.size(); ++i) {
-    uint64_t want = static_cast<uint64_t>(begin_row) + i;
-    if (rows[i] != want) {
-      std::cerr << "Worker " << worker_id
-                << " small-scan row mismatch for CUID " << cuid
-                << ", expected row=" << want << ", actual row=" << rows[i]
-                << std::endl;
-      return false;
-    }
-  }
-
-  global_stats.total_small_scans++;
-  return true;
-}
-
-bool VerifyFullScan(DB* db, uint64_t cuid, int written_rows, int worker_id,
-                    bool delta_full_scan) {
-  size_t actual = 0;
-  std::vector<uint64_t> rows;
-  if (!ScanRows(db, cuid, 0, written_rows, delta_full_scan, &actual, &rows)) {
-    std::cerr << "Worker " << worker_id
-              << " full-scan failed for CUID " << cuid << std::endl;
-    return false;
-  }
-
-  if (actual != static_cast<size_t>(written_rows)) {
-    std::cerr << "Worker " << worker_id << " full-scan count mismatch for CUID "
-              << cuid << ", expected=" << written_rows << ", actual=" << actual
-              << std::endl;
-    return false;
-  }
-
-  for (size_t i = 0; i < rows.size(); ++i) {
-    if (rows[i] != i) {
-      std::cerr << "Worker " << worker_id
-                << " full-scan row mismatch for CUID " << cuid
-                << ", expected row=" << i << ", actual row=" << rows[i]
-                << std::endl;
-      return false;
-    }
-  }
-
-  global_stats.total_full_scans++;
-  return true;
-}
-
-bool DeleteAllRows(DB* db, uint64_t cuid, int written_rows, int worker_id) {
-  WriteOptions wo;
-  for (int start = 0; start < written_rows; start += kBatchSize) {
-    int end = std::min(written_rows, start + kBatchSize);
-    WriteBatch wb;
-    for (int row = start; row < end; ++row) {
-      wb.Delete(GenerateKey(cuid, row));
+    // 1. 初始化每个线程的活跃工作池
+    for (size_t i = 0; i < kMaxActiveCuids; ++i) {
+      if (!add_new_cuid()) break;
     }
 
-    Status s = db->Write(wo, &wb);
-    if (!s.ok()) {
-      std::cerr << "Worker " << worker_id << " delete batch failed for CUID "
-                << cuid << ", range=[" << start << "," << end
-                << "), status=" << s.ToString() << std::endl;
-      return false;
-    }
-    global_stats.total_deletes += static_cast<uint64_t>(end - start);
-  }
+    while (!stop->load() && !active_cuids.empty()) {
+      // 2. 随机挑选一个没有走完生命周期的活跃 CUID
+      std::uniform_int_distribution<size_t> idx_dist(0, active_cuids.size() - 1);
+      size_t idx = idx_dist(gen);
+      auto& state = active_cuids[idx];
 
-  Status fs = db->Flush(FlushOptions());
-  if (!fs.ok()) {
-    std::cerr << "Worker " << worker_id << " flush after delete failed for CUID "
-              << cuid << ", status=" << fs.ToString() << std::endl;
-    return false;
-  }
-  return true;
-}
-
-bool VerifyEmptyAfterDelete(DB* db, uint64_t cuid, int worker_id) {
-  size_t actual = 0;
-  if (!ScanRows(db, cuid, 0, 1, false, &actual, nullptr)) {
-    std::cerr << "Worker " << worker_id
-              << " empty-scan failed for CUID " << cuid << std::endl;
-    return false;
-  }
-
-  if (actual != 0) {
-    std::cerr << "Worker " << worker_id
-              << " empty-scan found residual rows for CUID " << cuid
-              << ", actual=" << actual << std::endl;
-    return false;
-  }
-  return true;
-}
-
-void LifecycleWorker(DB* db, int worker_id) {
-  WriteOptions wo;
-  while (!stop_test) {
-    const uint64_t cuid = next_cuid.fetch_add(1);
-    int written_rows = 0;
-
-    // Stage A: write + small scans interleaving.
-    for (int b = 0; b < kTargetPutBatches && !stop_test; ++b) {
-      WriteBatch wb;
-      for (int i = 0; i < kBatchSize; ++i) {
-        wb.Put(GenerateKey(cuid, written_rows + i), "val");
+      bool do_put = false;
+      if (state.puts_done < kTargetPutBatches) {
+        if (state.scans_done < state.target_scans) {
+          // 根据进度比例交替，确保 Put 均匀分布在整个 Scan 周期中
+          if ((double)state.puts_done / kTargetPutBatches <= (double)state.scans_done / state.target_scans) {
+            do_put = true;
+          } else {
+            do_put = false;
+          }
+        } else {
+          do_put = true; // 只剩 Put 没做了
+        }
+      } else {
+        do_put = false; // 只剩 Scan 没做了
       }
 
-      Status s = db->Write(wo, &wb);
-      if (!s.ok()) {
-        std::cerr << "Worker " << worker_id << " write failed for CUID " << cuid
-                  << ", batch=" << b << ", status=" << s.ToString() << std::endl;
-        global_stats.errors++;
-        goto next_cuid_cycle;
+
+      // 3. 执行动作
+      if (do_put) {
+        DoPut(state.cuid, state.puts_done * kBatchSize, stats);
+        state.puts_done++;
+      } else {
+        bool full_scan = (dist(gen) < 0.2); // 20% Full Scan (SAC) / 80% Partial Scan
+        DoScan(state.cuid, state.puts_done * kBatchSize, full_scan, read_opts, stats, gen);
+        state.scans_done++;
+        // state.last_scan_time = now;
       }
 
-      written_rows += kBatchSize;
-      global_stats.total_writes += kBatchSize;
+      // 模拟业务节奏
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-      if ((b + 1) % kSmallScanEveryNBatches == 0) {
-        if (!VerifySmallScan(db, cuid, written_rows, worker_id,
-                             kEnableDeltaFullScan)) {
-          global_stats.errors++;
-          goto next_cuid_cycle;
+      // 4. 判断该 CUID 是否终于走完了完整的轮回
+      if (state.puts_done >= kTargetPutBatches && state.scans_done >= state.target_scans) {
+        int final_rows = state.puts_done * kBatchSize;
+        int final_scan_count = DoScan(state.cuid, final_rows, true, read_opts, stats, gen);
+        if (final_scan_count != final_rows) {
+          std::cerr << "[ERROR] Thread " << thread_id << " - CUID " << state.cuid 
+                    << " final full scan mismatch! Expected: " << final_rows 
+                    << ", Actual: " << final_scan_count << std::endl;
+        }
+        
+        // 移入延迟删除队列（不马上删，让数据有命沉淀到底层）
+        pending_deletes.push_back({state.cuid, final_rows});
+        active_cuids.erase(active_cuids.begin() + idx); 
+
+        // 补充一个新的血液到池子里
+        add_new_cuid();
+
+        // 推进删除滑动时间窗
+        if (pending_deletes.size() > kDeleteWindowSize) {
+          auto oldest = pending_deletes.front();
+          pending_deletes.pop_front();
+          DoDelete(oldest.first, oldest.second, stats);
         }
       }
     }
 
-    // Stage B: full scan.
-    if (!stop_test &&
-        !VerifyFullScan(db, cuid, written_rows, worker_id, kEnableDeltaFullScan)) {
-      global_stats.errors++;
-      goto next_cuid_cycle;
-    }
-
-    // Stage C: full delete.
-    if (!stop_test && !DeleteAllRows(db, cuid, written_rows, worker_id)) {
-      global_stats.errors++;
-      goto next_cuid_cycle;
-    }
-
-    // Stage D: empty verification scan.
-    if (!stop_test && !VerifyEmptyAfterDelete(db, cuid, worker_id)) {
-      global_stats.errors++;
-      goto next_cuid_cycle;
-    }
-
-    global_stats.total_lifecycle_completed++;
-
-  next_cuid_cycle:
-    if (kVerboseWorkerLog && !stop_test) {
-      std::cout << "Worker " << worker_id << " finished lifecycle for CUID "
-                << cuid << std::endl;
+    // 线程退出前，如果时间已经到了 (stop->load() 为 true)
+    // 那么直接放弃收尾清理 pending_deletes，以避免测试停滞无法结束。
+    // 在真实应用中系统退出也不需要把全部数据删掉。
+    if (!stop->load()) {
+      while (!pending_deletes.empty()) {
+        auto oldest = pending_deletes.front();
+        pending_deletes.pop_front();
+        DoDelete(oldest.first, oldest.second, stats);
+      }
     }
   }
-}
 
-void ManagerThread(DBImpl* db_impl) {
-  auto hotspot_mgr = db_impl->GetHotspotManager();
-  while (!stop_test) {
-    if (hotspot_mgr->HasPendingInitCuids()) {
-      db_impl->ProcessPendingHotCuids();
+ private:
+  void DoPut(uint64_t cuid, int start_row, ThreadStats* stats) {
+    rocksdb::WriteBatch batch;
+    for (int i = 0; i < kBatchSize; ++i) {
+      batch.Put(GenerateKey(cuid, start_row + i), "value_data_payload_xxxxxxxxxxxxxxxxxxxx");
     }
-    if (hotspot_mgr->HasPendingPartialMerge()) {
-      db_impl->ProcessPendingPartialMerge();
-      global_stats.total_merges++;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    auto start = std::chrono::high_resolution_clock::now();
+    rocksdb::Status s = db_->Write(rocksdb::WriteOptions(), &batch);
+    auto end = std::chrono::high_resolution_clock::now();
+    stats->AddPut(std::chrono::duration<double, std::milli>(end - start).count());
   }
-}
 
-}  // namespace
+  int DoScan(uint64_t cuid, int cur_rows, bool full_scan, const rocksdb::ReadOptions& ro, ThreadStats* stats, std::default_random_engine& gen) {
+    std::string start_key, end_key;
+    if (full_scan) {
+      start_key = GenerateKey(cuid, 0);
+      end_key = GenerateCuidUpperBoundKey(cuid);
+    } else {
+      // 随机扫描 10%-75% 的数据范围
+      if (cur_rows < 10) {
+          start_key = GenerateKey(cuid, 0);
+          end_key = GenerateKey(cuid, cur_rows);
+      } else {
+          int min_len = static_cast<int>(cur_rows * 0.1);
+          int max_len = static_cast<int>(cur_rows * 0.75);
+          std::uniform_int_distribution<int> len_dist(min_len, std::max(min_len + 1, max_len));
+          int scan_len = len_dist(gen);
+          
+          std::uniform_int_distribution<int> start_dist(0, std::max(0, cur_rows - scan_len));
+          int start_row = start_dist(gen);
+          start_key = GenerateKey(cuid, start_row);
+          end_key = GenerateKey(cuid, start_row + scan_len);
+      }
+    }
+
+    rocksdb::Slice upper_bound(end_key);
+    rocksdb::ReadOptions ro_copy = ro;
+    ro_copy.iterate_upper_bound = &upper_bound;
+    ro_copy.delta_full_scan = full_scan;
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+    rocksdb::Iterator* it = db_->NewIterator(ro_copy);
+    it->Seek(start_key);
+
+    int count = 0;
+    while (it->Valid()) {
+      if (ExtractCUID(it->key()) != cuid) break;
+      count++;
+      it->Next();
+    }
+    delete it;
+    auto t_end = std::chrono::high_resolution_clock::now();
+    stats->AddScan(std::chrono::duration<double, std::milli>(t_end - t_start).count(), count);
+
+    return count;
+  }
+
+  void DoDelete(uint64_t cuid, int total_rows, ThreadStats* stats) {
+    rocksdb::WriteOptions wo;
+    for (int i = 0; i < total_rows; ++i) {
+      auto start = std::chrono::high_resolution_clock::now();
+      db_->Delete(wo, GenerateKey(cuid, i));
+      auto end = std::chrono::high_resolution_clock::now();
+      stats->AddDelete(std::chrono::duration<double, std::milli>(end - start).count());
+    }
+  }
+
+  rocksdb::DB* db_;
+  std::atomic<uint64_t>* next_cuid_;
+};
+
+void ReportStats(const std::string& label, const std::vector<ThreadStats>& all_stats) {
+  uint64_t total_puts = 0, total_scans = 0, total_dels = 0, total_rows = 0;
+  std::vector<double> all_put_lat, all_scan_lat, all_del_lat;
+  
+  for (const auto& s : all_stats) {
+    total_puts += s.put_ops;
+    total_scans += s.scan_ops;
+    total_dels += s.del_ops;
+    total_rows += s.total_rows_scanned;
+    all_put_lat.insert(all_put_lat.end(), s.put_latencies.begin(), s.put_latencies.end());
+    all_scan_lat.insert(all_scan_lat.end(), s.scan_latencies.begin(), s.scan_latencies.end());
+    all_del_lat.insert(all_del_lat.end(), s.del_latencies.begin(), s.del_latencies.end());
+  }
+
+  auto get_avg = [](std::vector<double>& latencies) {
+    if (latencies.empty()) return 0.0;
+    double sum = 0;
+    for (double d : latencies) sum += d;
+    return sum / latencies.size();
+  };
+
+  auto get_p99 = [](std::vector<double>& latencies) {
+    if (latencies.empty()) return 0.0;
+    std::sort(latencies.begin(), latencies.end());
+    return latencies[static_cast<size_t>(latencies.size() * 0.99)];
+  };
+
+  std::cout << "\n--- " << label << " Results ---" << std::endl;
+  std::cout << "Put (Batch 128) Ops: " << total_puts << ", Avg Lat: " << std::fixed << std::setprecision(3) << get_avg(all_put_lat) << " ms, P99 Lat: " << get_p99(all_put_lat) << " ms" << std::endl;
+  std::cout << "Scan Ops: " << total_scans << ", Avg Lat: " << get_avg(all_scan_lat) << " ms, P99 Lat: " << get_p99(all_scan_lat) << " ms" << std::endl;
+  std::cout << "Delete Ops: " << total_dels << ", Avg Lat: " << get_avg(all_del_lat) << " ms, P99 Lat: " << get_p99(all_del_lat) << " ms" << std::endl;
+  std::cout << "Throughput: " << (kTestDurationSec > 0 ? total_rows / kTestDurationSec : 0) << " rows/s" << std::endl;
+}
 
 int main() {
-  stop_test = false;
-  next_cuid = 1001;
-  global_stats.total_writes.store(0);
-  global_stats.total_small_scans.store(0);
-  global_stats.total_full_scans.store(0);
-  global_stats.total_deletes.store(0);
-  global_stats.total_lifecycle_completed.store(0);
-  global_stats.total_merges.store(0);
-  global_stats.errors.store(0);
+  CleanupDBPath(kNativeDBPath);
+  CleanupDBPath(kDeltaDBPath);
 
-  Options options;
-  options.create_if_missing = true;
-  options.enable_delta = true;
-  options.delta_options.enable_partition = true;
+  std::atomic<uint64_t> next_cuid_counter{1};
 
-  options.delta_options.hotspot_scan_threshold = 200;
-  options.delta_options.hotspot_scan_window_sec = 300;
-  options.delta_options.delta_merge_threshold = 3;
-  options.delta_options.sac_delta_count_threshold = 5;
-  options.delta_options.sharding_count = 64;
-  options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
-  options.delta_options.hot_data_buffer_shards = 128;
-  options.delta_options.compaction_l0_trigger_count = 20;
-  options.delta_options.compaction_l0_trigger_age_sec = 3600;
-  options.delta_options.compaction_l0_files_to_pick = 10;
-  options.num_levels = 1;
-  options.level0_file_num_compaction_trigger = 20;
-  options.level_compaction_dynamic_level_bytes = false;
+  auto run_benchmark = [&](const std::string& path, bool delta_enabled, const std::string& label) {
+    rocksdb::Options options;
+    options.create_if_missing = true;
+    options.statistics = rocksdb::CreateDBStatistics();
+    
+    if (delta_enabled) {
+      options.enable_delta = true;
 
-  DestroyDB(kDBPath, options);
+      // --- Example 1: Programmatic Configuration of DeltaOptions ---
+      // These can be set directly on the options object before opening the DB.
+      options.delta_options.hotspot_scan_threshold = 200;
+      options.delta_options.hotspot_scan_window_sec = 300;
+      options.delta_options.delta_merge_threshold = 3;
+      options.delta_options.sac_delta_count_threshold = 5;
+      options.delta_options.sharding_count = 64; // Power of 2 recommended
+      options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
+      options.delta_options.hot_data_buffer_shards = 128;
+      options.delta_options.compaction_l0_trigger_count = 30;
+      options.delta_options.compaction_l0_trigger_age_sec = 3600;
+      options.delta_options.compaction_l0_files_to_pick = 10;
+      // -------------------------------------------------------------
+      options.level0_slowdown_writes_trigger = 200; // l0 file count thres
+      options.level0_stop_writes_trigger = 400; // l0 file count thres
+      options.level0_file_num_compaction_trigger = 100; // l0 file count thres
+      options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
+      options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
+      options.max_background_jobs = 16; // 与写入线程相同？
+      options.num_levels = 1;
+      options.level_compaction_dynamic_level_bytes = false;
+    } else {
+      options.enable_delta = false;
+      options.max_background_jobs = 16;
+    }
 
-  DB* db = nullptr;
-  Status s = DB::Open(options, kDBPath, &db);
-  if (!s.ok()) {
-    std::cerr << "Open failed: " << s.ToString() << std::endl;
-    return 1;
-  }
+    rocksdb::DestroyDB(path, options);
+    
+    rocksdb::DB* db;
+    rocksdb::Status s = rocksdb::DB::Open(options, path, &db);
+    if (!s.ok()) {
+      std::cerr << "Open " << label << " failed: " << s.ToString() << std::endl;
+      return;
+    }
 
-  DBImpl* db_impl = static_cast<DBImpl*>(db);
+    std::cout << ">>> Running " << label << " (Duration: " << kTestDurationSec << "s) <<<" << std::endl;
+    next_cuid_counter.store(1);
 
-  if (kTestDurationSec > 0) {
-    std::cout << "Starting lifecycle stress test for " << kTestDurationSec
-              << " seconds..." << std::endl;
-  } else {
-    std::cout << "Starting lifecycle stress test with NO time limit..."
-              << std::endl;
-  }
-  std::cout << "Model: write+small-scan -> full-scan -> full-delete -> empty-scan"
-            << std::endl;
+    std::atomic<bool> stop{false};
+    std::vector<ThreadStats> all_thread_stats(kNumThreads);
+    std::vector<std::thread> workers;
+    PerfRunner runner(db, &next_cuid_counter);
 
-  std::vector<std::thread> workers;
-  workers.reserve(kWorkerThreads);
-  for (int i = 0; i < kWorkerThreads; ++i) {
-    workers.emplace_back(LifecycleWorker, db, i + 1);
-  }
-  std::thread manager(ManagerThread, db_impl);
+    for (int i = 0; i < kNumThreads; i++) {
+      workers.emplace_back(&PerfRunner::Run, &runner, i, &stop, &all_thread_stats[i]);
+    }
 
-  auto start_time = std::chrono::steady_clock::now();
-  while (kTestDurationSec <= 0 ||
-         std::chrono::steady_clock::now() - start_time <
-             std::chrono::seconds(kTestDurationSec)) {
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-    std::cout << "Stats: Writes=" << global_stats.total_writes
-              << ", SmallScans=" << global_stats.total_small_scans
-              << ", FullScans=" << global_stats.total_full_scans
-              << ", Deletes=" << global_stats.total_deletes
-              << ", Lifecycles=" << global_stats.total_lifecycle_completed
-              << ", Merges=" << global_stats.total_merges
-              << ", Errors=" << global_stats.errors << std::endl;
-  }
+    std::this_thread::sleep_for(std::chrono::seconds(kTestDurationSec));
+    stop.store(true);
+    for (auto& t : workers) t.join();
 
-  stop_test = true;
-  for (auto& t : workers) {
-    t.join();
-  }
-  manager.join();
+    ReportStats(label, all_thread_stats);
+    
+    // Output comprehensive DB statistics
+    std::string stats;
+    if (db->GetProperty(rocksdb::DB::Properties::kStats, &stats)) {
+      std::cout << "\n=== DB Statistics for " << label << " ===\n";
+      std::cout << stats << std::endl;
+      std::cout << "=====================================\n";
+    }
 
-  std::cout << "Lifecycle stress test completed." << std::endl;
-  uint64_t final_errors = global_stats.errors;
-  if (final_errors > 0) {
-    std::cout << "Test FAILED with " << final_errors << " errors." << std::endl;
-  } else {
-    std::cout << "Test PASSED." << std::endl;
-  }
+    // Output Level Stats clearly
+    std::string level_stats;
+    if (db->GetProperty(rocksdb::DB::Properties::kLevelStats, &level_stats)) {
+      std::cout << "\n=== Level File Count Statistics (" << label << ") ===\n";
+      std::cout << level_stats << std::endl;
+      std::cout << "=====================================\n";
+    }
 
-  delete db;
-  return final_errors == 0 ? 0 : 1;
+    delete db;
+  };
+
+  run_benchmark(kDeltaDBPath, true, "DELTA MODE");
+  run_benchmark(kNativeDBPath, false, "NATIVE MODE");
+
+  return 0;
 }
