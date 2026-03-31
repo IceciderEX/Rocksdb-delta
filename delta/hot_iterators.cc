@@ -842,7 +842,11 @@ DeltaSwitchingIterator::DeltaSwitchingIterator(
       cold_iter_(nullptr),
       hot_iter_(nullptr),
       current_hot_cuid_(0),
-      is_hot_mode_(false) {}
+      is_hot_mode_(false) {
+  if (version_) {
+    version_->Ref();
+  }
+}
 
 DeltaSwitchingIterator::~DeltaSwitchingIterator() {
   if (hot_iter_) {
@@ -855,6 +859,9 @@ DeltaSwitchingIterator::~DeltaSwitchingIterator() {
     } else {
       delete cold_iter_;
     }
+  }
+  if (version_) {
+    version_->Unref();
   }
 }
 
@@ -884,9 +891,17 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
 
   // 1. 获取元数据
   HotIndexEntry entry;
-  if (!hotspot_manager_->GetHotIndexEntry(cuid, &entry) ||
-      !entry.HasSnapshot()) {
-    // 如果没有 Snapshot，使用 cold path
+  if (!hotspot_manager_->GetHotIndexEntry(cuid, &entry)) {
+    if (read_options_.enable_delta_diag_logging) {
+      fprintf(stderr, "[DIAG_HOT_PATH] CUID %lu: InitHotIter failed - No Index Entry found\n", cuid);
+    }
+    return false;
+  }
+
+  if (!entry.HasSnapshot()) {
+    if (read_options_.enable_delta_diag_logging) {
+      fprintf(stderr, "[DIAG_HOT_PATH] CUID %lu: InitHotIter failed - No Snapshot segments yet (Initial scan might be in progress)\n", cuid);
+    }
     return false;
   }
 
@@ -921,6 +936,9 @@ void DeltaSwitchingIterator::Seek(const Slice& target) {
       is_hot_mode_ = true;
     } else {
       // 热点索引尚未建立（如 Init Scan 还在进行中），回退到 Cold Path
+      if (read_options_.enable_delta_diag_logging) {
+        fprintf(stderr, "[DIAG_HOT_PATH] CUID %lu: IsHot=true but InitHotIter failed. Falling back to Cold Path.\n", cuid);
+      }
       InitColdIter();
       current_iter_ = cold_iter_;
       is_hot_mode_ = false;
@@ -928,6 +946,9 @@ void DeltaSwitchingIterator::Seek(const Slice& target) {
   }
   // 既不是 skip_hot_path 也不是热点，默认走冷路径
   else {
+    if (cuid != 0 && read_options_.enable_delta_diag_logging) {
+        fprintf(stderr, "[DIAG_HOT_PATH] CUID %lu: IsHot=false. Using Cold Path.\n", cuid);
+    }
     InitColdIter();
     current_iter_ = cold_iter_;
     is_hot_mode_ = false;

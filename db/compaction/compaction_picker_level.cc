@@ -527,9 +527,9 @@ void LevelCompactionBuilder::SetupInitialFilesDelta() {
 }
 
 // for delta
-// 选取最老的 N 个文件进行 L0->L0 合并
+// 目前的策略：选取最老的 N 个文件进行 L0->L0 合并
 bool LevelCompactionBuilder::PickMixedL0Compaction() {
-  // 策略阈值
+  // compaction策略阈值
   const int kL0TriggerCount =
       mutable_cf_options_.delta_options.compaction_l0_trigger_count;
   const uint64_t kL0TriggerAge =
@@ -588,7 +588,6 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
     }
     start_level_inputs_.files.push_back(f);
   }
-
 
   compaction_reason_ = CompactionReason::kLevelL0FilesNum; // 借用Reason
 
