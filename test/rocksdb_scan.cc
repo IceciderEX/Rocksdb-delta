@@ -72,43 +72,52 @@ uint64_t ExtractRowID(const Slice& key) {
 }
 
 std::string FormatKeyDisplay(const Slice& key) {
-  std::string cuid_part = std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
+  std::string cuid_part =
+      std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
   std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
   return cuid_part + "..." + suffix;
 }
 
 void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
-  uint64_t next_row_per_cuid[10] = {0};
+  uint64_t next_rid = 0;
+  uint64_t target_cuid = 1003;
   WriteOptions wo;
   while (!stop_test) {
-    for (size_t i = 0; i < cuids.size(); ++i) {
-      uint64_t cuid = 1003; // User hardcoded CUID
-      WriteBatch batch;
-      {
-        std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
-        for (int k = 0; k < 512; ++k) {
-          uint64_t rid = next_row_per_cuid[i]++;
-          batch.Put(GenerateKey(cuid, rid), "val_xxxxxxxxxxxxxxxx_" + std::to_string(rid));
-          // ground_truths[cuid]->row_ids.insert(rid);
-        }
+    WriteBatch batch;
+    uint64_t batch_start_rid = next_rid;
+    int batch_size = 512;
+
+    {
+      std::lock_guard<std::mutex> lock(ground_truths[target_cuid]->mtx);
+      for (int k = 0; k < batch_size; ++k) {
+        uint64_t rid = next_rid++;
+        batch.Put(GenerateKey(target_cuid, rid),
+                  "val_xxxxxxxxxxxxxxxx_" + std::to_string(rid));
       }
-      db->Write(wo, &batch);
-      for (uint64_t rid = next_row_per_cuid[i] - 512; rid < next_row_per_cuid[i]; ++rid) {
-        ground_truths[cuid]->row_ids.insert(rid);
-      }
-      global_stats.total_writes += 512;
     }
+    db->Write(wo, &batch);
+    for (uint64_t rid = batch_start_rid; rid < next_rid; ++rid) {
+      ground_truths[target_cuid]->row_ids.insert(rid);
+    }
+    global_stats.total_writes += batch_size;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 }
 
 void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
   ReadOptions ro;
+  // 仅让其中一个 Reader 输出调试日志，避免多线程日志堆叠
+  if (id == 1) {
+    ro.enable_delta_diag_logging = true;
+  }
+
   while (!stop_test) {
     uint64_t cuid = 1003;
     ro.delta_full_scan = (rand() % 2 == 0);
-    std::cout << "[Reader " << id << "] Starting scan for CUID " << cuid
-              << ", delta_full_scan=" << ro.delta_full_scan << std::endl;
+    if (ro.enable_delta_diag_logging) {
+      std::cout << "[Reader " << id << "] Starting scan for CUID " << cuid
+                << ", delta_full_scan=" << ro.delta_full_scan << std::endl;
+    }
 
     std::string start_key = GenerateKey(cuid, 0);
     std::string upper_bound = GenerateKey(cuid + 1, 0);
@@ -141,7 +150,7 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
         }
       }
 
-      if (!missing.empty()) {
+      if (!missing.empty() && ro.enable_delta_diag_logging) {
         if (missing.size() <= 10) {
           for (uint64_t rid : missing) {
             std::cerr << "Reader " << id << " error: Missing row " << rid
@@ -167,7 +176,7 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
 
         // Diagnostic: dump HotIndexEntry state
         auto hotspot_mgr = dynamic_cast<DBImpl*>(db)->GetHotspotManager();
-        if (hotspot_mgr) {
+        if (hotspot_mgr && ro.enable_delta_diag_logging) {
           HotIndexEntry diag_entry;
           if (hotspot_mgr->GetHotIndexEntry(cuid, &diag_entry)) {
             std::cerr << "[DIAG] CUID " << cuid << " snapshot_segments="
@@ -199,7 +208,8 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
           // auto* buf_iter = hotspot_mgr->NewBufferIterator(cuid, nullptr);
           // if (buf_iter) {
           //   size_t buf_count = 0;
-          //   for (buf_iter->SeekToFirst(); buf_iter->Valid(); buf_iter->Next()) {
+          //   for (buf_iter->SeekToFirst(); buf_iter->Valid();
+          //   buf_iter->Next()) {
           //     buf_count++;
           //   }
           //   std::cerr << "[DIAG] Buffer data count for CUID " << cuid << ": "
@@ -212,48 +222,46 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
           std::unique_ptr<Iterator> it2(db->NewIterator(ro));
           for (it2->Seek(start_key); it2->Valid(); it2->Next()) {
             if (ExtractCUID(it2->key()) != cuid) break;
-            if (count % mod == 0) std::cout << "Reader " << id << ": " << FormatKeyDisplay(it2->key()) << std::endl;
+            if (count % mod == 0)
+              std::cout << "Reader " << id << ": "
+                        << FormatKeyDisplay(it2->key()) << std::endl;
             found.insert(ExtractRowID(it2->key()));
             count++;
           }
           int i = 0;
           count = i;
-        }
-      } 
-      else {
-        if (rand() % 100 < 5) {
-          auto hotspot_mgr = dynamic_cast<DBImpl*>(db)->GetHotspotManager();
-          if (hotspot_mgr) {
-            HotIndexEntry diag_entry;
-            if (hotspot_mgr->GetHotIndexEntry(cuid, &diag_entry)) {
-              std::cerr << "[DIAG] CUID " << cuid << " snapshot_segments="
-                        << diag_entry.snapshot_segments.size()
-                        << " deltas=" << diag_entry.deltas.size() << std::endl;
-              for (size_t si = 0; si < diag_entry.snapshot_segments.size();
-                  si++) {
-                const auto& seg = diag_entry.snapshot_segments[si];
-                std::cerr << "[DIAG]   snap[" << si
-                          << "] file=" << (int64_t)seg.file_number
-                          << " first_key=" << FormatKeyDisplay(seg.first_key)
-                          << " last_key=" << FormatKeyDisplay(seg.last_key)
-                          << std::endl;
-              }
-              for (size_t di = 0; di < diag_entry.deltas.size(); di++) {
-                const auto& seg = diag_entry.deltas[di];
-                std::cerr << "[DIAG]   delta[" << di
-                          << "] file=" << (int64_t)seg.file_number
-                          << " first_key=" << FormatKeyDisplay(seg.first_key)
-                          << " last_key=" << FormatKeyDisplay(seg.last_key)
-                          << std::endl;
-              }
-            } else {
-              std::cerr << "[DIAG] CUID " << cuid << " has NO HotIndexEntry!"
-                        << std::endl;
-            }
+        } 
+      } else if (rand() % 100 < 2 && ro.enable_delta_diag_logging) {
+        // Log diagnostic information for a small percentage of scans
+        auto hotspot_mgr = dynamic_cast<DBImpl*>(db)->GetHotspotManager();
+        HotIndexEntry diag_entry;
+        if (hotspot_mgr->GetHotIndexEntry(cuid, &diag_entry)) {
+          std::cerr << "[DIAG] CUID " << cuid << " snapshot_segments="
+                    << diag_entry.snapshot_segments.size()
+                    << " deltas=" << diag_entry.deltas.size() << std::endl;
+          for (size_t si = 0; si < diag_entry.snapshot_segments.size();
+                si++) {
+            const auto& seg = diag_entry.snapshot_segments[si];
+            std::cerr << "[DIAG]   snap[" << si
+                      << "] file=" << (int64_t)seg.file_number
+                      << " first_key=" << FormatKeyDisplay(seg.first_key)
+                      << " last_key=" << FormatKeyDisplay(seg.last_key)
+                      << std::endl;
           }
+          for (size_t di = 0; di < diag_entry.deltas.size(); di++) {
+            const auto& seg = diag_entry.deltas[di];
+            std::cerr << "[DIAG]   delta[" << di
+                      << "] file=" << (int64_t)seg.file_number
+                      << " first_key=" << FormatKeyDisplay(seg.first_key)
+                      << " last_key=" << FormatKeyDisplay(seg.last_key)
+                      << std::endl;
+          }
+        } else {
+          std::cerr << "[DIAG] CUID " << cuid << " has NO HotIndexEntry!"
+                    << std::endl;
         }
       }
-    } 
+    }
     global_stats.total_scans++;
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
@@ -286,18 +294,18 @@ int main() {
   options.delta_options.hotspot_scan_window_sec = 300;
   options.delta_options.delta_merge_threshold = 3;
   options.delta_options.sac_delta_count_threshold = 5;
-  options.delta_options.sharding_count = 64; // Power of 2 recommended
+  options.delta_options.sharding_count = 64;  // Power of 2 recommended
   options.delta_options.hot_data_buffer_threshold_bytes = 8 * 1024 * 1024;
   options.delta_options.hot_data_buffer_shards = 128;
   options.delta_options.compaction_l0_trigger_count = 20;
   options.delta_options.compaction_l0_trigger_age_sec = 3600;
   options.delta_options.compaction_l0_files_to_pick = 10;
   // -------------------------------------------------------------
-  options.level0_slowdown_writes_trigger = 1000; // l0 file count thres
-  options.level0_stop_writes_trigger = 2000; // l0 file count thres
-  options.level0_file_num_compaction_trigger = 100; // l0 file count thres
-  options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
-  options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
+  options.level0_slowdown_writes_trigger = 1000;     // l0 file count thres
+  options.level0_stop_writes_trigger = 2000;         // l0 file count thres
+  options.level0_file_num_compaction_trigger = 100;  // l0 file count thres
+  options.soft_pending_compaction_bytes_limit = 0;   // 0 表示无限制
+  options.hard_pending_compaction_bytes_limit = 0;   // 0 表示无限制
   options.num_levels = 1;
   options.level0_file_num_compaction_trigger = 20;
   options.level_compaction_dynamic_level_bytes = false;
@@ -321,7 +329,7 @@ int main() {
   std::thread writer(WriterThread, db, cuids);
   std::thread reader1(ReaderThread, db, cuids, 1);
   std::thread reader2(ReaderThread, db, cuids, 2);
-  // std::thread reader3(ReaderThread, db, cuids, 3);
+  std::thread reader3(ReaderThread, db, cuids, 3);
   std::thread manager(ManagerThread, db_impl);
 
   auto start_time = std::chrono::steady_clock::now();
@@ -338,7 +346,7 @@ int main() {
   writer.join();
   reader1.join();
   reader2.join();
-  // reader3.join();
+  reader3.join();
   manager.join();
 
   std::cout << "Stress Test Completed." << std::endl;

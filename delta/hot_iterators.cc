@@ -267,10 +267,12 @@ void HotSnapshotIterator::UnrefSegments(const std::vector<DataSegment>& segs) {
 
 void HotSnapshotIterator::LogSegmentExit(const char* reason) {
   if (current_segment_index_ != -1) {
-    fprintf(stderr,
-            "[DIAG_ITER] CUID %lu: Finished Segment %d (%s). File number %lu. Range [%s, %s]. Read %lu records total.\n",
-            cuid_, current_segment_index_, reason, segments_[current_segment_index_].file_number, 
-            FormatKeyDisplay(segments_[current_segment_index_].first_key).c_str(), FormatKeyDisplay(segments_[current_segment_index_].last_key).c_str(), current_segment_read_count_);
+    if (read_options_.enable_delta_diag_logging) {
+      fprintf(stderr,
+              "[DIAG_ITER] CUID %lu: Finished Segment %d (%s). File number %lu. Range [%s, %s]. Read %lu records total.\n",
+              cuid_, current_segment_index_, reason, segments_[current_segment_index_].file_number, 
+              FormatKeyDisplay(segments_[current_segment_index_].first_key).c_str(), FormatKeyDisplay(segments_[current_segment_index_].last_key).c_str(), current_segment_read_count_);
+    }
   }
   current_segment_read_count_ = 0;
 }
@@ -359,10 +361,12 @@ HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
     }
 
     // [DIAG] Reset count moved to caller (Next/Seek) for correct logging
-    fprintf(stderr, "[DIAG_ITER] CUID %lu: Entering Segment %zu (File %lu). Range: [%s - %s]\n",
-            cuid_, index, seg.file_number,
-            FormatKeyDisplay(segments_[index].first_key).c_str(),
-            FormatKeyDisplay(segments_[index].last_key).c_str());
+    if (read_options_.enable_delta_diag_logging) {
+      fprintf(stderr, "[DIAG_ITER] CUID %lu: Entering Segment %zu (File %lu). Range: [%s - %s]\n",
+              cuid_, index, seg.file_number,
+              FormatKeyDisplay(segments_[index].first_key).c_str(),
+              FormatKeyDisplay(segments_[index].last_key).c_str());
+    }
 
     return SegmentInitStatus::kSuccess;
   }
@@ -436,15 +440,17 @@ void HotSnapshotIterator::Seek(const Slice& target) {
     }
 
     // [DIAG] Log where Seek landed
-    std::string landed_key = current_iter_->Valid()
-                                 ? FormatKeyDisplay(current_iter_->key())
-                                 : "N/A";
-    // fprintf(stderr,
-    //         "[DIAG_SEEK] CUID %lu Seek landed at Segment %d (File %lu). "
-    //         "Valid: %d, Landed: %s\n",
-    //         cuid_, current_segment_index_,
-    //         segments_[current_segment_index_].file_number,
-    //         current_iter_->Valid(), landed_key.c_str());
+    if (read_options_.enable_delta_diag_logging) {
+      std::string landed_key = current_iter_->Valid()
+                                   ? FormatKeyDisplay(current_iter_->key())
+                                   : "N/A";
+      fprintf(stderr,
+              "[DIAG_SEEK] CUID %lu Seek landed at Segment %d (File %lu). "
+              "Valid: %d, Landed: %s\n",
+              cuid_, current_segment_index_,
+              segments_[current_segment_index_].file_number,
+              current_iter_->Valid(), landed_key.c_str());
+    }
 
 
 
@@ -691,15 +697,17 @@ void HotSnapshotIterator::SeekToFirst() {
     current_iter_->Seek(segments_[current_segment_index_].first_key);
 
     // [DIAG] Log SeekToFirst landing
-    std::string landed_key = current_iter_->Valid()
-                                 ? FormatKeyDisplay(current_iter_->key())
-                                 : "N/A";
-    fprintf(stderr,
-            "[DIAG_SEEK] CUID %lu SeekToFirst landed at Segment %d (File %lu). "
-            "Valid: %d, Landed: %s\n",
-            cuid_, current_segment_index_, 
-            segments_[current_segment_index_].file_number,
-            current_iter_->Valid(), landed_key.c_str());
+    if (read_options_.enable_delta_diag_logging) {
+      std::string landed_key = current_iter_->Valid()
+                                   ? FormatKeyDisplay(current_iter_->key())
+                                   : "N/A";
+      fprintf(stderr,
+              "[DIAG_SEEK] CUID %lu SeekToFirst landed at Segment %d (File %lu). "
+              "Valid: %d, Landed: %s\n",
+              cuid_, current_segment_index_, 
+              segments_[current_segment_index_].file_number,
+              current_iter_->Valid(), landed_key.c_str());
+    }
     
     // [DIAG] Initialize count for the new start position
     if (current_iter_->Valid()) {

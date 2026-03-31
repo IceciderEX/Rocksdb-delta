@@ -2331,6 +2331,8 @@ struct ReadOptions {
   bool skip_hot_path = false;
   // 用于标记是否为系统后台触发的 Metadata Scan，如果是，则不执行缓冲和替换
   bool is_metadata_scan = false;
+  // 启用热数据路径的诊断日志（如段切换、计数等），仅用于调试
+  bool enable_delta_diag_logging = false;
 
   ReadOptions() {}
   ReadOptions(bool _verify_checksums, bool _fill_cache);

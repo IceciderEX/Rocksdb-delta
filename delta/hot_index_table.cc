@@ -165,6 +165,34 @@ void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {
   {
     Shard& shard = GetShard(cuid);
     std::unique_lock<std::shared_mutex> lock(shard.mutex);
+    auto& entry = shard.table[cuid];
+
+    // 异常检测 1：时序倒挂检测 (Row ID 顺序)
+    if (!entry.deltas.empty()) {
+      const auto& last_delta = entry.deltas.back();
+      // 使用 string 比较，因为我们的 key 格式保证了 string 比较等效于 Row ID 比较
+      if (delta.first_key < last_delta.last_key) {
+        fprintf(stderr,
+                "[WARNING_DELTA_ORDER] CUID %lu: New Delta (File %lu) starts at "
+                "%s, but previous Delta (File %lu) ended at %s!\n",
+                cuid, delta.file_number, FormatKeyDisplay(delta.first_key).c_str(),
+                last_delta.file_number,
+                FormatKeyDisplay(last_delta.last_key).c_str());
+      }
+    }
+
+    // 异常检测 2：检测异常大的 Key Range (疑似 L0 Flush 进入 Delta)
+    uint64_t first_rid = ExtractRowID(delta.first_key);
+    uint64_t last_rid = ExtractRowID(delta.last_key);
+    if (last_rid > first_rid + 50000) { // 阈值设为 50,000
+      fprintf(stderr,
+              "[WARNING_HUGE_DELTA] CUID %lu: Delta (File %lu) has suspicious "
+              "large range: %lu rows! [%s - %s]\n",
+              cuid, delta.file_number, (last_rid - first_rid + 1),
+              FormatKeyDisplay(delta.first_key).c_str(),
+              FormatKeyDisplay(delta.last_key).c_str());
+    }
+
     shard.table[cuid].deltas.push_back(delta);
   }
 
@@ -172,6 +200,7 @@ void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {
   //   lifecycle_manager_->Ref(delta.file_number);
   // }
 }
+
 
 bool HotIndexTable::GetEntry(uint64_t cuid, HotIndexEntry* entry) const {
   const Shard& shard = GetShard(cuid);
@@ -343,6 +372,18 @@ void HotIndexTable::UpdateDeltaIndex(uint64_t cuid,
     } else {
       ++it;
     }
+  }
+
+  // 异常检测：由于合并产生的新端 range 过大检测
+  uint64_t first_rid = ExtractRowID(new_delta.first_key);
+  uint64_t last_rid = ExtractRowID(new_delta.last_key);
+  if (last_rid > first_rid + 50000) {  // 阈值设为 50,000
+    fprintf(stderr,
+            "[WARNING_HUGE_DELTA_COMPACT] CUID %lu: New Compact Delta (File %lu) "
+            "has large range: %lu rows! [%s - %s]\n",
+            cuid, new_delta.file_number, last_rid - first_rid + 1,
+            FormatKeyDisplay(new_delta.first_key).c_str(),
+            FormatKeyDisplay(new_delta.last_key).c_str());
   }
 
   // 加入 new delta index
