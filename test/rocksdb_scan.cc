@@ -1,62 +1,74 @@
 /**
- * rocksdb_partial_merge_test.cc
+ * rocksdb_perf_test.cc
  *
- * 测试 Scan-as-Compaction 的 kPartialMerge 策略
- * 验证：
- * 1. skip_hot_path 选项正确绕过热点路径
- * 2. ProcessPendingHotCuids 能正确建立初始 snapshot
- * 3. kPartialMerge 策略在部分扫描时正确触发
- * 4. ProcessPendingPartialMerge 能正确归并数据
+ * RocksDB-delta 高性能并发测试工具 (重构版 - 顺序生命周期模型)
+ * 场景：16线程并发, 8分钟持续运行, 10W CUID, 15/77 负载分布
+ * 逻辑：每线程领取一个 CUID 走完“增删改查”一生，所有 CUID 行数保持一致 (~2.5W行)。
  */
 
-#include <cassert>
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <random>
 #include <string>
 #include <thread>
+#include <filesystem>
 #include <vector>
 
-#include "db/db_impl/db_impl.h"
-#include "delta/hot_index_table.h"
-#include "delta/hotspot_manager.h"
 #include "rocksdb/db.h"
-#include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
-#include "rocksdb/table.h"
-
-using namespace ROCKSDB_NAMESPACE;
-
-const std::string kDBPath = "/home/wam/Rocksdb-delta/db_tmp";
+#include "rocksdb/write_batch.h"
 
 // ==========================================
-// 辅助工具函数
+// 配置常量
 // ==========================================
+const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_native";
+const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_delta";
+const int kNumThreads = 16;
+const int kTestDurationSec = 240;       // 8 分钟
+const int kNumCuids = 100000;           // 10W CUID 总库
+const int kBatchSize = 128;             // 每次 Put 128 行
+const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (约 25,600 行)
+const double kHotRatio = 0.15;          // 15% 的热点
+const int kHotScanTarget = 1000;        // 热点访问目标
+const int kColdScanTarget = 150;        // 普通访问目标
+
+// ==========================================
+// 辅助工具与状态管理
+// ==========================================
+
+bool CleanupDBPath(const std::string& path) {
+  std::error_code ec;
+  if (path != kNativeDBPath && path != kDeltaDBPath) {
+    std::cerr << "Refusing to delete non-test path: " << path << std::endl;
+    return false;
+  }
+  std::filesystem::remove_all(path, ec);
+  return true;
+}
+
 std::string GenerateKey(uint64_t cuid, int row_id) {
   std::string key;
   key.resize(40);
   std::memset(&key[0], 0, 40);
-
   unsigned char* p = reinterpret_cast<unsigned char*>(&key[0]) + 16;
   for (int i = 0; i < 8; ++i) {
-    p[i] = (cuid >> (56 - 8 * i)) & 0xFF;
+    p[i] = (cuid >> (56 - 8 * i)) & 0xFF; // Big Endian
   }
-
-  // 使用固定10位宽度格式，确保字典序=数字序
-  // "123" -> "0000000123"
   char row_buf[16];
   snprintf(row_buf, sizeof(row_buf), "%010d", row_id);
   std::memcpy(&key[24], row_buf, 10);
-
   return key;
 }
 
-uint64_t ExtractCUID(const Slice& key) {
+uint64_t ExtractCUID(const rocksdb::Slice& key) {
   if (key.size() < 24) return 0;
-  const unsigned char* p =
-      reinterpret_cast<const unsigned char*>(key.data()) + 16;
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(key.data()) + 16;
   uint64_t c = 0;
   for (int i = 0; i < 8; ++i) {
     c = (c << 8) | p[i];
@@ -64,409 +76,261 @@ uint64_t ExtractCUID(const Slice& key) {
   return c;
 }
 
-void Check(bool condition, const std::string& msg) {
-  if (condition) {
-    std::cout << "[PASS] " << msg << std::endl;
-  } else {
-    std::cerr << "[FAIL] " << msg << std::endl;
-    exit(1);
+struct ThreadStats {
+  uint64_t put_ops = 0;
+  uint64_t scan_ops = 0;
+  uint64_t del_ops = 0;
+  uint64_t total_rows_scanned = 0;
+  std::vector<double> put_latencies;
+  std::vector<double> scan_latencies;
+  std::vector<double> del_latencies;
+
+  void AddPut(double ms) {
+    put_ops++;
+    if (put_latencies.size() < 1000000) put_latencies.push_back(ms);
   }
-}
-
-std::string FormatKeyDisplay(const Slice& key) {
-  std::string cuid_part = std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
-  std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
-  return cuid_part + "..." + suffix;
-}
-
-std::string GenerateUpperBoundKey(uint64_t cuid) {
-  return GenerateKey(cuid + 1, 0);
-}
-
-// 全量扫描
-int PerformFullScan(DB* db, uint64_t cuid) {
-  ReadOptions ro;
-  ro.delta_full_scan = true;
-
-  std::string upper_bound_str = GenerateUpperBoundKey(cuid);
-  Slice upper_bound = upper_bound_str;
-  ro.iterate_upper_bound = &upper_bound;
-
-  Iterator* it = db->NewIterator(ro);
-  std::string start_key = GenerateKey(cuid, 0);
-
-  int count = 0;
-  for (it->Seek(start_key); it->Valid(); it->Next()) {
-    // std::cout << "Full Scan Key: " << FormatKeyDisplay(it->key()) << std::endl;
-    if (ExtractCUID(it->key()) != cuid) break;
-    count++;
+  void AddScan(double ms, uint64_t rows) {
+    scan_ops++;
+    total_rows_scanned += rows;
+    if (scan_latencies.size() < 1000000) scan_latencies.push_back(ms);
   }
-
-  Status s = it->status();
-  delete it;
-  if (!s.ok()) {
-    std::cerr << "Full scan error: " << s.ToString() << std::endl;
+  void AddDelete(double ms) {
+    del_ops++;
+    if (del_latencies.size() < 1000000) del_latencies.push_back(ms);
   }
-  return count;
-}
+};
 
-// 部分扫描 (指定 row_id 范围)
-int PerformPartialScan(DB* db, uint64_t cuid, int start_row, int end_row) {
-  ReadOptions ro;
-  ro.delta_full_scan = false;  // 部分扫描不设置 full_scan
+class PerfRunner {
+ public:
+  PerfRunner(rocksdb::DB* db, std::atomic<uint64_t>* next_cuid) 
+      : db_(db), next_cuid_(next_cuid) {}
 
-  std::string upper_bound_str = GenerateKey(cuid, end_row + 1);
-  Slice upper_bound = upper_bound_str;
-  ro.iterate_upper_bound = &upper_bound;
+  void Run(int thread_id, std::atomic<bool>* stop, ThreadStats* stats) {
+    std::default_random_engine gen(thread_id + static_cast<int>(time(0)));
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    rocksdb::ReadOptions read_opts;
 
-  Iterator* it = db->NewIterator(ro);
-  std::string start_key = GenerateKey(cuid, start_row);
+    while (!stop->load()) {
+      // 1. 领取一个全新的 CUID
+      uint64_t cuid = next_cuid_->fetch_add(1);
+      if (cuid > kNumCuids) break;
 
-  int count = 0;
-  for (it->Seek(start_key); it->Valid(); it->Next()) {
-    if (ExtractCUID(it->key()) != cuid) break;
-    count++;
-  }
+      // 2. 状态初始化
+      // 使用简单的哈希分散热点分布，避免热动 CUID 集中顺序出现
+      bool is_hot = (((cuid * 1103515245 + 12345) / 65536) % 100 < (kHotRatio * 100));
+      int target_scans = is_hot ? kHotScanTarget : kColdScanTarget;
+      int puts_done = 0;
+      int scans_done = 0;
 
-  Status s = it->status();
-  delete it;
-  if (!s.ok()) {
-    std::cerr << "Partial scan error: " << s.ToString() << std::endl;
-  }
-  return count;
-}
+      // 3. 执行单 CUID 顺序周期：交替进行写入和读取
+      while (puts_done < kTargetPutBatches || scans_done < target_scans) {
+        if (stop->load()) return;
 
-// 写入数据并 Flush
-void WriteBatchAndFlush(DB* db, const std::vector<uint64_t>& cuids,
-                        int start_row, int count_per_cuid) {
-  WriteBatch batch;
-  for (uint64_t cuid : cuids) {
-    for (int i = 0; i < count_per_cuid; ++i) {
-      batch.Put(GenerateKey(cuid, start_row + i),
-                "payload_" + std::to_string(cuid) + "_" +
-                    std::to_string(start_row + i));
+        bool do_put = false;
+        if (puts_done < kTargetPutBatches) {
+          if (scans_done < target_scans) {
+            // 根据进度比例交替，确保 Put 均匀分布在整个 Scan 周期中
+            if ((double)puts_done / kTargetPutBatches <= (double)scans_done / target_scans) {
+              do_put = true;
+            } else {
+              do_put = false;
+            }
+          } else {
+            do_put = true; // 只剩 Put 没做了
+          }
+        } else {
+          do_put = false; // 只剩 Scan 没做了
+        }
+
+        if (do_put) {
+          DoPut(cuid, puts_done * kBatchSize, stats);
+          puts_done++;
+        } else {
+          bool full_scan = (dist(gen) < 0.1);
+          DoScan(cuid, puts_done * kBatchSize, full_scan, read_opts, stats);
+          scans_done++;
+        }
+      }
+
+      // 4. 终结清理：最后一次 Full Scan -> 逐一物理删除
+      int final_rows = puts_done * kBatchSize;
+      int final_scan_count = DoScan(cuid, final_rows, true, read_opts, stats);
+      if (final_scan_count != final_rows) {
+        std::cerr << "[ERROR] Thread " << thread_id << " - CUID " << cuid 
+                  << " final full scan mismatch! Expected: " << final_rows 
+                  << ", Actual: " << final_scan_count << std::endl;
+      }
+      DoDelete(cuid, final_rows, stats);
+
+      // std::cout << "[Thread " << thread_id << "] Completed CUID " << cuid
+      //           << " (Rows: " << final_rows << ", Scans: " << scans_done
+      //           << ", Hot: " << is_hot << ")" << std::endl;
     }
   }
-  Status s = db->Write(WriteOptions(), &batch);
-  Check(s.ok(), "Write batch");
 
-  s = db->Flush(FlushOptions());
-  Check(s.ok(), "Flush to SST");
-}
-
-// ==========================================
-// 主测试流程
-// ==========================================
-int main() {
-  std::cout << "========================================" << std::endl;
-  std::cout << "Partial Merge Test Suite" << std::endl;
-  std::cout << "========================================" << std::endl;
-
-  Options options;
-  options.create_if_missing = true;
-  Status s = DestroyDB(kDBPath, options);
-
-  options.create_missing_column_families = true;
-  options.enable_delta = true;
-
-  // --- Example 1: Programmatic Configuration of DeltaOptions ---
-  // These can be set directly on the options object before opening the DB.
-  // --- Example 1: Programmatic Configuration of DeltaOptions ---
-  // These can be set directly on the options object before opening the DB.
-  options.delta_options.hotspot_scan_threshold = 3;
-  options.delta_options.hotspot_scan_window_sec = 300;
-  options.delta_options.delta_merge_threshold = 3;
-  options.delta_options.sac_delta_count_threshold = 5;
-  options.delta_options.sharding_count = 64; // Power of 2 recommended
-  options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
-  options.delta_options.hot_data_buffer_shards = 128;
-  options.delta_options.compaction_l0_trigger_count = 40;
-  options.delta_options.compaction_l0_trigger_age_sec = 3600;
-  options.delta_options.compaction_l0_files_to_pick = 10;
-  // -------------------------------------------------------------
-  options.level0_slowdown_writes_trigger = 1000; // l0 file count thres
-  options.level0_stop_writes_trigger = 2000; // l0 file count thres
-  options.level0_file_num_compaction_trigger = 50; // l0 file count thres
-  options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
-  options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
-  options.num_levels = 1;
-  options.level_compaction_dynamic_level_bytes = false;
-
-  DB* db = nullptr;
-  s = DB::Open(options, kDBPath, &db);
-  Check(s.ok(), "DB Open");
-
-  DBImpl* db_impl = dynamic_cast<DBImpl*>(db);
-  auto hotspot_mgr = db_impl->GetHotspotManager();
-  Check(hotspot_mgr != nullptr, "HotspotManager attached");
-
-  const uint64_t CUID_PARTIAL = 5001;  // 测试 Partial Merge
-
-  // =================================================================
-  // 测试 1: skip_hot_path 与 ProcessPendingHotCuids
-  // =================================================================
-  std::cout << "\n>>> TEST 1: skip_hot_path & ProcessPendingHotCuids <<<\n";
-
-  // 写入初始数据: 3 个 SST，每个 50 条
-  for (int i = 0; i < 3; ++i) {
-    WriteBatchAndFlush(db, {CUID_PARTIAL}, i * 100, 50);
-    std::cout << "Generated SST #" << i + 1 << std::endl;
+ private:
+  void DoPut(uint64_t cuid, int start_row, ThreadStats* stats) {
+    rocksdb::WriteBatch batch;
+    for (int i = 0; i < kBatchSize; ++i) {
+      batch.Put(GenerateKey(cuid, start_row + i), "value_data_payload_xxxxxxx");
+    }
+    auto start = std::chrono::high_resolution_clock::now();
+    rocksdb::Status s = db_->Write(rocksdb::WriteOptions(), &batch);
+    auto end = std::chrono::high_resolution_clock::now();
+    stats->AddPut(std::chrono::duration<double, std::milli>(end - start).count());
   }
 
-  // 触发热点判定 (5 次全量扫描)
-  std::cout << "Triggering hot detection with 5 full scans..." << std::endl;
-  for (int i = 0; i < 5; ++i) {
-    int rows = PerformFullScan(db, CUID_PARTIAL);
-    std::cout << "  Scan #" << i + 1 << ": found " << rows << " rows"
-              << std::endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  int DoScan(uint64_t cuid, int cur_rows, bool full_scan, const rocksdb::ReadOptions& ro, ThreadStats* stats) {
+    std::string start_key, end_key;
+    if (full_scan) {
+      start_key = GenerateKey(cuid, 0);
+      end_key = GenerateKey(cuid + 1, 0);
+    } else {
+      int offset = std::max(0, cur_rows - 500);
+      start_key = GenerateKey(cuid, offset);
+      end_key = GenerateKey(cuid, cur_rows);
+    }
+
+    rocksdb::Slice upper_bound(end_key);
+    rocksdb::ReadOptions ro_copy = ro;
+    ro_copy.iterate_upper_bound = &upper_bound;
+    ro_copy.delta_full_scan = full_scan;
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+    rocksdb::Iterator* it = db_->NewIterator(ro_copy);
+    it->Seek(start_key);
+
+    int count = 0;
+    while (it->Valid()) {
+      if (ExtractCUID(it->key()) != cuid) break;
+      count++;
+      it->Next();
+    }
+    delete it;
+    auto t_end = std::chrono::high_resolution_clock::now();
+    stats->AddScan(std::chrono::duration<double, std::milli>(t_end - t_start).count(), count);
+
+    return count;
   }
 
-  // 验证热点建立
-  HotIndexEntry entry;
-  bool has_index = hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
-  Check(has_index, "CUID_PARTIAL should be in HotIndexTable");
-  Check(entry.HasSnapshot(),
-        "CUID_PARTIAL should have Snapshot (via ProcessPendingHotCuids)");
-
-  std::cout << "Snapshot segments: " << entry.snapshot_segments.size()
-            << std::endl;
-  std::cout << "Deltas: " << entry.deltas.size() << std::endl;
-
-  // =================================================================
-  // 测试 2: 写入更多数据产生新 Delta
-  // =================================================================
-  std::cout << "\n>>> TEST 2: Writing more data to create Deltas <<<\n";
-
-  for (int i = 0; i < 4; ++i) {
-    WriteBatchAndFlush(db, {CUID_PARTIAL}, 300 + i * 50, 50);
-    std::cout << "Generated Delta SST #" << i + 1 << std::endl;
+  void DoDelete(uint64_t cuid, int total_rows, ThreadStats* stats) {
+    rocksdb::WriteOptions wo;
+    for (int i = 0; i < total_rows; ++i) {
+      auto start = std::chrono::high_resolution_clock::now();
+      db_->Delete(wo, GenerateKey(cuid, i));
+      auto end = std::chrono::high_resolution_clock::now();
+      stats->AddDelete(std::chrono::duration<double, std::milli>(end - start).count());
+    }
   }
 
-  hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
-  size_t delta_count = entry.deltas.size();
-  std::cout << "Delta count after writes: " << delta_count << std::endl;
-  Check(delta_count >= 3,
-        "Should have multiple deltas (>= 3 for kPartialMerge threshold)");
+  rocksdb::DB* db_;
+  std::atomic<uint64_t>* next_cuid_;
+};
+
+void ReportStats(const std::string& label, const std::vector<ThreadStats>& all_stats) {
+  uint64_t total_puts = 0, total_scans = 0, total_dels = 0, total_rows = 0;
+  std::vector<double> all_put_lat, all_scan_lat, all_del_lat;
   
-  for (size_t i = 0; i < entry.deltas.size(); ++i) {
-    std::cout << "  Delta " << i + 1 << ": file_number=" << entry.deltas[i].file_number
-              << ", range=[" << FormatKeyDisplay(entry.deltas[i].first_key) << "]" << std::endl;
+  for (const auto& s : all_stats) {
+    total_puts += s.put_ops;
+    total_scans += s.scan_ops;
+    total_dels += s.del_ops;
+    total_rows += s.total_rows_scanned;
+    all_put_lat.insert(all_put_lat.end(), s.put_latencies.begin(), s.put_latencies.end());
+    all_scan_lat.insert(all_scan_lat.end(), s.scan_latencies.begin(), s.scan_latencies.end());
+    all_del_lat.insert(all_del_lat.end(), s.del_latencies.begin(), s.del_latencies.end());
   }
 
-  // =================================================================
-  // 测试 3: 部分扫描触发 kPartialMerge
-  // =================================================================
-  std::cout << "\n>>> TEST 3: Partial Scan triggering kPartialMerge <<<\n";
+  auto get_avg = [](std::vector<double>& latencies) {
+    if (latencies.empty()) return 0.0;
+    double sum = 0;
+    for (double d : latencies) sum += d;
+    return sum / latencies.size();
+  };
 
-  // 执行部分扫描 (只扫描 row_id 100-200 范围)
-  std::cout << "Performing partial scan on row range [100, 200]..."
-            << std::endl;
-  int partial_rows = PerformPartialScan(db, CUID_PARTIAL, 100, 200);
-  std::cout << "Partial scan found: " << partial_rows << " rows" << std::endl;
+  auto get_p99 = [](std::vector<double>& latencies) {
+    if (latencies.empty()) return 0.0;
+    std::sort(latencies.begin(), latencies.end());
+    return latencies[static_cast<size_t>(latencies.size() * 0.99)];
+  };
 
-  // =================================================================
-  // 测试 3.5: 验证 Buffer-based Partial Merge & Coalescing
-  // =================================================================
-  std::cout << "\n>>> TEST 3.5: Buffer-based Partial Merge & Coalescing <<<\n";
+  std::cout << "\n--- " << label << " Results ---" << std::endl;
+  std::cout << "Put (Batch 128) Ops: " << total_puts << ", Avg Lat: " << std::fixed << std::setprecision(3) << get_avg(all_put_lat) << " ms, P99 Lat: " << get_p99(all_put_lat) << " ms" << std::endl;
+  std::cout << "Scan Ops: " << total_scans << ", Avg Lat: " << get_avg(all_scan_lat) << " ms, P99 Lat: " << get_p99(all_scan_lat) << " ms" << std::endl;
+  std::cout << "Delete Ops: " << total_dels << ", Avg Lat: " << get_avg(all_del_lat) << " ms, P99 Lat: " << get_p99(all_del_lat) << " ms" << std::endl;
+  std::cout << "Throughput: " << (kTestDurationSec > 0 ? total_rows / kTestDurationSec : 0) << " rows/s" << std::endl;
+}
 
-  // 此时 DBIter 析构应该已经触发了 EnqueuePartialMerge
-  // 我们手动调用处理函数（模拟后台工作完成）
-  if (hotspot_mgr->HasPendingPartialMerge()) {
-    std::cout << "Executing ProcessPendingPartialMerge() for [100, 200]..."
-              << std::endl;
-    db_impl->ProcessPendingPartialMerge();
-  }
+int main() {
+  CleanupDBPath(kNativeDBPath);
+  CleanupDBPath(kDeltaDBPath);
 
-  hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
-  bool found_mem_seg = false;
-  for (const auto& seg : entry.snapshot_segments) {
-    if (seg.file_number == static_cast<uint64_t>(-1)) {
-      found_mem_seg = true;
-      std::cout << "  Found memory segment: [" << seg.first_key << ", "
-                << seg.last_key << "]" << std::endl;
-      break;
+  std::atomic<uint64_t> next_cuid_counter{1};
+
+  auto run_benchmark = [&](const std::string& path, bool delta_enabled, const std::string& label) {
+    rocksdb::Options options;
+    options.create_if_missing = true;
+    
+    if (delta_enabled) {
+      options.enable_delta = true;
+
+      // --- Example 1: Programmatic Configuration of DeltaOptions ---
+      // These can be set directly on the options object before opening the DB.
+      options.delta_options.hotspot_scan_threshold = 200;
+      options.delta_options.hotspot_scan_window_sec = 300;
+      options.delta_options.delta_merge_threshold = 3;
+      options.delta_options.sac_delta_count_threshold = 5;
+      options.delta_options.sharding_count = 128; // Power of 2 recommended
+      options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
+      options.delta_options.hot_data_buffer_shards = 128;
+      options.delta_options.compaction_l0_trigger_count = 30;
+      options.delta_options.compaction_l0_trigger_age_sec = 3600;
+      options.delta_options.compaction_l0_files_to_pick = 5;
+      // -------------------------------------------------------------
+      options.level0_slowdown_writes_trigger = 200; // l0 file count thres
+      options.level0_stop_writes_trigger = 400; // l0 file count thres
+      options.level0_file_num_compaction_trigger = 50; // l0 file count thres
+      options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
+      options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
+      options.max_background_jobs = 16; // 与写入线程相同？
+      options.num_levels = 1;
+      options.level_compaction_dynamic_level_bytes = false;
+    } else {
+      options.enable_delta = false;
+      options.max_background_jobs = 16;
     }
-  }
-  Check(found_mem_seg, "Should have a memory segment (-1) after partial merge");
 
-  // 确保 CUID 是热点 (Warm up)
-  std::cout << "Warming up CUID to ensure it is HOT..." << std::endl;
-  for (int i = 0; i < 3; ++i) {
-    PerformFullScan(db, CUID_PARTIAL);
-  }
-  Check(hotspot_mgr->IsHot(CUID_PARTIAL),
-        "CUID should be hot before 2nd partial scan");
+    rocksdb::DestroyDB(path, options);
+    
+    rocksdb::DB* db;
+    rocksdb::Status s = rocksdb::DB::Open(options, path, &db);
+    if (!s.ok()) {
+      std::cerr << "Open " << label << " failed: " << s.ToString() << std::endl;
+      return;
+    }
 
-  // 写入新的 Delta (SST files) 以确保满足 kPartialMerge 的 Delta 数量阈值 (>2)
-  std::cout << "Creating new Deltas for [201, 300] range..." << std::endl;
-  for (int i = 0; i < 3; ++i) {
-    WriteBatchAndFlush(db, {CUID_PARTIAL}, 201 + i * 20,
-                       20);  // 201-220, 221-240, etc.
-  }
+    std::cout << ">>> Running " << label << " (Duration: " << kTestDurationSec << "s) <<<" << std::endl;
+    next_cuid_counter.store(1);
 
-  std::cout << "SNAPSHOT KEY RANGES BEFORE 2nd partial merge:" << std::endl;
-  for (const auto& seg : entry.snapshot_segments) {
-    std::cout << "  Segment: [" << FormatKeyDisplay(seg.first_key) << ", " << FormatKeyDisplay(seg.last_key)
-              << "], file_number=" << seg.file_number << std::endl;
-  }
-  for (size_t i = 0; i < entry.deltas.size(); ++i) {
-    std::cout << "  Delta " << i + 1 << ": file_number=" << entry.deltas[i].file_number
-              << ", range=[" << FormatKeyDisplay(entry.deltas[i].first_key) << ", " << FormatKeyDisplay(entry.deltas[i].last_key) << "]" << std::endl;
-  }
+    std::atomic<bool> stop{false};
+    std::vector<ThreadStats> all_thread_stats(kNumThreads);
+    std::vector<std::thread> workers;
+    PerfRunner runner(db, &next_cuid_counter);
 
-  // 执行第二个相邻的部分扫描 (201-300)
-  std::cout << "Performing second partial scan on row range [201, 300]..."
-            << std::endl;
-  PerformPartialScan(db, CUID_PARTIAL, 201, 300);
+    for (int i = 0; i < kNumThreads; i++) {
+      workers.emplace_back(&PerfRunner::Run, &runner, i, &stop, &all_thread_stats[i]);
+    }
 
-  if (hotspot_mgr->HasPendingPartialMerge()) {
-    std::cout << "Executing ProcessPendingPartialMerge() for [201, 300]..."
-              << std::endl;
-    db_impl->ProcessPendingPartialMerge();
-  } else {
-    std::cerr << "[WARNING] No pending partial merge found after 2nd scan! "
-                 "Coalescing might fail."
-              << std::endl;
-  }
+    std::this_thread::sleep_for(std::chrono::seconds(kTestDurationSec));
+    stop.store(true);
+    for (auto& t : workers) t.join();
 
-  // 验证合并（Coalescing）
-  hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
-  int mem_seg_count = 0;
-  DataSegment coalesced_seg;
-  for (const auto& seg : entry.snapshot_segments) {
-    // if (seg.file_number == static_cast<uint64_t>(-1)) {
-    //   mem_seg_count++;
-    //   coalesced_seg = seg;
-    // }
-    coalesced_seg = seg;
-    mem_seg_count++;
-  }
-  std::cout << "Memory segment count: " << mem_seg_count << std::endl;
-  Check(mem_seg_count == 1,
-        "Adjacent memory segments should be coalesced into ONE");
+    ReportStats(label, all_thread_stats);
+    delete db;
+  };
 
-  // 验证边界是否正确扩大（基于段扩展机制，实际范围会向两端吸附旧数据的边界）
-  std::string expected_start_max = GenerateKey(CUID_PARTIAL, 100);
-  std::string expected_end_min = GenerateKey(CUID_PARTIAL, 300);
+  run_benchmark(kDeltaDBPath, true, "DELTA MODE");
+  run_benchmark(kNativeDBPath, false, "NATIVE MODE");
 
-  std::cout
-      << "Expected Max Start: " << FormatKeyDisplay(expected_start_max) << std::endl;
-  std::cout << "Actual Seg Start:   " << FormatKeyDisplay(coalesced_seg.first_key) << std::endl;
-  std::cout << "Expected Min End:   " << FormatKeyDisplay(expected_end_min) << std::endl;
-  std::cout << "Actual Seg End:     " << FormatKeyDisplay(coalesced_seg.last_key) << std::endl;
-
-  // 必须小于或者等于 100 (可能会因为吞并前面的重叠段变成 0)
-  Check(coalesced_seg.first_key <= expected_start_max,
-        "Coalesced start key should be <= row 100 (due to overlap expansion)");
-  // 必须大于或者等于 300 (可能会因为吞并重叠段被扩展得更大)
-  Check(coalesced_seg.last_key >= expected_end_min,
-        "Coalesced last key should be >= row 300 (due to overlap expansion)");
-
-  std::cout << "Coalesced segment range: [" << coalesced_seg.first_key << ", "
-            << coalesced_seg.last_key << "]" << std::endl;
-
-  // =================================================================
-  // 测试 4: 验证数据完整性
-  // =================================================================
-  std::cout << "\n>>> TEST 4: Data Integrity Verification <<<\n";
-
-  // 全量扫描验证所有数据可读
-  int total_rows = PerformFullScan(db, CUID_PARTIAL);
-  std::cout << "Total rows after all operations: " << total_rows << std::endl;
-
-  // 预期: 3*50 (初始) + 4*50 (新增) + 11 (TEST 3.5中新增的不重合键 [250-260]) =
-  // 361
-  int expected = 3 * 50 + 4 * 50 + 11;
-  Check(total_rows == expected,
-        "Data integrity: expected " + std::to_string(expected) + " rows");
-
-  // =================================================================
-  // 测试 5: 多次部分扫描
-  // =================================================================
-  std::cout << "\n>>> TEST 5: Multiple Partial Scans <<<\n";
-
-  for (int i = 0; i < 3; ++i) {
-    int start = i * 100;
-    int end = start + 80;
-    int rows = PerformPartialScan(db, CUID_PARTIAL, start, end);
-    std::cout << "Partial scan [" << start << ", " << end << "]: " << rows
-              << " rows" << std::endl;
-  }
-
-  // 最终数据验证
-  total_rows = PerformFullScan(db, CUID_PARTIAL);
-  std::cout << "Final total rows: " << total_rows << std::endl;
-  Check(total_rows == expected, "Final data integrity check");
-
-  // =================================================================
-  // 测试 6: L0 Compaction 索引更新
-  // =================================================================
-  std::cout << "\n>>> TEST 6: L0 Compaction Index Update <<<\n";
-
-  int rows = PerformFullScan(db, CUID_PARTIAL);
-
-  // 记录 Compaction 前的 Delta 状态
-  hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
-  size_t deltas_before = entry.deltas.size();
-  std::vector<uint64_t> file_numbers_before;
-  for (const auto& d : entry.deltas) {
-    file_numbers_before.push_back(d.file_number);
-  }
-  std::cout << "Before Compaction: " << deltas_before << " deltas" << std::endl;
-  std::cout << "Delta file numbers: ";
-  for (uint64_t fn : file_numbers_before) {
-    std::cout << fn << " ";
-  }
-  std::cout << std::endl;
-
-  // 触发 L0 Compaction
-  std::cout << "Triggering L0 Compaction via CompactRange()..." << std::endl;
-  s = db->CompactRange(CompactRangeOptions(), nullptr, nullptr);
-  Check(s.ok(), "CompactRange");
-
-  // 检查 Compaction 后的状态
-  hotspot_mgr->GetIndexTable().GetEntry(CUID_PARTIAL, &entry);
-  size_t deltas_after = entry.deltas.size();
-  std::cout << "After Compaction: " << deltas_after << " deltas" << std::endl;
-
-  // 验证 Delta 被合并 (数量应该减少或文件号变化)
-  if (deltas_after < deltas_before) {
-    std::cout << "[PASS] Deltas merged: " << deltas_before << " -> "
-              << deltas_after << std::endl;
-  } else if (deltas_after == 1 && !entry.deltas.empty()) {
-    // 检查文件号是否变化
-    bool file_changed = (entry.deltas[0].file_number != file_numbers_before[0]);
-    std::cout << "New delta file number: " << entry.deltas[0].file_number
-              << std::endl;
-    Check(file_changed || deltas_before == 1,
-          "Delta file number should change after compaction");
-  } else {
-    std::cout << "[INFO] Compaction may not have affected deltas (num_levels=1 "
-                 "config)"
-              << std::endl;
-  }
-
-  // =================================================================
-  // 测试 7: Compaction 后数据完整性
-  // =================================================================
-  std::cout << "\n>>> TEST 7: Post-Compaction Data Integrity <<<\n";
-
-  // 全量扫描验证数据未丢失
-  total_rows = PerformFullScan(db, CUID_PARTIAL);
-  std::cout << "Post-compaction total rows: " << total_rows << std::endl;
-  Check(total_rows == expected, "Data integrity after L0 Compaction");
-
-  // 部分扫描验证热点路径仍正常工作
-  int rows_100_150 = PerformPartialScan(db, CUID_PARTIAL, 100, 149);
-  std::cout << "Partial scan [100, 149]: " << rows_100_150 << " rows"
-            << std::endl;
-  Check(rows_100_150 == 50, "Partial scan [100, 149] should find 50 rows");
-
-  std::cout << "\n========================================" << std::endl;
-  std::cout << "All Tests PASSED!" << std::endl;
-  std::cout << "========================================" << std::endl;
-
-  delete db;
   return 0;
 }

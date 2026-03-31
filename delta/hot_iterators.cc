@@ -843,9 +843,9 @@ DeltaSwitchingIterator::DeltaSwitchingIterator(
       hot_iter_(nullptr),
       current_hot_cuid_(0),
       is_hot_mode_(false) {
-  if (version_) {
-    version_->Ref();
-  }
+  // if (version_) {
+  //   version_->Ref();
+  // }
 }
 
 DeltaSwitchingIterator::~DeltaSwitchingIterator() {
@@ -860,9 +860,9 @@ DeltaSwitchingIterator::~DeltaSwitchingIterator() {
       delete cold_iter_;
     }
   }
-  if (version_) {
-    version_->Unref();
-  }
+  // if (version_) {
+  //   version_->Unref();
+  // }
 }
 
 void DeltaSwitchingIterator::InitColdIter() {
