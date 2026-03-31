@@ -24,4 +24,15 @@ inline std::string FormatKeyDisplay(const Slice& key) {
   return cuid_part + "..." + suffix;
 }
 
+inline uint64_t ExtractRowID(const Slice& key) {
+  if (key.size() < 34) return 0;
+  // Suffix starts at 24, Row ID is at 24-33
+  std::string rid_str = key.ToString().substr(24, 10);
+  try {
+    return std::stoull(rid_str);
+  } catch (...) {
+    return 0;
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE

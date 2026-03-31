@@ -32,13 +32,13 @@
 const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_native";
 const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_delta";
 const int kNumThreads = 16;
-const int kTestDurationSec = 600;       // s
+const int kTestDurationSec = 2500;       // s
 const int kNumCuids = 1000000;           // 100W CUID 总库
 const int kBatchSize = 512;             // 每次 Put 128 行
 const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
 const double kHotRatio = 0.15;          // 15% 的热点
-const int kHotScanTarget = 1000;        // 热点访问目标
-const int kColdScanTarget = 150;        // 普通访问目标
+const int kHotScanTarget = 50;        // 热点访问目标
+const int kColdScanTarget = 20;        // 普通访问目标
 
 // ==========================================
 // 辅助工具与状态管理
@@ -128,8 +128,8 @@ class PerfRunner {
     // 单个 CUID 数据量约：512 batch * 200 rows/batch * 72 bytes/row ≈ 7.37 MB
     // 实现 100GB 常驻数据需 100,000 / 7.37 ≈ 13,568 个 CUID
     // 设 16 线程，则每线程需维持 13,568 / 16 ≈ 848 个 CUID (活跃 + 待删除)
-    const size_t kMaxActiveCuids = 600;   
-    const size_t kDeleteWindowSize = 200; 
+    const size_t kMaxActiveCuids = 10;   
+    const size_t kDeleteWindowSize = 50; 
 
     auto add_new_cuid = [&]() {
       uint64_t cuid = next_cuid_->fetch_add(1);
@@ -169,14 +169,6 @@ class PerfRunner {
         do_put = false; // 只剩 Scan 没做了
       }
 
-      // 3. 执行动作
-      auto now = std::chrono::steady_clock::now();
-      if (!do_put) {
-          if (std::chrono::duration_cast<std::chrono::milliseconds>(now - state.last_scan_time).count() < 1000) {
-              std::this_thread::sleep_for(std::chrono::milliseconds(5));
-              continue; // 距离上次扫描不足 1s，且当前逻辑想进行扫描，则跳过本次循环等待
-          }
-      }
 
       // 3. 执行动作
       if (do_put) {
@@ -186,7 +178,7 @@ class PerfRunner {
         bool full_scan = (dist(gen) < 0.2); // 20% Full Scan (SAC) / 80% Partial Scan
         DoScan(state.cuid, state.puts_done * kBatchSize, full_scan, read_opts, stats, gen);
         state.scans_done++;
-        state.last_scan_time = now;
+        // state.last_scan_time = now;
       }
 
       // 模拟业务节奏
@@ -422,7 +414,6 @@ int main() {
   };
 
   run_benchmark(kDeltaDBPath, true, "DELTA MODE");
-  // 70w
   run_benchmark(kNativeDBPath, false, "NATIVE MODE");
 
   return 0;

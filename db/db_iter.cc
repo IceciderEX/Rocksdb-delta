@@ -52,6 +52,7 @@ extern thread_local double tl_hot_snapshot_self_ms;
 #include "util/mutexlock.h"
 #include "util/string_util.h"
 #include "util/user_comparator_wrapper.h"
+#include "util/extract_cuid.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -548,6 +549,11 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
               uint64_t cuid =
                   hotspot_manager_->ExtractCUID(saved_key_.GetUserKey());
               if (cuid != 0) {
+                // [DIAG_KEY] Log buffered key size
+                // if (cuid == 1003 && read_options_.delta_full_scan) {
+                //   fprintf(stderr, "[DIAG_BUFFER] CUID 1003 buffering key size: %zu, UserKey size: %zu\n", 
+                //           iter_.key().size(), saved_key_.GetUserKey().size());
+                // }
                 // 如果 CUID 已被删除，跳过
                 // 缓存 deleted 状态：同一 CUID optimization
                 if (delta_ctx_.cached_deleted_check_cuid != cuid) {

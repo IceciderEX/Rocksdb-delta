@@ -2339,6 +2339,8 @@ struct ReadOptions {
   // 将读取/扫描操作限制在特定分区上。-1 表示所有分区。
   // 仅在 delta_options.enable_partition=true 时生效。
   int32_t read_partition_id = -1;
+  // 启用热数据路径的诊断日志（如段切换、计数等），仅用于调试
+  bool enable_delta_diag_logging = false;
 
   ReadOptions() {}
   ReadOptions(bool _verify_checksums, bool _fill_cache);

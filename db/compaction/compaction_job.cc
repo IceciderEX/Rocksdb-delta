@@ -1142,6 +1142,8 @@ Status CompactionJob::Install(bool* compaction_released) {
                   input_files_vec, output_file_id
               );
 
+              fprintf(stderr, "CUID: %lu, Input Files: %d, Output Files: %d\n", cuid, input_count, output_count);
+
               if (output_count > 0) {
                   for (const auto& seg : out_it->second) {
                       hotspot_manager_->UpdateCompactionDelta(
@@ -1151,7 +1153,7 @@ Status CompactionJob::Install(bool* compaction_released) {
                           seg.last_key 
                       );
                   }
-              } else { // 被删除或者过滤的cuid的处理？
+              } else { // 没有输出新compaction文件，被删除或者过滤的cuid的处理？
                   hotspot_manager_->GetIndexTable().RemoveObsoleteDeltasForCUIDs({cuid}, input_files_vec);
               } 
           }

@@ -94,6 +94,9 @@ bool HotspotManager::BufferHotData(uint64_t cuid, const Slice& key,
     std::lock_guard<std::mutex> lock(buffered_cuids_mutex_);
     active_buffered_cuids_.insert(cuid);
   }
+  // if (cuid == 1003) {
+  //   fprintf(stderr, "[DIAG_APPEND] CUID 1003 appending key size: %zu\n", key.size());
+  // }
   return buffer_.Append(cuid, key, value);
 }
 
@@ -441,6 +444,16 @@ Status HotspotManager::FlushBlockToSharedSST(
       segment.first_key = segment_first_key;
       segment.last_key = segment_last_key;
       (*output_segments)[current_cuid] = segment;
+
+      if (current_cuid == 1003) {
+        fprintf(stderr,
+                "[DIAG_FLUSH] CUID 1003: SST %lu written_count=%d "
+                "range=[%s - %s] bucket_size=%zu\n",
+                file_number, written_count,
+                FormatKeyDisplay(segment_first_key).c_str(),
+                FormatKeyDisplay(segment_last_key).c_str(),
+                bucket_entries.size());
+      }
     }
   }
 
@@ -487,9 +500,10 @@ void HotspotManager::TriggerBufferFlush() {
         uint64_t cuid = kv.first;
         const DataSegment& real_segment = kv.second;
 
-        // 先检查 pending_snapshots_，再尝试 PromoteSnapshot
-        // 如果该 CUID 有正在进行的 full Scan（pending_snapshots_ 中有注册），
-        // 将 SST 放入 pending，由 FinalizeScanAsCompaction 提交
+        // 先尝试加入 pending（如果有活跃 Full Scan）
+        // 然后始终尝试 Promote（保证并发 Reader 可见性）
+        // 两条路都走：pending 保证 Finalize 知道所有 SST，Promote 保证即时可见
+        // 双 Ref 通过 Finalize 中的 pending release 平衡
         bool added_to_pending = false;
         {
           std::lock_guard<std::mutex> lock(pending_mutex_);
@@ -497,16 +511,16 @@ void HotspotManager::TriggerBufferFlush() {
           if (it != pending_snapshots_.end()) {
             it->second.push_back(real_segment);
             added_to_pending = true;
+            // pending 路径 Ref：保证文件在 Finalize 前不被删除
+            lifecycle_manager_->Ref(real_segment.file_number);
           }
         }
 
-        // 无论是否 added_to_pending，只要发生了flush，必须同步到 index
-        // 防止并发 Reader 因为 Buffer 没了而 sst segment 没更新导致的数据缺失
         bool promoted = index_table_.PromoteSnapshot(
             cuid, real_segment, &buffer_, internal_comparator_);
 
         if (!promoted && !added_to_pending) {
-          // 既无活跃 Scan 也无 {-1} 段，说明是全新的 Snapshot 段，强制 Append
+          // 既无活跃 Scan 也无 -1 段，强制 Append
           ROCKS_LOG_WARN(db_options_.info_log,
                          "[HotspotManager] No active scan or {-1} segment "
                          "for CUID %" PRIu64
@@ -558,6 +572,10 @@ void HotspotManager::FinalizeScanAsCompaction(
         // 如果裁剪后发现 seg first >= last，这段 segment 无效
         if (internal_comparator_->Compare(seg_it->first_key,
                                           seg_it->last_key) >= 0) {
+          // 释放 pending 路径的 Ref，防止泄漏
+          if (seg_it->file_number != static_cast<uint64_t>(-1)) {
+            lifecycle_manager_->Unref(seg_it->file_number);
+          }
           seg_it = final_segments.erase(seg_it);
         } else {
           ++seg_it;
@@ -586,18 +604,48 @@ void HotspotManager::FinalizeScanAsCompaction(
     return;
   }
 
-  // 防止 buffer data 的 segment keyrange 重叠
+  // ===== 第一步：先排序并消解 pending SST 之间的重叠 =====
+  // 必须在创建 -1 尾段之前完成，否则 tail_min 会基于未排序的数据计算，
+  // 导致跨代污染 SST 的巨大 range 干扰 tail_min 的正确性
+  if (final_segments.size() > 1) {
+    std::sort(final_segments.begin(), final_segments.end(),
+              [this](const DataSegment& a, const DataSegment& b) {
+                return internal_comparator_->Compare(a.first_key, b.first_key) < 0;
+              });
+    // 消解重叠：将前一个段的 last_key 裁剪到后一个段的 first_key
+    for (size_t i = 0; i + 1 < final_segments.size(); ++i) {
+      if (internal_comparator_->Compare(final_segments[i].last_key,
+                                        final_segments[i + 1].first_key) > 0) {
+        final_segments[i].last_key = final_segments[i + 1].first_key;
+      }
+    }
+    // 移除裁剪后失效的空段 (first_key >= last_key)
+    for (auto it = final_segments.begin(); it != final_segments.end(); ) {
+      if (!it->last_key.empty() && 
+          internal_comparator_->Compare(it->first_key, it->last_key) >= 0) {
+        // 释放 pending 路径的 Ref，防止泄漏
+        if (it->file_number != static_cast<uint64_t>(-1)) {
+          lifecycle_manager_->Unref(it->file_number);
+        }
+        it = final_segments.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  // ===== 第二步：基于排序后的结果计算 tail_min 并创建 -1 尾段 =====
   std::string tail_min;
   if (final_segments.empty()) {
     tail_min = scan_first_key;
   } else {
-    // buffer minkey=前一个物理 SST 的结尾
+    // 基于排序+裁剪后的最后一个 SST 的 last_key
     tail_min = final_segments.back().last_key;
   }
 
-  // 确保拼接逻辑不会发生区间倒置
   bool has_valid_tail =
       internal_comparator_->Compare(tail_min, scan_last_key) <= 0;
+
   if (has_buffered_data && has_valid_tail) {
     DataSegment tail_segment;
     tail_segment.file_number = static_cast<uint64_t>(-1);  // 标记为内存段
@@ -625,27 +673,6 @@ void HotspotManager::FinalizeScanAsCompaction(
                    " skipped: final_segments is empty.",
                    cuid);
     return;
-  }
-
-  // sort and cut segment
-  std::sort(final_segments.begin(), final_segments.end(),
-            [this](const DataSegment& a, const DataSegment& b) {
-              return internal_comparator_->Compare(a.first_key, b.first_key) < 0;
-            });
-  for (size_t i = 0; i + 1 < final_segments.size(); ++i) {
-    if (internal_comparator_->Compare(final_segments[i].last_key,
-                                      final_segments[i + 1].first_key) > 0) {
-      final_segments[i].last_key = final_segments[i + 1].first_key;
-    }
-  }
-  // 5. 移除裁剪后失效的空段 (first_key >= last_key)
-  for (auto it = final_segments.begin(); it != final_segments.end(); ) {
-    if (!it->last_key.empty() && 
-        internal_comparator_->Compare(it->first_key, it->last_key) >= 0) {
-      it = final_segments.erase(it);
-    } else {
-      ++it;
-    }
   }
 
   // 【debug】验证拼接出来的 final_segments 是不是重叠的
@@ -681,6 +708,17 @@ void HotspotManager::FinalizeScanAsCompaction(
 
   // 更新这个 cuid 的 Snapshot
   index_table_.UpdateSnapshot(cuid, final_segments);
+
+  // 释放 pending 路径的 Ref。
+  // UpdateSnapshot 内部已经为 final_segments 中的每个 segment 做了 Ref(+1)，
+  // 此处释放 pending 添加时的 Ref，使 ref_count 最终为 1（仅 snapshot 持有）。
+  // 对于同时被 Promote 过的 SST：UpdateSnapshot 的 Unref(old) 已经抵消了 Promote 的 Ref。
+  for (const auto& seg : final_segments) {
+    if (seg.file_number != static_cast<uint64_t>(-1)) {
+      lifecycle_manager_->Unref(seg.file_number);
+    }
+  }
+
   index_table_.MarkDeltasAsObsolete(cuid, visited_files);
 
   // fprintf(stdout, "[HotspotManager] Finalized CUID %lu. Snapshot has %zu
@@ -852,12 +890,17 @@ void HotspotManager::EnqueuePartialMerge(
     uint64_t cuid, const std::string& scan_first_key,
     const std::string& scan_last_key,
     const std::vector<std::pair<std::string, std::string>>& scan_data) {
+  if (!TryLockCuid(cuid)) {
+    return;
+  }
+
   std::lock_guard<std::mutex> lock(partial_merge_mutex_);
   // 避免重复添加相同 cuid 的任务?
   for (auto& task : partial_merge_queue_) {
     if (task.cuid == cuid) {
       // 已经有一个队列了，暂时忽略本次小的 scan触发，或者也可以用更大的
       // range更新
+      UnlockCuid(cuid);
       return;
     }
   }
@@ -881,15 +924,9 @@ bool HotspotManager::PopPendingPartialMerge(PartialMergePendingTask* task) {
     return false;
   }
 
-  for (auto it = partial_merge_queue_.begin(); it != partial_merge_queue_.end();
-       ++it) {
-    if (TryLockCuid(it->cuid)) {
-      *task = std::move(*it);
-      partial_merge_queue_.erase(it);
-      return true;
-    }
-  }
-  return false;
+  *task = std::move(partial_merge_queue_.front());
+  partial_merge_queue_.erase(partial_merge_queue_.begin());
+  return true;
 }
 
 bool HotspotManager::TryLockCuid(uint64_t cuid) {
