@@ -85,7 +85,7 @@ void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
   while (!stop_test) {
     WriteBatch batch;
     uint64_t batch_start_rid = next_rid;
-    int batch_size = 512;
+    int batch_size = 1024;
 
     {
       std::lock_guard<std::mutex> lock(ground_truths[target_cuid]->mtx);
