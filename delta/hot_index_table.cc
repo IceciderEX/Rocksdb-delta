@@ -318,12 +318,19 @@ void HotIndexTable::RemoveObsoleteDeltasForCUIDs(
     if (entry_it == shard.table.end()) continue;
 
     auto& entry = entry_it->second;
-    if (entry.obsolete_deltas.empty()) continue;
 
-    // 移除 matched 文件
+    // 1. 移除 deltas 中的匹配文件
+    for (auto it = entry.deltas.begin(); it != entry.deltas.end();) {
+      if (input_files_set.count(it->file_number)) {
+        it = entry.deltas.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    // 2. 移除 obsolete_deltas 中的匹配文件
     for (auto it = entry.obsolete_deltas.begin();
          it != entry.obsolete_deltas.end();) {
-      bool is_input = false;
       if (input_files_set.count(it->file_number)) {
         it = entry.obsolete_deltas.erase(it);
       } else {
@@ -374,18 +381,6 @@ void HotIndexTable::UpdateDeltaIndex(uint64_t cuid,
     } else {
       ++it;
     }
-  }
-
-  // 异常检测：由于合并产生的新端 range 过大检测
-  uint64_t first_rid = ExtractRowID(new_delta.first_key);
-  uint64_t last_rid = ExtractRowID(new_delta.last_key);
-  if (last_rid > first_rid + 50000) {  // 阈值设为 50,000
-    fprintf(stderr,
-            "[WARNING_HUGE_DELTA_COMPACT] CUID %lu: New Compact Delta (File %lu) "
-            "has large range: %lu rows! [%s - %s]\n",
-            cuid, new_delta.file_number, last_rid - first_rid + 1,
-            FormatKeyDisplay(new_delta.first_key).c_str(),
-            FormatKeyDisplay(new_delta.last_key).c_str());
   }
 
   // 加入 new delta index

@@ -7194,6 +7194,8 @@ void DBImpl::ProcessPendingPartialMerge() {
     return;
   }
 
+  // fprintf(stderr, "[DIAG_SV] Acquired SV %p for CUID %lu\n", sv, (unsigned long)task.cuid);
+
   const auto& icmp = cfd->internal_comparator();
   ReadOptions read_opts;
   FileOptions file_opts;
@@ -7236,7 +7238,7 @@ void DBImpl::ProcessPendingPartialMerge() {
   InternalIterator* merging_iter = NewMergingIterator(
       &icmp, children.data(), static_cast<int>(children.size()));
 
-  // 遍历归并并写入 Buffer，去重
+  // 遍历归并并写入 Buffer，去重并过滤 CUID
   std::string last_user_key;
   std::string segment_first_key, segment_last_key;
   size_t written_count = 0;
@@ -7245,14 +7247,26 @@ void DBImpl::ProcessPendingPartialMerge() {
   for (merging_iter->SeekToFirst(); merging_iter->Valid();
        merging_iter->Next()) {
     Slice key = merging_iter->key();
+    
+    // 提取 CUID 并进行过滤
+    uint64_t current_cuid = hotspot_manager_->ExtractCUID(key);
+    // Key 是按照 CUID 有序排列的，一旦超过目标 CUID 停止扫描
+    if (current_cuid > task.cuid) {
+      break; 
+    }
+    if (current_cuid < task.cuid) {
+      continue;
+    }
+
     Slice value = merging_iter->value();
     Slice user_key = ExtractUserKey(key);
 
-    // 去重
-    if (user_key.ToString() == last_user_key) {
+    // Slice 比较减少 ToString 开销
+    if (!last_user_key.empty() && 
+        icmp.user_comparator()->Compare(user_key, Slice(last_user_key)) == 0) {
       continue;
     }
-    last_user_key = user_key.ToString();
+    last_user_key.assign(user_key.data(), user_key.size());
 
     // 写入 Buffer
     if (hotspot_manager_->BufferHotData(task.cuid, key, value)) {
@@ -7268,6 +7282,8 @@ void DBImpl::ProcessPendingPartialMerge() {
 
   delete merging_iter;
   ReturnAndCleanupSuperVersion(cfd, sv);
+  // fprintf(stderr, "[DIAG_SV] Released SV %p for CUID %lu, wrote %zu entries\n", 
+  //                 sv, (unsigned long)task.cuid, written_count);
 
   if (written_count == 0) {
     hotspot_manager_->UnlockCuid(task.cuid);
@@ -7330,6 +7346,15 @@ void DBImpl::DeltaBGWorkThreadFunc() {
     // 周期性异步刷盘并尝试对长日志执行收缩重写
     if (hotspot_manager_) {
       hotspot_manager_->CompactAndFlushGDCTLogIfNeeded();
+      
+      // DIAG: Check queue sizes
+      static int log_counter = 0;
+      if (++log_counter % 10 == 0) {
+          fprintf(stderr, "[DIAG_BG] Processing BG Work... Pending Tasks: Hot=%d, Metadata=%d, PartialMerge=%d\n",
+                          (int)hotspot_manager_->HasPendingInitCuids(),
+                          (int)hotspot_manager_->HasPendingMetadataScans(),
+                          (int)hotspot_manager_->HasPendingPartialMerge());
+      }
     }
 
     ProcessPendingHotCuids();

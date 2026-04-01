@@ -1108,11 +1108,28 @@ Status CompactionJob::Install(bool* compaction_released) {
     // fix: 成功之后再修改metadata
     if (status.ok() && hotspot_manager_) {
         if (status.ok() && hotspot_manager_) {
+          // fprintf(stderr, "CompactionJob::Install()...\n");
           // CUID -> List<Segments>
           std::map<uint64_t, std::vector<DeltaOutputInfo>> output_map;
           for (const auto& out : global_outputs_) {
               output_map[out.cuid].push_back(out);
           }
+
+          // // 记录所有涉及文件的物理大小
+          // std::map<uint64_t, uint64_t> all_file_sizes;
+          // // 输入文件
+          // for (size_t i = 0; i < compact_->compaction->num_input_levels(); ++i) {
+          //    for (const auto* f : *compact_->compaction->inputs(i)) {
+          //        all_file_sizes[f->fd.GetNumber()] = f->fd.GetFileSize();
+          //    }
+          // }
+          // // 输出文件 (来自各个 subcompaction_state)
+          // for (const auto& sub_state : compact_->sub_compact_states) {
+          //      for (auto it = sub_state.GetOutputs(); it != it.end(); ++it) {
+          //          const auto& out = *it;
+          //          all_file_sizes[out.meta.fd.GetNumber()] = out.meta.fd.GetFileSize();
+          //      }
+          // }
 
           for (auto& pair : global_cuid_inputs_) {
               uint64_t cuid = pair.first;
@@ -1142,7 +1159,22 @@ Status CompactionJob::Install(bool* compaction_released) {
                   input_files_vec, output_file_id
               );
 
-              fprintf(stderr, "CUID: %lu, Input Files: %d, Output Files: %d\n", cuid, input_count, output_count);
+              // uint64_t total_input_size = 0;
+              // for (uint64_t fid : input_files_vec) {
+              //     total_input_size += all_file_sizes[fid];
+              // }
+              // uint64_t total_output_size = 0;
+              // uint64_t total_output_rows = 0;
+              // if (output_count > 0) {
+              //     for (const auto& seg : out_it->second) {
+              //         total_output_size += all_file_sizes[seg.file_number];
+              //         total_output_rows += seg.entry_count;
+              //     }
+              // }
+
+              // fprintf(stderr, "CUID: %lu, Input Files: %d (%lu bytes), Output Files: %d (%lu bytes), Output Total Rows: %lu\n",
+              //         cuid, input_count, total_input_size, 
+              //         output_count, total_output_size, total_output_rows);
 
               if (output_count > 0) {
                   for (const auto& seg : out_it->second) {
@@ -1157,7 +1189,7 @@ Status CompactionJob::Install(bool* compaction_released) {
                   hotspot_manager_->GetIndexTable().RemoveObsoleteDeltasForCUIDs({cuid}, input_files_vec);
               } 
           }
-          
+
           global_cuid_inputs_.clear();
           global_outputs_.clear();
         }

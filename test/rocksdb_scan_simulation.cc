@@ -357,6 +357,7 @@ int main() {
       options.level0_slowdown_writes_trigger = 200; // l0 file count thres
       options.level0_stop_writes_trigger = 400; // l0 file count thres
       options.level0_file_num_compaction_trigger = 100; // l0 file count thres
+      options.max_subcompactions = 4; // subcompaction 线程数
       options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
       options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
       options.max_background_jobs = 16; // 与写入线程相同？

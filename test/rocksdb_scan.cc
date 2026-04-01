@@ -34,11 +34,11 @@ const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_d
 const int kNumThreads = 16;
 const int kTestDurationSec = 2500;       // s
 const int kNumCuids = 1000000;           // 100W CUID 总库
-const int kBatchSize = 512;             // 每次 Put 128 行
-const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
+const int kBatchSize = 128;             // 每次 Put 512 行
+const int kTargetPutBatches = 500;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
 const double kHotRatio = 0.15;          // 15% 的热点
-const int kHotScanTarget = 50;        // 热点访问目标
-const int kColdScanTarget = 20;        // 普通访问目标
+const int kHotScanTarget = 300;        // 热点访问目标
+const int kColdScanTarget = 50;        // 普通访问目标
 
 // ==========================================
 // 辅助工具与状态管理
@@ -125,11 +125,11 @@ class PerfRunner {
     std::deque<std::pair<uint64_t, int>> pending_deletes;
     
     // === 100GB 目标数据量计算过程 ===
-    // 单个 CUID 数据量约：512 batch * 200 rows/batch * 72 bytes/row ≈ 7.37 MB
-    // 实现 100GB 常驻数据需 100,000 / 7.37 ≈ 13,568 个 CUID
-    // 设 16 线程，则每线程需维持 13,568 / 16 ≈ 848 个 CUID (活跃 + 待删除)
-    const size_t kMaxActiveCuids = 10;   
-    const size_t kDeleteWindowSize = 50; 
+    // 单个 CUID 数据量约：128 batch * 500 rows/batch * 72 bytes/row ≈ 4.3945 MB
+    // 实现 100GB 常驻数据需 100,000 / 4.3945 ≈ 22,750 个 CUID
+    // 设 16 线程，则每线程需维持 22,750 / 16 ≈ 1,422 个 CUID (活跃 + 待删除)
+    const size_t kMaxActiveCuids = 50;   
+    const size_t kDeleteWindowSize = 150; 
 
     auto add_new_cuid = [&]() {
       uint64_t cuid = next_cuid_->fetch_add(1);
@@ -356,7 +356,8 @@ int main() {
       // -------------------------------------------------------------
       options.level0_slowdown_writes_trigger = 200; // l0 file count thres
       options.level0_stop_writes_trigger = 400; // l0 file count thres
-      options.level0_file_num_compaction_trigger = 100; // l0 file count thres
+      options.level0_file_num_compaction_trigger = 50; // l0 file count thres
+      options.max_subcompactions = 4; // subcompaction 线程数
       options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
       options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
       options.max_background_jobs = 16; // 与写入线程相同？
@@ -364,6 +365,7 @@ int main() {
       options.level_compaction_dynamic_level_bytes = false;
     } else {
       options.enable_delta = false;
+      options.max_subcompactions = 4;
       options.max_background_jobs = 16;
     }
 

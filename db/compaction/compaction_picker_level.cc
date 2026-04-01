@@ -563,32 +563,43 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
     return false;
   }
 
-  // 选最早生成的 kFilesToPick 个文件
-  // [Size - Pick ... Size - 1]？
-  size_t pick_count = std::min(kFilesToPick, total_files);
-
-  // 超时触发的且文件数不足 10 个
-  if (trigger_by_time && pick_count < kFilesToPick) {
-      pick_count = total_files;
+  // 查找一个未被锁定的连续 block
+  // 从后向前寻找最老的可以做 Compaction 的 batch
+  size_t current_pick_count = 0;
+  start_level_inputs_.files.clear();
+  for (int i = static_cast<int>(total_files) - 1; i >= 0; --i) {
+    if (l0_files[i]->being_compacted) {
+      if (current_pick_count > 0) {
+          // 遇到被锁定的且之前已经攒了一部分?
+          current_pick_count = 0;
+          start_level_inputs_.files.clear();
+      }
+      continue;
+    }
+    
+    start_level_inputs_.files.push_back(l0_files[i]);
+    current_pick_count++;
+    if (current_pick_count == kFilesToPick) {
+        break;
+    }
   }
 
-  size_t start_index = total_files - pick_count;
-  start_level_inputs_.level = 0;
-  start_level_inputs_.files.clear();
+  if (current_pick_count == 0) {
+      return false;
+  }
+
+  // 如果这波不足 kFilesToPick 且不是触发 time，则放弃这次尝试
+  if (!trigger_by_time && current_pick_count < kFilesToPick) {
+      start_level_inputs_.files.clear();
+      return false;
+  }
+
+  // reverse list
+  std::reverse(start_level_inputs_.files.begin(), start_level_inputs_.files.end());
+
   start_level_ = 0;
   output_level_ = 0; // L0 -> L0
-
-  for (size_t i = start_index; i < total_files; ++i) {
-    FileMetaData* f = l0_files[i];
-    // 检查并发冲突的逻辑？？
-    if (f->being_compacted) {
-      // TODO：如果最老的数据正在合并，直接abandon这次compaction？
-      start_level_inputs_.clear();
-      return false;
-    }
-    start_level_inputs_.files.push_back(f);
-  }
-
+  start_level_inputs_.level = 0;
   compaction_reason_ = CompactionReason::kLevelL0FilesNum; // 借用Reason
 
   ROCKS_LOG_BUFFER(log_buffer_, 
