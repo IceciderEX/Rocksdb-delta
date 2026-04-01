@@ -19,7 +19,7 @@ class HotDeltaIterator : public InternalIterator {
  public:
   // deltas: 数据段列表 (FileID, FirstKey, LastKey)
   // icmp: 内部 Key 比较器
-  HotDeltaIterator(const std::vector<DataSegment>& deltas,
+  HotDeltaIterator(const std::vector<DataSegment>& deltas, uint64_t cuid,
                    TableCache* table_cache, const ReadOptions& read_options,
                    const FileOptions& file_options,
                    const InternalKeyComparator& icmp,
@@ -50,6 +50,7 @@ class HotDeltaIterator : public InternalIterator {
   std::vector<Slice> bounds_slices_;
   // all ReadOptions (BlockBasedTableIterator
   std::vector<ReadOptions> read_options_storage_;
+  uint64_t cuid_;
 };
 
 class HotSnapshotIterator : public InternalIterator {

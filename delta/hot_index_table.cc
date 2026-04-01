@@ -98,7 +98,7 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
         continue;
       }
 
-      found_mem_overlap = true; // We found a -1 segment to replace
+      found_mem_overlap = true; // found a -1 segment to replace
 
       // 只针对 Memory 段 (-1) 进行切分
       // 1. 左侧剩余: [seg.first, new.first)
@@ -132,13 +132,15 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
       }
       next_segments.push_back(replacement);
 
-      fprintf(stderr,
-              "[DIAG_PROMOTE] CUID %lu: Mem Segment [%s - %s] replaced by SST "
-              "%lu clipped to [%s - %s]\n",
-              cuid, FormatKeyDisplay(seg.first_key).c_str(),
-              FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
-              FormatKeyDisplay(replacement.first_key).c_str(),
-              FormatKeyDisplay(replacement.last_key).c_str());
+      if (false) {
+        fprintf(stderr,
+        "[DIAG_PROMOTE] CUID %lu: Mem Segment [%s - %s] replaced by SST "
+        "%lu clipped to [%s - %s]\n",
+        cuid, FormatKeyDisplay(seg.first_key).c_str(),
+        FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
+        FormatKeyDisplay(replacement.first_key).c_str(),
+        FormatKeyDisplay(replacement.last_key).c_str());
+      }
     } else {
       next_segments.push_back(seg);
     }

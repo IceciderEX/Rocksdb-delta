@@ -386,6 +386,12 @@ void DBImpl::DeleteObsoleteFileImpl(int job_id, const std::string& fname,
   TEST_SYNC_POINT_CALLBACK("DBImpl::DeleteObsoleteFileImpl:AfterDeletion",
                            &file_deletion_status);
   if (file_deletion_status.ok()) {
+    // for delta [DIAG]
+    // if (type == kTableFile) {
+    //     fprintf(stderr, "[DIAG_SST_PURGE] Physical delete %s SST #%lu (%s)\n", 
+    //                     immutable_db_options_.enable_delta ? "DELTA" : "NATIVE",
+    //                     number, fname.c_str());
+    // }
     ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
                     "[JOB %d] Delete %s type=%d #%" PRIu64 " -- %s\n", job_id,
                     fname.c_str(), type, number,

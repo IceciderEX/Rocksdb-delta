@@ -7214,8 +7214,8 @@ void DBImpl::ProcessPendingPartialMerge() {
   // 2. Delta Iterator
   if (!overlapping_deltas.empty()) {
     InternalIterator* delta_iter =
-        new HotDeltaIterator(overlapping_deltas, cfd->table_cache(), read_opts,
-                             file_opts, icmp, mutable_cf_opts, false);
+        new HotDeltaIterator(overlapping_deltas, task.cuid, cfd->table_cache(),
+                             read_opts, file_opts, icmp, mutable_cf_opts, false);
     children.push_back(delta_iter);
   }
 

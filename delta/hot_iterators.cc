@@ -3,6 +3,10 @@
 #include <time.h>
 
 #include <chrono>
+#include <sstream>
+
+#include "rocksdb/env.h"
+#include "logging/logging.h"
 
 #include "table/merging_iterator.h"
 #include "util/cast_util.h"
@@ -34,16 +38,29 @@ static FileMetaData MakeFileMetaFromSegment(const DataSegment& seg,
 // ======================= HotDeltaIterator ==========================
 
 HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
-                                   TableCache* table_cache,
+                                   uint64_t cuid, TableCache* table_cache,
                                    const ReadOptions& read_options,
                                    const FileOptions& file_options,
                                    const InternalKeyComparator& icmp,
                                    const MutableCFOptions& mutable_cf_options,
                                    bool allow_unprepared_value)
-    : merging_iter_(nullptr), deltas_(deltas) {  // Copy deltas
+    : merging_iter_(nullptr),
+      deltas_(deltas),
+      cuid_(cuid) {  // Copy deltas
   if (deltas_.empty()) {
     merging_iter_ = NewEmptyInternalIterator<Slice>(nullptr);
     return;
+  }
+
+  if (read_options.enable_delta_diag_logging) {
+    std::stringstream ss;
+    ss << "[";
+    for (size_t i = 0; i < deltas_.size(); ++i) {
+      ss << deltas_[i].file_number << (i == deltas_.size() - 1 ? "" : ", ");
+    }
+    ss << "]";
+    fprintf(stderr, "[DIAG_DELTA_INIT] CUID %lu, Delta Files: %s\n",
+                   cuid_, ss.str().c_str());
   }
 
   bounds_storage_.reserve(deltas_.size() * 2);
@@ -452,8 +469,6 @@ void HotSnapshotIterator::Seek(const Slice& target) {
               current_iter_->Valid(), landed_key.c_str());
     }
 
-
-
     if (!Valid()) {
       SwitchToNextSegment();
       if (current_iter_) {
@@ -842,11 +857,7 @@ DeltaSwitchingIterator::DeltaSwitchingIterator(
       cold_iter_(nullptr),
       hot_iter_(nullptr),
       current_hot_cuid_(0),
-      is_hot_mode_(false) {
-  // if (version_) {
-  //   version_->Ref();
-  // }
-}
+      is_hot_mode_(false) {}
 
 DeltaSwitchingIterator::~DeltaSwitchingIterator() {
   if (hot_iter_) {
@@ -860,9 +871,6 @@ DeltaSwitchingIterator::~DeltaSwitchingIterator() {
       delete cold_iter_;
     }
   }
-  // if (version_) {
-  //   version_->Unref();
-  // }
 }
 
 void DeltaSwitchingIterator::InitColdIter() {
@@ -913,7 +921,7 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
                               hotspot_manager_->GetLifecycleManager());
 
   InternalIterator* delta_iter = new HotDeltaIterator(
-      entry.deltas, version_->cfd()->table_cache(), read_options_,
+      entry.deltas, cuid, version_->cfd()->table_cache(), read_options_,
       file_options_, icmp_, mutable_cf_options_, false);
 
   std::vector<InternalIterator*> children = {delta_iter, snapshot_iter};
