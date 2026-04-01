@@ -279,8 +279,11 @@ struct FileMetaData {
   bool user_defined_timestamps_persisted = true;
 
   // L0 partition id for partition-aware read/compaction.
-  // Valid range is [0, kL0PartitionCount). Default 0 for backward
-  // compatibility when the key schema does not expose table id.
+  // Valid partition ids are [0, kL0PartitionCount).
+  // kL0PartitionUnpartitioned means this file must be visible to all
+  // read_partition_id values (e.g., mixed-partition flush fallback output).
+  // Default 0 for backward compatibility when the key schema does not expose
+  // table id.
   uint32_t partition_id = 0;
 
   FileMetaData() = default;

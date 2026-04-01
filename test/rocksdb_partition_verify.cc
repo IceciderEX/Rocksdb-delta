@@ -107,6 +107,43 @@ bool ScanAndCheck(DB* db, const ReadOptions& ro, int expected_count,
   return true;
 }
 
+bool MultiGetAndCheck(DB* db, const ReadOptions& ro,
+                      const std::vector<std::string>& keys,
+                      const std::vector<bool>& expected_found) {
+  if (keys.size() != expected_found.size()) {
+    std::cerr << "Invalid test input: keys/expected_found size mismatch"
+              << std::endl;
+    return false;
+  }
+
+  std::vector<Slice> key_slices;
+  key_slices.reserve(keys.size());
+  for (const auto& key : keys) {
+    key_slices.emplace_back(key);
+  }
+
+  std::vector<std::string> values;
+  std::vector<Status> statuses = db->MultiGet(ro, key_slices, &values);
+  if (statuses.size() != expected_found.size()) {
+    std::cerr << "Unexpected MultiGet status count. expected="
+              << expected_found.size() << ", actual=" << statuses.size()
+              << std::endl;
+    return false;
+  }
+
+  for (size_t i = 0; i < statuses.size(); ++i) {
+    const bool found = statuses[i].ok();
+    if (found != expected_found[i]) {
+      std::cerr << "MultiGet mismatch at index " << i << ", expected_found="
+                << expected_found[i] << ", actual_status="
+                << statuses[i].ToString() << std::endl;
+      return false;
+    }
+  }
+
+  return true;
+}
+
 bool RunPartitionVerify() {
   Options options;
   options.create_if_missing = true;
@@ -179,6 +216,23 @@ bool RunPartitionVerify() {
     return false;
   }
 
+  const std::string key_p1 = MakeKey(kDbId, 1, 100, 0);
+  const std::string key_p2 = MakeKey(kDbId, 2, 200, 0);
+  const std::vector<std::string> check_keys = {key_p1, key_p2};
+
+  if (!MultiGetAndCheck(db, ro_all, check_keys, {true, true})) {
+    delete db;
+    return false;
+  }
+  if (!MultiGetAndCheck(db, ro_p1, check_keys, {true, false})) {
+    delete db;
+    return false;
+  }
+  if (!MultiGetAndCheck(db, ro_p2, check_keys, {false, true})) {
+    delete db;
+    return false;
+  }
+
   delete db;
 
   // Reopen: verify partition metadata persisted to MANIFEST and still works.
@@ -203,6 +257,73 @@ bool RunPartitionVerify() {
   }
 
   if (!ScanAndCheck(db, ro_p1, total_rows, false, -1)) {
+    delete db;
+    return false;
+  }
+
+  delete db;
+
+  // Recreate DB and verify partition reads still work when flush falls back
+  // (e.g., memtable contains range tombstones).
+  options.create_if_missing = true;
+  options.delta_options.enable_partition = true;
+  DestroyDB(kDBPath, options);
+
+  s = DB::Open(options, kDBPath, &db);
+  if (!s.ok()) {
+    std::cerr << "Open(range-delete fallback) failed: " << s.ToString()
+              << std::endl;
+    return false;
+  }
+
+  constexpr int kFallbackRows = 1000;
+  if (!WriteTableRows(db, 1, kFallbackRows) ||
+      !WriteTableRows(db, 2, kFallbackRows)) {
+    delete db;
+    return false;
+  }
+
+  WriteBatch wb;
+  wb.DeleteRange(MakeKey(kDbId + 10, 0, 0, 0), MakeKey(kDbId + 10, 0, 0, 1));
+  s = db->Write(WriteOptions(), &wb);
+  if (!s.ok()) {
+    std::cerr << "Write(range tombstone) failed: " << s.ToString()
+              << std::endl;
+    delete db;
+    return false;
+  }
+
+  s = db->Flush(FlushOptions());
+  if (!s.ok()) {
+    std::cerr << "Flush(range-delete fallback) failed: " << s.ToString()
+              << std::endl;
+    delete db;
+    return false;
+  }
+
+  ReadOptions ro_fallback_p1;
+  ro_fallback_p1.read_partition_id = 1;
+  if (!ScanAndCheck(db, ro_fallback_p1, kFallbackRows, true, 1)) {
+    delete db;
+    return false;
+  }
+
+  ReadOptions ro_fallback_p2;
+  ro_fallback_p2.read_partition_id = 2;
+  if (!ScanAndCheck(db, ro_fallback_p2, kFallbackRows, true, 2)) {
+    delete db;
+    return false;
+  }
+
+  const std::string fallback_key_p1 = MakeKey(kDbId, 1, 100, 0);
+  const std::string fallback_key_p2 = MakeKey(kDbId, 2, 200, 0);
+  const std::vector<std::string> fallback_keys = {fallback_key_p1,
+                                                  fallback_key_p2};
+  if (!MultiGetAndCheck(db, ro_fallback_p1, fallback_keys, {true, false})) {
+    delete db;
+    return false;
+  }
+  if (!MultiGetAndCheck(db, ro_fallback_p2, fallback_keys, {false, true})) {
     delete db;
     return false;
   }

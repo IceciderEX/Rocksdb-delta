@@ -14,6 +14,7 @@
 #include "db/db_iter.h"
 #include "db/dbformat.h"
 #include "db/job_context.h"
+#include "db/partition_filter_iterator.h"
 #include "db/range_del_aggregator.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "rocksdb/env.h"
@@ -24,6 +25,24 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+inline InternalIterator* WrapUnpartitionedL0IterIfNeeded(
+    InternalIterator* iter, const MutableCFOptions& mutable_cf_options,
+    const ReadOptions& read_options, const FileMetaData* file_meta) {
+  if (iter == nullptr || !mutable_cf_options.delta_options.enable_partition ||
+      read_options.read_partition_id < 0 || file_meta == nullptr) {
+    return iter;
+  }
+  if (file_meta->partition_id < kL0PartitionCount) {
+    return iter;
+  }
+  return new PartitionFilterIterator(
+      iter, static_cast<uint32_t>(read_options.read_partition_id));
+}
+
+}  // namespace
 
 // Usage:
 //     ForwardLevelIterator iter;
@@ -765,6 +784,9 @@ void ForwardIterator::RebuildIterators(bool refresh_sv) {
           MaxFileSizeForL0MetaPin(sv_->mutable_cf_options),
           /*smallest_compaction_key=*/nullptr,
           /*largest_compaction_key=*/nullptr, allow_unprepared_value_);
+          l0_iters_[loc.GetPosition()] = WrapUnpartitionedL0IterIfNeeded(
+              l0_iters_[loc.GetPosition()], sv_->mutable_cf_options,
+              read_options_, l0);
     }
   } else {
     for (size_t i = 0; i < l0_files.size(); ++i) {
@@ -885,6 +907,9 @@ void ForwardIterator::RenewIterators() {
             MaxFileSizeForL0MetaPin(svnew->mutable_cf_options),
             /*smallest_compaction_key=*/nullptr,
             /*largest_compaction_key=*/nullptr, allow_unprepared_value_);
+        l0_iters_new[new_loc.GetPosition()] = WrapUnpartitionedL0IterIfNeeded(
+            l0_iters_new[new_loc.GetPosition()], svnew->mutable_cf_options,
+            read_options_, l0_new);
       }
     }
   } else {
@@ -991,6 +1016,8 @@ void ForwardIterator::ResetIncompleteIterators() {
         MaxFileSizeForL0MetaPin(sv_->mutable_cf_options),
         /*smallest_compaction_key=*/nullptr,
         /*largest_compaction_key=*/nullptr, allow_unprepared_value_);
+      l0_iters_[i] = WrapUnpartitionedL0IterIfNeeded(
+        l0_iters_[i], sv_->mutable_cf_options, read_options_, l0_files[i]);
     l0_iters_[i]->SetPinnedItersMgr(pinned_iters_mgr_);
   };
 

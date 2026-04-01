@@ -1031,6 +1031,13 @@ Status FlushJob::WriteLevel0Table() {
     // 仅在开启分区且没有 Range Deletion 时启用分区 flush。
     const bool enable_partitioned_flush =
       enable_partition && (total_num_range_deletes == 0);
+    if (enable_partition && !enable_partitioned_flush) {
+      ROCKS_LOG_WARN(
+          db_options_.info_log,
+          "[%s] [JOB %d] Partitioned flush disabled due to range deletions; "
+          "marking L0 output as unpartitioned",
+          cfd_->GetName().c_str(), job_context_->job_id);
+    }
     uint64_t total_input_records_scanned = 0;
     uint64_t total_output_records_written = 0;
     uint64_t total_payload_bytes = 0;
@@ -1133,8 +1140,11 @@ Status FlushJob::WriteLevel0Table() {
           flush_stats.cpu_micros += partition_flush_stats.cpu_micros;
 
           if (partition_meta.fd.GetFileSize() > 0) {
-            partition_meta.partition_id =
-                enable_partitioned_flush ? partition_id : 0;
+            partition_meta.partition_id = enable_partitioned_flush
+                                             ? partition_id
+                                             : (enable_partition
+                                                    ? kL0PartitionUnpartitioned
+                                                    : 0);
             output_files.emplace_back(partition_meta);
             blob_file_additions.insert(blob_file_additions.end(),
                                        partition_blob_file_additions.begin(),

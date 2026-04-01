@@ -342,6 +342,8 @@ class VersionStorageInfo {
 
   // REQUIRES: PrepareForVersionAppend has been called
   // Returns cached L0 files that belong to the given partition.
+  // Also includes unpartitioned fallback files (if any), because they must be
+  // visible to all read_partition_id values.
   const std::vector<FileMetaData*>& Level0FilesForPartition(
       int32_t partition_id) const {
     assert(finalized_);

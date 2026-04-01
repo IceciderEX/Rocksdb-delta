@@ -433,12 +433,18 @@ Status CompactionOutputs::AddToOutput(
   }
 
   const ParsedInternalKey& ikey = c_iter.ikey();
+  const bool preserve_unpartitioned_output =
+      compaction_->mutable_cf_options().delta_options.enable_partition &&
+      compaction_->start_level() == 0 && compaction_->num_input_files(0) > 0 &&
+      compaction_->input(0, 0)->partition_id >= kL0PartitionCount;
   // for delta
   // 提取分区id
   if (compaction_->mutable_cf_options().delta_options.enable_partition &&
       current_output().meta.smallest.size() == 0) {
-    current_output().meta.partition_id =
-        ExtractL0PartitionFromUserKey(ikey.user_key);
+    current_output().meta.partition_id = preserve_unpartitioned_output
+                                             ? kL0PartitionUnpartitioned
+                                             : ExtractL0PartitionFromUserKey(
+                                                   ikey.user_key);
   }
   if (ikey.type == kTypeValuePreferredSeqno) {
     SequenceNumber preferred_seqno = ParsePackedValueForSeqno(value);

@@ -9,6 +9,10 @@ namespace ROCKSDB_NAMESPACE {
 // L0层分区总数，默认为16
 constexpr uint32_t kL0PartitionCount = 16;
 
+// L0 文件分区哨兵值：表示该文件属于“所有分区”（例如包含跨分区数据）。
+// 读取请求指定 read_partition_id 时，这类文件必须被包含，避免漏读。
+constexpr uint32_t kL0PartitionUnpartitioned = kL0PartitionCount;
+
 /**
  * 从 User Key 中提取 Table ID
  * 预期 Key 的前缀布局为: [dbid:8B][tableid:8B][cuid:8B][key:...]
