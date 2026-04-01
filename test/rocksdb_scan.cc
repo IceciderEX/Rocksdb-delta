@@ -10,7 +10,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
-#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -24,7 +23,6 @@
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/write_batch.h"
-#include "rocksdb/statistics.h"
 
 // ==========================================
 // 配置常量
@@ -32,12 +30,10 @@
 const std::string kNativeDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_native";
 const std::string kDeltaDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_delta";
 const int kNumThreads = 16;
-const int kTestDurationSec = 3000;       // s
-const int kNumCuids = 1000000;           // 100W CUID 总库
-const uint64_t kDbId = 1;
-const uint64_t kNumTableIds = 256;       // 保证每个 tableid 的 CUID 数量大致相同
-const int kBatchSize = 512;             // 每次 Put 128 行
-const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
+const int kTestDurationSec = 240;       // 8 分钟
+const int kNumCuids = 100000;           // 10W CUID 总库
+const int kBatchSize = 128;             // 每次 Put 128 行
+const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (约 25,600 行)
 const double kHotRatio = 0.15;          // 15% 的热点
 const int kHotScanTarget = 1000;        // 热点访问目标
 const int kColdScanTarget = 150;        // 普通访问目标
@@ -60,20 +56,6 @@ std::string GenerateKey(uint64_t cuid, int row_id) {
   std::string key;
   key.resize(40);
   std::memset(&key[0], 0, 40);
-
-  auto encode_u64_be = [&](uint64_t value, size_t offset) {
-    for (int i = 0; i < 8; ++i) {
-      key[offset + i] = static_cast<char>((value >> (56 - 8 * i)) & 0xFF);
-    }
-  };
-
-  // Hash-based mapping keeps CUID unique while distributing them
-  // approximately evenly across tableids.
-  const uint64_t mixed = cuid * 11400714819323198485ull;
-  const uint64_t table_id = (mixed % kNumTableIds) + 1;
-  encode_u64_be(kDbId, 0);
-  encode_u64_be(table_id, 8);
-
   unsigned char* p = reinterpret_cast<unsigned char*>(&key[0]) + 16;
   for (int i = 0; i < 8; ++i) {
     p[i] = (cuid >> (56 - 8 * i)) & 0xFF; // Big Endian
@@ -82,12 +64,6 @@ std::string GenerateKey(uint64_t cuid, int row_id) {
   snprintf(row_buf, sizeof(row_buf), "%010d", row_id);
   std::memcpy(&key[24], row_buf, 10);
   return key;
-}
-
-std::string GenerateCuidUpperBoundKey(uint64_t cuid) {
-  // Use per-CUID row upper bound directly (exclusive) and do not rely on
-  // table-id/cuid ordering relationships.
-  return GenerateKey(cuid, kTargetPutBatches * kBatchSize);
 }
 
 uint64_t ExtractCUID(const rocksdb::Slice& key) {
@@ -129,118 +105,66 @@ class PerfRunner {
   PerfRunner(rocksdb::DB* db, std::atomic<uint64_t>* next_cuid) 
       : db_(db), next_cuid_(next_cuid) {}
 
-    struct CuidState {
-      uint64_t cuid;
-      bool is_hot;
-      int target_scans;
-      int puts_done = 0;
-      int scans_done = 0;
-      std::chrono::steady_clock::time_point last_scan_time = std::chrono::steady_clock::now();
-    };
-
   void Run(int thread_id, std::atomic<bool>* stop, ThreadStats* stats) {
     std::default_random_engine gen(thread_id + static_cast<int>(time(0)));
     std::uniform_real_distribution<double> dist(0.0, 1.0);
     rocksdb::ReadOptions read_opts;
-    
-    std::vector<CuidState> active_cuids;
-    std::deque<std::pair<uint64_t, int>> pending_deletes;
-    
-    // === 100GB 目标数据量计算过程 ===
-    // 单个 CUID 数据量约：512 batch * 200 rows/batch * 72 bytes/row ≈ 7.37 MB
-    // 实现 100GB 常驻数据需 100,000 / 7.37 ≈ 13,568 个 CUID
-    // 设 16 线程，则每线程需维持 13,568 / 16 ≈ 848 个 CUID (活跃 + 待删除)
-    const size_t kMaxActiveCuids = 10;   
-    const size_t kDeleteWindowSize = 50; 
 
-    auto add_new_cuid = [&]() {
+    while (!stop->load()) {
+      // 1. 领取一个全新的 CUID
       uint64_t cuid = next_cuid_->fetch_add(1);
-      if (cuid > kNumCuids) return false;
-      CuidState state;
-      state.cuid = cuid;
-      state.is_hot = (((cuid * 1103515245 + 12345) / 65536) % 100 < (kHotRatio * 100));
-      state.target_scans = state.is_hot ? kHotScanTarget : kColdScanTarget;
-      active_cuids.push_back(state);
-      return true;
-    };
+      if (cuid > kNumCuids) break;
 
-    // 1. 初始化每个线程的活跃工作池
-    for (size_t i = 0; i < kMaxActiveCuids; ++i) {
-      if (!add_new_cuid()) break;
-    }
+      // 2. 状态初始化
+      // 使用简单的哈希分散热点分布，避免热动 CUID 集中顺序出现
+      bool is_hot = (((cuid * 1103515245 + 12345) / 65536) % 100 < (kHotRatio * 100));
+      int target_scans = is_hot ? kHotScanTarget : kColdScanTarget;
+      int puts_done = 0;
+      int scans_done = 0;
 
-    while (!stop->load() && !active_cuids.empty()) {
-      // 2. 随机挑选一个没有走完生命周期的活跃 CUID
-      std::uniform_int_distribution<size_t> idx_dist(0, active_cuids.size() - 1);
-      size_t idx = idx_dist(gen);
-      auto& state = active_cuids[idx];
+      // 3. 执行单 CUID 顺序周期：交替进行写入和读取
+      while (puts_done < kTargetPutBatches || scans_done < target_scans) {
+        if (stop->load()) return;
 
-      bool do_put = false;
-      if (state.puts_done < kTargetPutBatches) {
-        if (state.scans_done < state.target_scans) {
-          // 根据进度比例交替，确保 Put 均匀分布在整个 Scan 周期中
-          if ((double)state.puts_done / kTargetPutBatches <= (double)state.scans_done / state.target_scans) {
-            do_put = true;
+        bool do_put = false;
+        if (puts_done < kTargetPutBatches) {
+          if (scans_done < target_scans) {
+            // 根据进度比例交替，确保 Put 均匀分布在整个 Scan 周期中
+            if ((double)puts_done / kTargetPutBatches <= (double)scans_done / target_scans) {
+              do_put = true;
+            } else {
+              do_put = false;
+            }
           } else {
-            do_put = false;
+            do_put = true; // 只剩 Put 没做了
           }
         } else {
-          do_put = true; // 只剩 Put 没做了
+          do_put = false; // 只剩 Scan 没做了
         }
-      } else {
-        do_put = false; // 只剩 Scan 没做了
-      }
 
-
-      // 3. 执行动作
-      if (do_put) {
-        DoPut(state.cuid, state.puts_done * kBatchSize, stats);
-        state.puts_done++;
-      } else {
-        bool full_scan = (dist(gen) < 0.2); // 20% Full Scan (SAC) / 80% Partial Scan
-        DoScan(state.cuid, state.puts_done * kBatchSize, full_scan, read_opts, stats, gen);
-        state.scans_done++;
-        // state.last_scan_time = now;
-      }
-
-      // 模拟业务节奏
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-
-      // 4. 判断该 CUID 是否终于走完了完整的轮回
-      if (state.puts_done >= kTargetPutBatches && state.scans_done >= state.target_scans) {
-        int final_rows = state.puts_done * kBatchSize;
-        int final_scan_count = DoScan(state.cuid, final_rows, true, read_opts, stats, gen);
-        if (final_scan_count != final_rows) {
-          std::cerr << "[ERROR] Thread " << thread_id << " - CUID " << state.cuid 
-                    << " final full scan mismatch! Expected: " << final_rows 
-                    << ", Actual: " << final_scan_count << std::endl;
-        }
-        
-        // 移入延迟删除队列（不马上删，让数据有命沉淀到底层）
-        pending_deletes.push_back({state.cuid, final_rows});
-        active_cuids.erase(active_cuids.begin() + idx); 
-
-        // 补充一个新的血液到池子里
-        add_new_cuid();
-
-        // 推进删除滑动时间窗
-        if (pending_deletes.size() > kDeleteWindowSize) {
-          auto oldest = pending_deletes.front();
-          pending_deletes.pop_front();
-          DoDelete(oldest.first, oldest.second, stats);
+        if (do_put) {
+          DoPut(cuid, puts_done * kBatchSize, stats);
+          puts_done++;
+        } else {
+          bool full_scan = (dist(gen) < 0.1);
+          DoScan(cuid, puts_done * kBatchSize, full_scan, read_opts, stats);
+          scans_done++;
         }
       }
-    }
 
-    // 线程退出前，如果时间已经到了 (stop->load() 为 true)
-    // 那么直接放弃收尾清理 pending_deletes，以避免测试停滞无法结束。
-    // 在真实应用中系统退出也不需要把全部数据删掉。
-    if (!stop->load()) {
-      while (!pending_deletes.empty()) {
-        auto oldest = pending_deletes.front();
-        pending_deletes.pop_front();
-        DoDelete(oldest.first, oldest.second, stats);
+      // 4. 终结清理：最后一次 Full Scan -> 逐一物理删除
+      int final_rows = puts_done * kBatchSize;
+      int final_scan_count = DoScan(cuid, final_rows, true, read_opts, stats);
+      if (final_scan_count != final_rows) {
+        std::cerr << "[ERROR] Thread " << thread_id << " - CUID " << cuid 
+                  << " final full scan mismatch! Expected: " << final_rows 
+                  << ", Actual: " << final_scan_count << std::endl;
       }
+      DoDelete(cuid, final_rows, stats);
+
+      // std::cout << "[Thread " << thread_id << "] Completed CUID " << cuid
+      //           << " (Rows: " << final_rows << ", Scans: " << scans_done
+      //           << ", Hot: " << is_hot << ")" << std::endl;
     }
   }
 
@@ -248,7 +172,7 @@ class PerfRunner {
   void DoPut(uint64_t cuid, int start_row, ThreadStats* stats) {
     rocksdb::WriteBatch batch;
     for (int i = 0; i < kBatchSize; ++i) {
-      batch.Put(GenerateKey(cuid, start_row + i), "value_data_payload_xxxxxxxxxxxxxxxxxxxx");
+      batch.Put(GenerateKey(cuid, start_row + i), "value_data_payload_xxxxxxx");
     }
     auto start = std::chrono::high_resolution_clock::now();
     rocksdb::Status s = db_->Write(rocksdb::WriteOptions(), &batch);
@@ -256,27 +180,15 @@ class PerfRunner {
     stats->AddPut(std::chrono::duration<double, std::milli>(end - start).count());
   }
 
-  int DoScan(uint64_t cuid, int cur_rows, bool full_scan, const rocksdb::ReadOptions& ro, ThreadStats* stats, std::default_random_engine& gen) {
+  int DoScan(uint64_t cuid, int cur_rows, bool full_scan, const rocksdb::ReadOptions& ro, ThreadStats* stats) {
     std::string start_key, end_key;
     if (full_scan) {
       start_key = GenerateKey(cuid, 0);
-      end_key = GenerateCuidUpperBoundKey(cuid);
+      end_key = GenerateKey(cuid + 1, 0);
     } else {
-      // 随机扫描 10%-75% 的数据范围
-      if (cur_rows < 10) {
-          start_key = GenerateKey(cuid, 0);
-          end_key = GenerateKey(cuid, cur_rows);
-      } else {
-          int min_len = static_cast<int>(cur_rows * 0.1);
-          int max_len = static_cast<int>(cur_rows * 0.75);
-          std::uniform_int_distribution<int> len_dist(min_len, std::max(min_len + 1, max_len));
-          int scan_len = len_dist(gen);
-          
-          std::uniform_int_distribution<int> start_dist(0, std::max(0, cur_rows - scan_len));
-          int start_row = start_dist(gen);
-          start_key = GenerateKey(cuid, start_row);
-          end_key = GenerateKey(cuid, start_row + scan_len);
-      }
+      int offset = std::max(0, cur_rows - 500);
+      start_key = GenerateKey(cuid, offset);
+      end_key = GenerateKey(cuid, cur_rows);
     }
 
     rocksdb::Slice upper_bound(end_key);
@@ -358,7 +270,6 @@ int main() {
   auto run_benchmark = [&](const std::string& path, bool delta_enabled, const std::string& label) {
     rocksdb::Options options;
     options.create_if_missing = true;
-    options.statistics = rocksdb::CreateDBStatistics();
     
     if (delta_enabled) {
       options.enable_delta = true;
@@ -369,16 +280,16 @@ int main() {
       options.delta_options.hotspot_scan_window_sec = 300;
       options.delta_options.delta_merge_threshold = 3;
       options.delta_options.sac_delta_count_threshold = 5;
-      options.delta_options.sharding_count = 64; // Power of 2 recommended
+      options.delta_options.sharding_count = 128; // Power of 2 recommended
       options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
       options.delta_options.hot_data_buffer_shards = 128;
       options.delta_options.compaction_l0_trigger_count = 30;
       options.delta_options.compaction_l0_trigger_age_sec = 3600;
-      options.delta_options.compaction_l0_files_to_pick = 10;
+      options.delta_options.compaction_l0_files_to_pick = 5;
       // -------------------------------------------------------------
       options.level0_slowdown_writes_trigger = 200; // l0 file count thres
       options.level0_stop_writes_trigger = 400; // l0 file count thres
-      options.level0_file_num_compaction_trigger = 100; // l0 file count thres
+      options.level0_file_num_compaction_trigger = 50; // l0 file count thres
       options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
       options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
       options.max_background_jobs = 16; // 与写入线程相同？
@@ -415,23 +326,6 @@ int main() {
     for (auto& t : workers) t.join();
 
     ReportStats(label, all_thread_stats);
-    
-    // Output comprehensive DB statistics
-    std::string stats;
-    if (db->GetProperty(rocksdb::DB::Properties::kStats, &stats)) {
-      std::cout << "\n=== DB Statistics for " << label << " ===\n";
-      std::cout << stats << std::endl;
-      std::cout << "=====================================\n";
-    }
-
-    // Output Level Stats clearly
-    std::string level_stats;
-    if (db->GetProperty(rocksdb::DB::Properties::kLevelStats, &level_stats)) {
-      std::cout << "\n=== Level File Count Statistics (" << label << ") ===\n";
-      std::cout << level_stats << std::endl;
-      std::cout << "=====================================\n";
-    }
-
     delete db;
   };
 

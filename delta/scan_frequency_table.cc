@@ -43,7 +43,8 @@ bool ScanFrequencyTable::RecordAndCheckHot(uint64_t cuid, bool* became_hot) {
     *became_hot = false;
   }
   
-  CheckAndRotateWindow(shard);
+  // 暂时不使用 window 策略
+  // CheckAndRotateWindow(shard);
 
   FrequencyEntry& entry = shard.table[cuid];
 
