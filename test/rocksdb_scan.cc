@@ -127,7 +127,7 @@ class PerfRunner {
     // === 100GB 目标数据量计算过程 ===
     // 单个 CUID 数据量约：128 batch * 500 rows/batch * 72 bytes/row ≈ 4.3945 MB
     // 实现 100GB 常驻数据需 100,000 / 4.3945 ≈ 22,750 个 CUID
-    // 设 16 线程，则每线程需维持 22,750 / 16 ≈ 1,422 个 CUID (活跃 + 待删除)
+    // 设 32 线程，则每线程需维持 22,750 / 32 ≈ 711 个 CUID (活跃 + 待删除)
     const size_t kMaxActiveCuids = 50;   
     const size_t kDeleteWindowSize = 150; 
 

@@ -7360,13 +7360,13 @@ void DBImpl::BackgroundDeltaWork() {
     hotspot_manager_->CompactAndFlushGDCTLogIfNeeded();
 
     // DIAG: Check queue sizes
-    static int log_counter = 0;
-    if (++log_counter % 10 == 0) {
-        fprintf(stderr, "[DIAG_BG] Processing BG Work... Pending Tasks: Hot=%d, Metadata=%d, PartialMerge=%d\n",
-                        (int)hotspot_manager_->HasPendingInitCuids(),
-                        (int)hotspot_manager_->HasPendingMetadataScans(),
-                        (int)hotspot_manager_->HasPendingPartialMerge());
-    }
+    // static int log_counter = 0;
+    // if (++log_counter % 10 == 0) {
+    //     fprintf(stderr, "[DIAG_BG] Processing BG Work... Pending Tasks: Hot=%d, Metadata=%d, PartialMerge=%d\n",
+    //                     (int)hotspot_manager_->HasPendingInitCuids(),
+    //                     (int)hotspot_manager_->HasPendingMetadataScans(),
+    //                     (int)hotspot_manager_->HasPendingPartialMerge());
+    // }
     
     ProcessPendingHotCuids();
     ProcessPendingMetadataScans();

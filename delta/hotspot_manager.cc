@@ -445,15 +445,15 @@ Status HotspotManager::FlushBlockToSharedSST(
       segment.last_key = segment_last_key;
       (*output_segments)[current_cuid] = segment;
 
-      if (current_cuid == 1003) {
-        fprintf(stderr,
-                "[DIAG_FLUSH] CUID 1003: SST %lu written_count=%d "
-                "range=[%s - %s] bucket_size=%zu\n",
-                file_number, written_count,
-                FormatKeyDisplay(segment_first_key).c_str(),
-                FormatKeyDisplay(segment_last_key).c_str(),
-                bucket_entries.size());
-      }
+      // if (current_cuid == 1003) {
+      //   fprintf(stderr,
+      //           "[DIAG_FLUSH] CUID 1003: SST %lu written_count=%d "
+      //           "range=[%s - %s] bucket_size=%zu\n",
+      //           file_number, written_count,
+      //           FormatKeyDisplay(segment_first_key).c_str(),
+      //           FormatKeyDisplay(segment_last_key).c_str(),
+      //           bucket_entries.size());
+      // }
     }
   }
 
