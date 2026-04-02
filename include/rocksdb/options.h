@@ -85,6 +85,9 @@ struct DeltaOptions {
 
   // Global Concurrency/Sharding (Default for GDCT/HotIndex/ScanFreq)
   uint32_t sharding_count = 128;
+  
+  // Background threads for Delta workloads
+  int max_delta_threads = 1;
 
   bool operator==(const DeltaOptions& other) const {
     return hotspot_scan_threshold == other.hotspot_scan_threshold &&
@@ -101,6 +104,7 @@ struct DeltaOptions {
            compaction_l0_trigger_count == other.compaction_l0_trigger_count &&
            compaction_l0_trigger_age_sec == other.compaction_l0_trigger_age_sec &&
            compaction_l0_files_to_pick == other.compaction_l0_files_to_pick &&
+           max_delta_threads == other.max_delta_threads &&
            sharding_count == other.sharding_count;
   }
 

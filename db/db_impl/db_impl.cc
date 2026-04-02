@@ -297,9 +297,10 @@ void DBImpl::InitializeHotspotManager(const Options& options) {
 
     std::cout << "HotspotManager initialized at DBImpl " << hotspot_dir.c_str() << std::endl;
 
-    // Start dedicated delta background worker thread
-    delta_bg_stop_.store(false, std::memory_order_relaxed);
-    delta_bg_thread_ = std::thread(&DBImpl::DeltaBGWorkThreadFunc, this);
+    {
+      InstrumentedMutexLock l(&mutex_);
+      MaybeScheduleDeltaWork();
+    }
   }
 }
 
@@ -552,13 +553,6 @@ Status DBImpl::CloseHelper() {
   // marker. After this we do a variant of the waiting and unschedule work
   // (to consider: moving all the waiting into CancelAllBackgroundWork(true))
   CancelAllBackgroundWork(false);
-  // for delta
-  // Stop delta background thread before other cleanup
-  delta_bg_stop_.store(true, std::memory_order_release);
-  delta_bg_cv_.notify_all();
-  if (delta_bg_thread_.joinable()) {
-    delta_bg_thread_.join();
-  }
 
   // Cancel manual compaction if there's any
   if (HasPendingManualCompaction()) {
@@ -575,8 +569,9 @@ Status DBImpl::CloseHelper() {
   Status ret = Status::OK();
 
   // Wait for background work to finish
+  // for delta
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_ || bg_purge_scheduled_ ||
+         bg_flush_scheduled_ || bg_purge_scheduled_ || bg_delta_scheduled_ ||
          pending_purge_obsolete_files_ ||
          error_handler_.IsRecoveryInProgress()) {
     TEST_SYNC_POINT("DBImpl::~DBImpl:WaitJob");
@@ -7323,43 +7318,66 @@ void DBImpl::ProcessPendingPartialMerge() {
 }
 
 void DBImpl::NotifyDeltaBGWork() {
-  delta_bg_cv_.notify_one();
+  InstrumentedMutexLock l(&mutex_);
+  MaybeScheduleDeltaWork();
 }
 
-void DBImpl::DeltaBGWorkThreadFunc() {
-  while (true) {
-    {
-      std::unique_lock<std::mutex> lock(delta_bg_mutex_);
-      // 使用 wait_for 周期性唤醒以检查刷写异步 gdct 日志任务
-      delta_bg_cv_.wait_for(lock, std::chrono::seconds(600), [this] {
-        return delta_bg_stop_.load(std::memory_order_acquire) ||
-               (hotspot_manager_ &&
-                (hotspot_manager_->HasPendingInitCuids() ||
-                 hotspot_manager_->HasPendingMetadataScans() ||
-                 hotspot_manager_->HasPendingPartialMerge()));
-      });
-    }
-    if (delta_bg_stop_.load(std::memory_order_acquire)) {
-      break;
-    }
+void DBImpl::BGWorkDelta(void* arg) {
+  DBImpl* db = reinterpret_cast<DBImpl*>(arg);
+  db->BackgroundDeltaWork();
+}
 
-    // 周期性异步刷盘并尝试对长日志执行收缩重写
-    if (hotspot_manager_) {
-      hotspot_manager_->CompactAndFlushGDCTLogIfNeeded();
-      
-      // DIAG: Check queue sizes
-      static int log_counter = 0;
-      if (++log_counter % 10 == 0) {
-          fprintf(stderr, "[DIAG_BG] Processing BG Work... Pending Tasks: Hot=%d, Metadata=%d, PartialMerge=%d\n",
-                          (int)hotspot_manager_->HasPendingInitCuids(),
-                          (int)hotspot_manager_->HasPendingMetadataScans(),
-                          (int)hotspot_manager_->HasPendingPartialMerge());
-      }
-    }
+void DBImpl::MaybeScheduleDeltaWork() {
+  mutex_.AssertHeld();
+  
+  if (shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+  // 允许多个后台线程并发处理 delta 任务，使用系统的 LOW 优先级线程池
+  int max_delta_threads = immutable_db_options_.max_background_compactions;
+  if (max_delta_threads <= 0) max_delta_threads = 1;
+  if (bg_delta_scheduled_ >= max_delta_threads) {
+    return;
+  }
+  
+  bool has_work = hotspot_manager_ &&
+                  (hotspot_manager_->HasPendingInitCuids() ||
+                   hotspot_manager_->HasPendingMetadataScans() ||
+                   hotspot_manager_->HasPendingPartialMerge());
 
+  if (has_work) {
+    bg_delta_scheduled_++;
+    env_->Schedule(&DBImpl::BGWorkDelta, this, Env::Priority::LOW, nullptr);
+  }
+}
+
+void DBImpl::BackgroundDeltaWork() {
+  TEST_SYNC_POINT("DBImpl::BackgroundDeltaWork:Start");
+  
+  if (hotspot_manager_) {
+    hotspot_manager_->CompactAndFlushGDCTLogIfNeeded();
+
+    // DIAG: Check queue sizes
+    static int log_counter = 0;
+    if (++log_counter % 10 == 0) {
+        fprintf(stderr, "[DIAG_BG] Processing BG Work... Pending Tasks: Hot=%d, Metadata=%d, PartialMerge=%d\n",
+                        (int)hotspot_manager_->HasPendingInitCuids(),
+                        (int)hotspot_manager_->HasPendingMetadataScans(),
+                        (int)hotspot_manager_->HasPendingPartialMerge());
+    }
+    
     ProcessPendingHotCuids();
     ProcessPendingMetadataScans();
     ProcessPendingPartialMerge();
+  }
+  // 任务完成后，减少计数，并检查是否还有积压的任务需要调度
+  {
+    InstrumentedMutexLock l(&mutex_);
+    bg_delta_scheduled_--;
+    if (bg_delta_scheduled_ == 0) {
+      bg_cv_.SignalAll();
+    }
+    MaybeScheduleDeltaWork();
   }
 }
 

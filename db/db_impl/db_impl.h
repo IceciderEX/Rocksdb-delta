@@ -3207,12 +3207,12 @@ class DBImpl : public DB {
 
   // for delta
   std::shared_ptr<HotspotManager> hotspot_manager_;
-  // Delta background worker thread
-  std::thread delta_bg_thread_;
-  std::mutex delta_bg_mutex_;
-  std::condition_variable delta_bg_cv_;
-  std::atomic<bool> delta_bg_stop_{false};
-  void DeltaBGWorkThreadFunc();
+  
+  // Delta background work [TO ROCKSDB Env]
+  int bg_delta_scheduled_ = 0;
+  static void BGWorkDelta(void* arg);
+  void BackgroundDeltaWork();
+  void MaybeScheduleDeltaWork();
   void InitializeHotspotManager(const Options& options);
 
  public:

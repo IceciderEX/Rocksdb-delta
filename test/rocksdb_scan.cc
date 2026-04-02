@@ -353,6 +353,7 @@ int main() {
       options.delta_options.compaction_l0_trigger_count = 30;
       options.delta_options.compaction_l0_trigger_age_sec = 3600;
       options.delta_options.compaction_l0_files_to_pick = 10;
+      options.delta_options.max_delta_threads = 4;
       // -------------------------------------------------------------
       options.level0_slowdown_writes_trigger = 200; // l0 file count thres
       options.level0_stop_writes_trigger = 400; // l0 file count thres
