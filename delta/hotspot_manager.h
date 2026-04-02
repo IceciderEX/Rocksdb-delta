@@ -159,8 +159,8 @@ class HotspotManager {
   // 将 CUID 加入待初始化队列 (首次成为热点时调用)
   void EnqueueForInitScan(uint64_t cuid);
 
-  // 获取并清空待初始化队列 (由 DBImpl 后台线程调用)
-  std::vector<uint64_t> PopPendingInitCuids();
+  // 获取并清空部分待初始化队列 (由 DBImpl 后台线程调用)
+  std::vector<uint64_t> PopPendingInitCuids(size_t max_count = 32);
 
   // 检查是否有待处理的初始化任务
   bool HasPendingInitCuids() const;
@@ -168,8 +168,8 @@ class HotspotManager {
   // 将 CUID 加入待补全元数据的扫描队列
   void EnqueueMetadataScan(uint64_t cuid);
 
-  // 获取并清空待补全元数据的扫描队列
-  std::vector<uint64_t> PopPendingMetadataScans();
+  // 获取并部清空待补全元数据的扫描队列
+  std::vector<uint64_t> PopPendingMetadataScans(size_t max_count = 32);
 
   // 检查是否有待处理的物理单元计数扫描任务
   bool HasPendingMetadataScans() const;

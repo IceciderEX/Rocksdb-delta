@@ -290,12 +290,15 @@ void DBImpl::InitializeHotspotManager(const Options& options) {
       return; // Already initialized
     }
     std::string hotspot_dir = dbname_ + "/hotspot_data";
-    auto* internal_comparator = &versions_->GetColumnFamilySet()->GetDefault()->internal_comparator();
+    auto* internal_comparator =
+        &versions_->GetColumnFamilySet()->GetDefault()->internal_comparator();
     hotspot_manager_ = std::make_shared<HotspotManager>(
         options, hotspot_dir, internal_comparator);
     immutable_db_options_.hotspot_manager = hotspot_manager_;
 
-    std::cout << "HotspotManager initialized at DBImpl " << hotspot_dir.c_str() << std::endl;
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[DBImpl] HotspotManager initialized at %s",
+                   hotspot_dir.c_str());
     // BGDeltaWork
     mutex_.AssertHeld();
     MaybeScheduleDeltaWork();
@@ -6970,8 +6973,8 @@ void DBImpl::ProcessPendingHotCuids() {
     return;
   }
 
-  // 获取待处理的 CUID 列表
-  std::vector<uint64_t> pending_cuids = hotspot_manager_->PopPendingInitCuids();
+  // 获取待处理的 CUID 列表 (按批次获取)
+  std::vector<uint64_t> pending_cuids = hotspot_manager_->PopPendingInitCuids(32);
   if (pending_cuids.empty()) {
     return;
   }
@@ -7039,7 +7042,7 @@ void DBImpl::ProcessPendingMetadataScans() {
   }
 
   std::vector<uint64_t> pending_cuids =
-      hotspot_manager_->PopPendingMetadataScans();
+      hotspot_manager_->PopPendingMetadataScans(32);
   if (pending_cuids.empty()) {
     return;
   }
@@ -7143,176 +7146,170 @@ void DBImpl::ProcessPendingPartialMerge() {
   if (!hotspot_manager_) {
     return;
   }
-  PartialMergePendingTask task;
-  if (!hotspot_manager_->PopPendingPartialMerge(&task)) {
-    return;
-  }
-
-  ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                 "[DBImpl] Processing PartialMerge for CUID %" PRIu64,
-                 task.cuid);
-
-  // 获取重叠的 segments
-  std::vector<DataSegment> overlapping_snaps, overlapping_deltas;
-  hotspot_manager_->GetIndexTable().GetOverlappingSegments(
-      task.cuid, task.scan_first_key, task.scan_last_key, &overlapping_snaps,
-      &overlapping_deltas);
-
-  // 如果没有重叠数据，使用 FullReplace 逻辑
-  if (overlapping_snaps.empty() && overlapping_deltas.empty()) {
-    DataSegment new_segment;
-    new_segment.file_number = static_cast<uint64_t>(-1);
-    new_segment.first_key = task.scan_first_key;
-    new_segment.last_key = task.scan_last_key;
-    hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
-        task.cuid, new_segment, std::vector<uint64_t>{});
-    hotspot_manager_->UnlockCuid(task.cuid);
-    return;
-  }
 
   ColumnFamilyHandle* cfh = DefaultColumnFamily();
   if (!cfh) {
-    ROCKS_LOG_ERROR(immutable_db_options_.info_log,
-                    "[DBImpl] No default column family for partial merge");
-    hotspot_manager_->UnlockCuid(task.cuid);
     return;
   }
 
   auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(cfh)->cfd();
   SuperVersion* sv = GetAndRefSuperVersion(cfd);
   if (!sv) {
-    ROCKS_LOG_ERROR(immutable_db_options_.info_log,
-                    "[DBImpl] Failed to get SuperVersion for partial merge");
-    hotspot_manager_->UnlockCuid(task.cuid);
     return;
   }
-
-  // fprintf(stderr, "[DIAG_SV] Acquired SV %p for CUID %lu\n", sv, (unsigned long)task.cuid);
 
   const auto& icmp = cfd->internal_comparator();
   ReadOptions read_opts;
   FileOptions file_opts;
   MutableCFOptions mutable_cf_opts = cfd->GetLatestMutableCFOptions();
 
-  // 创建迭代器
-  std::vector<InternalIterator*> children;
+  // 批量处理，减少 Ref/Unref 开销
+  const int kBatchSize = 32;
+  int processed_count = 0;
 
-  // 1. Snapshot Iterator
-  if (!overlapping_snaps.empty()) {
-    InternalIterator* snap_iter = new HotSnapshotIterator(
-        overlapping_snaps, task.cuid, hotspot_manager_.get(),
-        cfd->table_cache(), read_opts, file_opts, icmp, mutable_cf_opts,
-        hotspot_manager_->GetLifecycleManager());
-    children.push_back(snap_iter);
-  }
+  while (processed_count < kBatchSize) {
+    PartialMergePendingTask task;
+    if (!hotspot_manager_->PopPendingPartialMerge(&task)) {
+      break;
+    }
 
-  // 2. Delta Iterator
-  if (!overlapping_deltas.empty()) {
-    InternalIterator* delta_iter =
-        new HotDeltaIterator(overlapping_deltas, task.cuid, cfd->table_cache(),
-                             read_opts, file_opts, icmp, mutable_cf_opts, false);
-    children.push_back(delta_iter);
-  }
+    processed_count++;
+    // fprintf(stderr, "[DIAG_SV] Processing PartialMerge for CUID %lu in batch
+    // (SV:%p)\n", (unsigned long)task.cuid, sv);
 
-  // 3. Scan Data Iterator (Local to this PartialMerge execution)
-  InternalIterator* scan_data_iter = nullptr;
-  if (!task.scan_data.empty()) {
-    scan_data_iter = new ScanDataIterator(task.scan_data);
-    children.push_back(scan_data_iter);
-  }
+    // 获取重叠的 segments
+    std::vector<DataSegment> overlapping_snaps, overlapping_deltas;
+    hotspot_manager_->GetIndexTable().GetOverlappingSegments(
+        task.cuid, task.scan_first_key, task.scan_last_key, &overlapping_snaps,
+        &overlapping_deltas);
 
-  if (children.empty()) {
-    ReturnAndCleanupSuperVersion(cfd, sv);
+    // 如果没有重叠数据，使用 FullReplace 逻辑
+    if (overlapping_snaps.empty() && overlapping_deltas.empty()) {
+      DataSegment new_segment;
+      new_segment.file_number = static_cast<uint64_t>(-1);
+      new_segment.first_key = task.scan_first_key;
+      new_segment.last_key = task.scan_last_key;
+      hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
+          task.cuid, new_segment, std::vector<uint64_t>{});
+      hotspot_manager_->UnlockCuid(task.cuid);
+      continue;
+    }
+
+    // 创建迭代器
+    std::vector<InternalIterator*> children;
+
+    // 1. Snapshot Iterator
+    if (!overlapping_snaps.empty()) {
+      InternalIterator* snap_iter = new HotSnapshotIterator(
+          overlapping_snaps, task.cuid, hotspot_manager_.get(),
+          cfd->table_cache(), read_opts, file_opts, icmp, mutable_cf_opts,
+          hotspot_manager_->GetLifecycleManager());
+      children.push_back(snap_iter);
+    }
+
+    // 2. Delta Iterator
+    if (!overlapping_deltas.empty()) {
+      InternalIterator* delta_iter = new HotDeltaIterator(
+          overlapping_deltas, task.cuid, cfd->table_cache(), read_opts,
+          file_opts, icmp, mutable_cf_opts, false);
+      children.push_back(delta_iter);
+    }
+
+    // 3. Scan Data Iterator (Local to this PartialMerge execution)
+    InternalIterator* scan_data_iter = nullptr;
+    if (!task.scan_data.empty()) {
+      scan_data_iter = new ScanDataIterator(task.scan_data);
+      children.push_back(scan_data_iter);
+    }
+
+    if (children.empty()) {
+      hotspot_manager_->UnlockCuid(task.cuid);
+      continue;
+    }
+
+    // 创建 MergingIterator
+    InternalIterator* merging_iter = NewMergingIterator(
+        &icmp, children.data(), static_cast<int>(children.size()));
+
+    // 遍历归并并写入 Buffer，去重并过滤 CUID
+    std::string last_user_key;
+    std::string segment_first_key, segment_last_key;
+    size_t written_count = 0;
+    bool trigger_flush = false;
+
+    for (merging_iter->SeekToFirst(); merging_iter->Valid();
+         merging_iter->Next()) {
+      Slice key = merging_iter->key();
+
+      // 提取 CUID 并进行过滤
+      uint64_t current_cuid = hotspot_manager_->ExtractCUID(key);
+      // Key 是按照 CUID 有序排列的，一旦超过目标 CUID 停止扫描
+      if (current_cuid > task.cuid) {
+        break;
+      }
+      if (current_cuid < task.cuid) {
+        continue;
+      }
+
+      Slice value = merging_iter->value();
+      Slice user_key = ExtractUserKey(key);
+
+      // Slice 比较减少 ToString 开销
+      if (!last_user_key.empty() &&
+          icmp.user_comparator()->Compare(user_key, Slice(last_user_key)) == 0) {
+        continue;
+      }
+      last_user_key.assign(user_key.data(), user_key.size());
+
+      // 写入 Buffer
+      if (hotspot_manager_->BufferHotData(task.cuid, key, value)) {
+        trigger_flush = true;
+      }
+
+      if (segment_first_key.empty()) {
+        segment_first_key = key.ToString();
+      }
+      segment_last_key = key.ToString();
+      written_count++;
+    }
+
+    delete merging_iter;
+
+    if (written_count > 0) {
+      // 构造新的 DataSegment
+      DataSegment new_segment;
+      new_segment.file_number = static_cast<uint64_t>(-1);
+      new_segment.first_key = segment_first_key;
+      new_segment.last_key = segment_last_key;
+
+      // 收集需要清理的旧文件
+      std::vector<uint64_t> obsolete_files;
+      for (const auto& seg : overlapping_snaps) {
+        if (seg.file_number != static_cast<uint64_t>(-1)) {
+          obsolete_files.push_back(seg.file_number);
+        }
+      }
+      for (const auto& seg : overlapping_deltas) {
+        obsolete_files.push_back(seg.file_number);
+      }
+
+      // 这里先处理为 {-1} 的内存 segment 替换，后续再触发 Buffer Flush
+      hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
+          task.cuid, new_segment, obsolete_files);
+
+      if (trigger_flush) {
+        hotspot_manager_->TriggerBufferFlush();
+      }
+
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "[DBImpl] PartialMerge completed for CUID %" PRIu64
+                     ": merged %zu entries into HotDataBuffer (SV:%p)",
+                     task.cuid, written_count, sv);
+    }
     hotspot_manager_->UnlockCuid(task.cuid);
-    return;
   }
 
-  // 创建 MergingIterator
-  InternalIterator* merging_iter = NewMergingIterator(
-      &icmp, children.data(), static_cast<int>(children.size()));
-
-  // 遍历归并并写入 Buffer，去重并过滤 CUID
-  std::string last_user_key;
-  std::string segment_first_key, segment_last_key;
-  size_t written_count = 0;
-  bool trigger_flush = false;
-
-  for (merging_iter->SeekToFirst(); merging_iter->Valid();
-       merging_iter->Next()) {
-    Slice key = merging_iter->key();
-    
-    // 提取 CUID 并进行过滤
-    uint64_t current_cuid = hotspot_manager_->ExtractCUID(key);
-    // Key 是按照 CUID 有序排列的，一旦超过目标 CUID 停止扫描
-    if (current_cuid > task.cuid) {
-      break; 
-    }
-    if (current_cuid < task.cuid) {
-      continue;
-    }
-
-    Slice value = merging_iter->value();
-    Slice user_key = ExtractUserKey(key);
-
-    // Slice 比较减少 ToString 开销
-    if (!last_user_key.empty() && 
-        icmp.user_comparator()->Compare(user_key, Slice(last_user_key)) == 0) {
-      continue;
-    }
-    last_user_key.assign(user_key.data(), user_key.size());
-
-    // 写入 Buffer
-    if (hotspot_manager_->BufferHotData(task.cuid, key, value)) {
-      trigger_flush = true;
-    }
-
-    if (segment_first_key.empty()) {
-      segment_first_key = key.ToString();
-    }
-    segment_last_key = key.ToString();
-    written_count++;
-  }
-
-  delete merging_iter;
   ReturnAndCleanupSuperVersion(cfd, sv);
-  // fprintf(stderr, "[DIAG_SV] Released SV %p for CUID %lu, wrote %zu entries\n", 
-  //                 sv, (unsigned long)task.cuid, written_count);
-
-  if (written_count == 0) {
-    hotspot_manager_->UnlockCuid(task.cuid);
-    return;
-  }
-
-  // 构造新的 DataSegment
-  DataSegment new_segment;
-  new_segment.file_number = static_cast<uint64_t>(-1);
-  new_segment.first_key = segment_first_key;
-  new_segment.last_key = segment_last_key;
-
-  // 收集需要清理的旧文件
-  std::vector<uint64_t> obsolete_files;
-  for (const auto& seg : overlapping_snaps) {
-    if (seg.file_number != static_cast<uint64_t>(-1)) {
-      obsolete_files.push_back(seg.file_number);
-    }
-  }
-  for (const auto& seg : overlapping_deltas) {
-    obsolete_files.push_back(seg.file_number);
-  }
-
-  // 这里先处理为 {-1} 的内存 segment 替换，后续再触发 Buffer Flush
-  hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
-      task.cuid, new_segment, obsolete_files);
-
-  if (trigger_flush) {
-    hotspot_manager_->TriggerBufferFlush();
-  }
-
-  ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                 "[DBImpl] PartialMerge completed for CUID %" PRIu64
-                 ": merged %zu entries into HotDataBuffer",
-                 task.cuid, written_count);
-  hotspot_manager_->UnlockCuid(task.cuid);
 }
 
 void DBImpl::NotifyDeltaBGWork() {

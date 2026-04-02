@@ -840,11 +840,11 @@ void HotspotManager::EnqueueForInitScan(uint64_t cuid) {
       "[HotspotManager] Enqueued CUID %" PRIu64 " for initial full scan", cuid);
 }
 
-std::vector<uint64_t> HotspotManager::PopPendingInitCuids() {
+std::vector<uint64_t> HotspotManager::PopPendingInitCuids(size_t max_count) {
   std::lock_guard<std::mutex> lock(pending_init_mutex_);
   std::vector<uint64_t> result;
   for (auto it = pending_init_cuids_.begin();
-       it != pending_init_cuids_.end();) {
+       it != pending_init_cuids_.end() && result.size() < max_count;) {
     if (TryLockCuid(*it)) {
       result.push_back(*it);
       it = pending_init_cuids_.erase(it);
@@ -872,10 +872,13 @@ void HotspotManager::EnqueueMetadataScan(uint64_t cuid) {
   //         cuid);
 }
 
-std::vector<uint64_t> HotspotManager::PopPendingMetadataScans() {
+std::vector<uint64_t> HotspotManager::PopPendingMetadataScans(size_t max_count) {
   std::lock_guard<std::mutex> lock(pending_metadata_mutex_);
-  std::vector<uint64_t> result = std::move(pending_metadata_scans_);
-  pending_metadata_scans_.clear();
+  std::vector<uint64_t> result;
+  while (!pending_metadata_scans_.empty() && result.size() < max_count) {
+    result.push_back(pending_metadata_scans_.front());
+    pending_metadata_scans_.erase(pending_metadata_scans_.begin());
+  }
   return result;
 }
 
