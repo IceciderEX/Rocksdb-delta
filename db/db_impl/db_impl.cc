@@ -296,11 +296,9 @@ void DBImpl::InitializeHotspotManager(const Options& options) {
     immutable_db_options_.hotspot_manager = hotspot_manager_;
 
     std::cout << "HotspotManager initialized at DBImpl " << hotspot_dir.c_str() << std::endl;
-
-    {
-      InstrumentedMutexLock l(&mutex_);
-      MaybeScheduleDeltaWork();
-    }
+    // BGDeltaWork
+    mutex_.AssertHeld();
+    MaybeScheduleDeltaWork();
   }
 }
 
@@ -7334,7 +7332,11 @@ void DBImpl::MaybeScheduleDeltaWork() {
     return;
   }
   // 允许多个后台线程并发处理 delta 任务，使用系统的 LOW 优先级线程池
-  int max_delta_threads = immutable_db_options_.max_background_compactions;
+    int max_delta_threads = 1;
+  auto* cfd = versions_->GetColumnFamilySet()->GetDefault();
+  if (cfd != nullptr) {
+    max_delta_threads = cfd->GetLatestMutableCFOptions().delta_options.max_delta_threads;
+  }
   if (max_delta_threads <= 0) max_delta_threads = 1;
   if (bg_delta_scheduled_ >= max_delta_threads) {
     return;

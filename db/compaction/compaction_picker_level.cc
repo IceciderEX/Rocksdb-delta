@@ -602,9 +602,9 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
   start_level_inputs_.level = 0;
   compaction_reason_ = CompactionReason::kLevelL0FilesNum; // 借用Reason
 
-  ROCKS_LOG_BUFFER(log_buffer_, 
-      "[Delta-Opt] Picked Mixed L0 Compaction. Trigger: %s, Files: %zu, OutputLevel: 0", 
-      trigger_by_count ? "Count" : "Time", start_level_inputs_.size());
+  // fprintf(stderr, 
+  //     "[Delta-Opt] Picked Mixed L0 Compaction. Trigger: %s, Files: %zu, OutputLevel: 0", 
+  //     trigger_by_count ? "Count" : "Time", start_level_inputs_.size());
 
   return true;
 }

@@ -31,14 +31,14 @@
 // ==========================================
 const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_native";
 const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_delta";
-const int kNumThreads = 16;
+const int kNumThreads = 32;
 const int kTestDurationSec = 2500;       // s
 const int kNumCuids = 1000000;           // 100W CUID 总库
-const int kBatchSize = 128;             // 每次 Put 512 行
-const int kTargetPutBatches = 500;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
+const int kBatchSize = 512;             // 每次 Put 512 行
+const int kTargetPutBatches = 120;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
 const double kHotRatio = 0.15;          // 15% 的热点
-const int kHotScanTarget = 300;        // 热点访问目标
-const int kColdScanTarget = 50;        // 普通访问目标
+const int kHotScanTarget = 800;        // 热点访问目标
+const int kColdScanTarget = 100;        // 普通访问目标
 
 // ==========================================
 // 辅助工具与状态管理
@@ -353,21 +353,21 @@ int main() {
       options.delta_options.compaction_l0_trigger_count = 30;
       options.delta_options.compaction_l0_trigger_age_sec = 3600;
       options.delta_options.compaction_l0_files_to_pick = 10;
-      options.delta_options.max_delta_threads = 4;
+      options.delta_options.max_delta_threads = 8;
       // -------------------------------------------------------------
       options.level0_slowdown_writes_trigger = 200; // l0 file count thres
       options.level0_stop_writes_trigger = 400; // l0 file count thres
-      options.level0_file_num_compaction_trigger = 50; // l0 file count thres
+      options.level0_file_num_compaction_trigger = 30; // l0 file count thres
       options.max_subcompactions = 4; // subcompaction 线程数
       options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
       options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
-      options.max_background_jobs = 16; // 与写入线程相同？
+      options.max_background_jobs = 32; // 与写入线程相同？
       options.num_levels = 1;
       options.level_compaction_dynamic_level_bytes = false;
     } else {
       options.enable_delta = false;
       options.max_subcompactions = 4;
-      options.max_background_jobs = 16;
+      options.max_background_jobs = 32;
     }
 
     rocksdb::DestroyDB(path, options);
