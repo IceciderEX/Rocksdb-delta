@@ -83,6 +83,9 @@ struct DeltaOptions {
 
   // Compaction Picker (Mixed L0)
   int compaction_l0_trigger_count = 10;
+  // Per-partition trigger threshold: when a partition accumulates this many
+  // L0 files, prioritize compaction within that partition.
+  int compaction_l0_partition_trigger_count = 10;
   uint64_t compaction_l0_trigger_age_sec = 3600;
   size_t compaction_l0_files_to_pick = 5;
 
@@ -103,6 +106,8 @@ struct DeltaOptions {
            gdct_flush_interval_us == other.gdct_flush_interval_us &&
            gdct_compact_interval_us == other.gdct_compact_interval_us &&
            compaction_l0_trigger_count == other.compaction_l0_trigger_count &&
+             compaction_l0_partition_trigger_count ==
+               other.compaction_l0_partition_trigger_count &&
            compaction_l0_trigger_age_sec == other.compaction_l0_trigger_age_sec &&
            compaction_l0_files_to_pick == other.compaction_l0_files_to_pick &&
            sharding_count == other.sharding_count;

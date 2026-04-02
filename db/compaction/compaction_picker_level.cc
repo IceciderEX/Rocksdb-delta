@@ -9,6 +9,9 @@
 
 #include "db/compaction/compaction_picker_level.h"
 
+#include <atomic>
+#include <limits>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,6 +20,7 @@
 #include "logging/log_buffer.h"
 #include "test_util/sync_point.h"
 #include "logging/logging.h"
+#include "util/l0_partition.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -528,82 +532,241 @@ void LevelCompactionBuilder::SetupInitialFilesDelta() {
 }
 
 // for delta
-// 目前的策略：选取最老的 N 个文件进行 L0->L0 合并
+// 分区模式下优先做“分区内压缩”，同时在全局压力下做分区轮询，
+// 避免仅盯住最老文件导致长期挑选失败。
 bool LevelCompactionBuilder::PickMixedL0Compaction() {
   const bool enable_partition =
       mutable_cf_options_.delta_options.enable_partition;
-  // compaction策略阈值
-  const int kL0TriggerCount =
-      mutable_cf_options_.delta_options.compaction_l0_trigger_count;
+  const size_t kGlobalL0TriggerCount = static_cast<size_t>(std::max(
+      mutable_cf_options_.delta_options.compaction_l0_trigger_count, 2));
+  const size_t kPartitionL0TriggerCount = static_cast<size_t>(std::max(
+    mutable_cf_options_.delta_options.compaction_l0_partition_trigger_count,
+    2));
   const uint64_t kL0TriggerAge =
       mutable_cf_options_.delta_options.compaction_l0_trigger_age_sec;
-  const size_t kFilesToPick =
-      mutable_cf_options_.delta_options.compaction_l0_files_to_pick;
+  const size_t kFilesToPick = std::max<size_t>(
+      mutable_cf_options_.delta_options.compaction_l0_files_to_pick, 2);
 
-  // 2. 获取 L0 文件列表
-  // TODO: 检查 seqno 排列顺序?
   const std::vector<FileMetaData*>& l0_files = vstorage_->LevelFiles(0);
-  
-  size_t total_files = l0_files.size();
+
+  const size_t total_files = l0_files.size();
   if (total_files < 2) {
     return false;
   }
 
-  bool trigger_by_count = (total_files >= static_cast<size_t>(kL0TriggerCount));
+  const bool trigger_by_global_count = (total_files >= kGlobalL0TriggerCount);
   bool trigger_by_time = false;
 
-  // 检查最老文件的时间 l0_files.back()？
-  FileMetaData* oldest_file = l0_files.back();
-  uint64_t creation_time = oldest_file->file_creation_time;
-  uint64_t now_sec = ioptions_.env->NowMicros() / 1000000;
-
-  if (creation_time > 0 && creation_time != kUnknownFileCreationTime) {
-      if (now_sec > creation_time + kL0TriggerAge) {
-          trigger_by_time = true;
-      }
+  const uint64_t now_sec = ioptions_.env->NowMicros() / 1000000;
+  const FileMetaData* oldest_file = l0_files.back();
+  const uint64_t creation_time = oldest_file->file_creation_time;
+  if (kL0TriggerAge > 0 && creation_time > 0 &&
+      creation_time != kUnknownFileCreationTime &&
+      now_sec > creation_time + kL0TriggerAge) {
+    trigger_by_time = true;
   }
-  if (!trigger_by_count && !trigger_by_time) {
-    return false;
-  }
-
-  // for delta
-  // 选最早生成的 kFilesToPick 个文件
-  // [Size - Pick ... Size - 1]，且限定单一 partition
-  size_t start_index = total_files - 1;
-  const uint32_t target_partition = l0_files[start_index]->partition_id;
 
   start_level_inputs_.level = 0;
   start_level_inputs_.files.clear();
   start_level_ = 0;
-  output_level_ = 0; // L0 -> L0
+  output_level_ = 0;  // L0 -> L0
 
-  for (size_t i = total_files; i > 0; --i) {
-    size_t idx = i - 1;
-    FileMetaData* f = l0_files[idx];
-    if (enable_partition && f->partition_id != target_partition) {
-      continue;
+  if (!enable_partition) {
+    if (!trigger_by_global_count && !trigger_by_time) {
+      return false;
     }
-    if (start_level_inputs_.files.size() >= kFilesToPick) {
-      break;
+    for (size_t i = total_files; i > 0 &&
+                       start_level_inputs_.files.size() < kFilesToPick;
+         --i) {
+      FileMetaData* f = l0_files[i - 1];
+      if (f->being_compacted) {
+        continue;
+      }
+      start_level_inputs_.files.push_back(f);
     }
-    // 检查并发冲突的逻辑？？
-    if (f->being_compacted) {
-      // TODO：如果最老的数据正在合并，直接abandon这次compaction？
+
+    if (start_level_inputs_.files.size() < 2) {
       start_level_inputs_.clear();
       return false;
     }
-    start_level_inputs_.files.push_back(f);
+
+    compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+    ROCKS_LOG_BUFFER(
+        log_buffer_,
+        "[Delta-Opt] Picked Mixed L0 Compaction (non-partitioned). Trigger: "
+        "%s, Files: %zu, OutputLevel: 0",
+      trigger_by_global_count ? "GlobalCount" : "Time",
+      start_level_inputs_.size());
+    return true;
   }
+
+  struct CompactionBucketKey {
+    uint32_t partition_id;
+    uint64_t table_id;
+
+    bool operator<(const CompactionBucketKey& other) const {
+      if (partition_id != other.partition_id) {
+        return partition_id < other.partition_id;
+      }
+      return table_id < other.table_id;
+    }
+  };
+
+  struct PartitionBucket {
+    std::vector<FileMetaData*> candidates;
+  };
+
+  // 静态游标用于全局轮询，避免一直只尝试同一个分区。
+  static std::atomic<uint32_t> partition_rr_cursor{0};
+
+  std::map<CompactionBucketKey, PartitionBucket> buckets;
+  std::map<uint32_t, size_t> partition_total_counts;
+  std::map<uint32_t, size_t> partition_candidate_counts;
+  std::vector<CompactionBucketKey> oldest_bucket_order;
+  oldest_bucket_order.reserve(total_files);
+
+  for (size_t i = total_files; i > 0; --i) {
+    FileMetaData* f = l0_files[i - 1];
+    const uint32_t pid = f->partition_id;
+    uint64_t table_id = std::numeric_limits<uint64_t>::max();
+    const bool has_table_id =
+        ExtractTableIdFromUserKey(f->smallest.user_key(), &table_id);
+    if (!has_table_id) {
+      table_id = std::numeric_limits<uint64_t>::max();
+    }
+    const CompactionBucketKey bucket_key{pid, table_id};
+    if (oldest_bucket_order.empty() ||
+        !(oldest_bucket_order.back().partition_id == bucket_key.partition_id &&
+          oldest_bucket_order.back().table_id == bucket_key.table_id)) {
+      oldest_bucket_order.push_back(bucket_key);
+    }
+    if (f->being_compacted) {
+      partition_total_counts[pid] += 1;
+      continue;
+    }
+    partition_total_counts[pid] += 1;
+    buckets[bucket_key].candidates.push_back(f);
+    partition_candidate_counts[pid] += 1;
+  }
+
+  std::vector<uint32_t> pressure_partitions;
+  std::vector<uint32_t> available_partitions;
+  for (const auto& entry : partition_total_counts) {
+    const uint32_t pid = entry.first;
+    const size_t total_count = entry.second;
+    const size_t candidate_count = partition_candidate_counts[pid];
+    if (candidate_count < 2) {
+      continue;
+    }
+    available_partitions.push_back(pid);
+    if (total_count >= kPartitionL0TriggerCount) {
+      pressure_partitions.push_back(pid);
+    }
+  }
+
+  auto pick_round_robin = [&](const std::vector<uint32_t>& pids)
+      -> uint32_t {
+    if (pids.empty()) {
+      return std::numeric_limits<uint32_t>::max();
+    }
+    const uint32_t start =
+        partition_rr_cursor.fetch_add(1, std::memory_order_relaxed);
+    const size_t n = pids.size();
+    for (size_t offset = 0; offset < n; ++offset) {
+      const uint32_t pid = pids[(start + offset) % n];
+      auto count_it = partition_candidate_counts.find(pid);
+      if (count_it != partition_candidate_counts.end() &&
+          count_it->second >= 2) {
+        return pid;
+      }
+    }
+    return std::numeric_limits<uint32_t>::max();
+  };
+
+  uint32_t target_partition = std::numeric_limits<uint32_t>::max();
+  CompactionBucketKey target_bucket{std::numeric_limits<uint32_t>::max(),
+                                    std::numeric_limits<uint64_t>::max()};
+  const char* trigger_mode = "None";
+
+  if (!pressure_partitions.empty()) {
+    target_partition = pick_round_robin(pressure_partitions);
+    trigger_mode = "PartitionCount";
+  }
+
+  if (target_partition == std::numeric_limits<uint32_t>::max() &&
+      trigger_by_global_count) {
+    target_partition = pick_round_robin(available_partitions);
+    trigger_mode = "GlobalCountRoundRobin";
+  }
+
+  if (target_partition == std::numeric_limits<uint32_t>::max() &&
+      trigger_by_time) {
+    for (const auto& bucket_key : oldest_bucket_order) {
+      auto it = buckets.find(bucket_key);
+      if (it != buckets.end() && it->second.candidates.size() >= 2) {
+        target_partition = bucket_key.partition_id;
+        target_bucket = bucket_key;
+        trigger_mode = "OldestAge";
+        break;
+      }
+    }
+  }
+
+  if (target_partition == std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  auto choose_oldest_bucket_for_partition = [&](uint32_t partition_id)
+      -> CompactionBucketKey {
+    for (const auto& bucket_key : oldest_bucket_order) {
+      if (bucket_key.partition_id != partition_id) {
+        continue;
+      }
+      auto it = buckets.find(bucket_key);
+      if (it != buckets.end() && it->second.candidates.size() >= 2) {
+        return bucket_key;
+      }
+    }
+    return {std::numeric_limits<uint32_t>::max(),
+            std::numeric_limits<uint64_t>::max()};
+  };
+
+  if (target_bucket.partition_id == std::numeric_limits<uint32_t>::max()) {
+    target_bucket = choose_oldest_bucket_for_partition(target_partition);
+  }
+
+  if (target_bucket.partition_id == std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  const auto bucket_it = buckets.find(target_bucket);
+  if (bucket_it == buckets.end()) {
+    return false;
+  }
+  const auto& candidates = bucket_it->second.candidates;
+  const size_t pick_count = std::min(candidates.size(), kFilesToPick);
+  start_level_inputs_.files.insert(start_level_inputs_.files.end(),
+                                   candidates.begin(),
+                                   candidates.begin() + pick_count);
 
   if (start_level_inputs_.files.size() < 2) {
     start_level_inputs_.clear();
     return false;
   }
-  compaction_reason_ = CompactionReason::kLevelL0FilesNum; // 借用Reason
 
-  ROCKS_LOG_BUFFER(log_buffer_, 
-      "[Delta-Opt] Picked Mixed L0 Compaction. Trigger: %s, Files: %zu, OutputLevel: 0", 
-      trigger_by_count ? "Count" : "Time", start_level_inputs_.size());
+  compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+
+  ROCKS_LOG_BUFFER(
+      log_buffer_,
+      "[Delta-Opt] Picked Mixed L0 Compaction. Trigger: %s, Partition: %u, "
+      "TableID: %llu, Files: %zu/%zu, L0Total: %zu, "
+      "PartitionFileCount: %zu, PartitionTriggerThreshold: %zu, "
+      "GlobalTriggerThreshold: %zu, OutputLevel: 0",
+      trigger_mode, target_partition,
+      static_cast<unsigned long long>(target_bucket.table_id),
+      start_level_inputs_.size(), candidates.size(), total_files,
+      partition_total_counts[target_partition], kPartitionL0TriggerCount,
+      kGlobalL0TriggerCount);
 
   return true;
 }

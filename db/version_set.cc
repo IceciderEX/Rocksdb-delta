@@ -140,6 +140,47 @@ inline InternalIterator* WrapUnpartitionedFileIteratorIfNeeded(
       iter, static_cast<uint32_t>(read_options.read_partition_id));
 }
 
+inline bool FileMayMatchIteratorBounds(const UserComparatorWrapper& ucmp,
+                                       const ReadOptions& read_options,
+                                       const FileMetaData* file_meta) {
+  if (file_meta == nullptr) {
+    return false;
+  }
+  if (read_options.iterate_upper_bound != nullptr &&
+      ucmp.CompareWithoutTimestamp(file_meta->smallest.user_key(),
+                                   /*a_has_ts=*/true,
+                                   *read_options.iterate_upper_bound,
+                                   /*b_has_ts=*/false) >= 0) {
+    return false;
+  }
+  if (read_options.iterate_lower_bound != nullptr &&
+      ucmp.CompareWithoutTimestamp(file_meta->largest.user_key(),
+                                   /*a_has_ts=*/true,
+                                   *read_options.iterate_lower_bound,
+                                   /*b_has_ts=*/false) < 0) {
+    return false;
+  }
+  return true;
+}
+
+inline bool FileMayMatchReadTableId(const FileMetaData* file_meta,
+                                    bool has_target_table_id,
+                                    uint64_t target_table_id) {
+  if (!has_target_table_id || file_meta == nullptr) {
+    return true;
+  }
+  uint64_t smallest_table_id = 0;
+  uint64_t largest_table_id = 0;
+  if (!ExtractTableIdFromUserKey(file_meta->smallest.user_key(),
+                                 &smallest_table_id) ||
+      !ExtractTableIdFromUserKey(file_meta->largest.user_key(),
+                                 &largest_table_id)) {
+    return true;
+  }
+  return smallest_table_id <= target_table_id &&
+         target_table_id <= largest_table_id;
+}
+
 // Find File in LevelFilesBrief data structure
 // Within an index range defined by left and right
 int FindFileInRange(const InternalKeyComparator& icmp,
@@ -2408,6 +2449,8 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
   }
 
   bool should_sample = should_sample_file_read();
+  const UserComparatorWrapper user_cmp(
+      cfd_->internal_comparator().user_comparator());
 
   auto* arena = merge_iter_builder->GetArena();
   if (level == 0) {
@@ -2416,11 +2459,23 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
     const bool use_partition_index =
         mutable_cf_options_.delta_options.enable_partition &&
         read_options.read_partition_id >= 0;
+    uint64_t target_table_id = 0;
+    const bool has_target_table_id =
+        use_partition_index && read_options.iterate_lower_bound != nullptr &&
+        ExtractTableIdFromUserKey(*read_options.iterate_lower_bound,
+                                  &target_table_id);
 
     if (use_partition_index) {
       const auto& partition_files =
           storage_info_.Level0FilesForPartition(read_options.read_partition_id);
       for (const auto* file_meta : partition_files) {
+        if (!FileMayMatchIteratorBounds(user_cmp, read_options, file_meta)) {
+          continue;
+        }
+        if (!FileMayMatchReadTableId(file_meta, has_target_table_id,
+                                     target_table_id)) {
+          continue;
+        }
         Arena* table_iter_arena =
             file_meta->partition_id < kL0PartitionCount ? arena : nullptr;
         auto table_iter = cfd_->table_cache()->NewIterator(
@@ -2444,6 +2499,14 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
     } else {
       for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
         const auto& file = storage_info_.LevelFilesBrief(0).files[i];
+        if (!FileMayMatchIteratorBounds(user_cmp, read_options,
+                                        file.file_metadata)) {
+          continue;
+        }
+        if (!FileMayMatchReadTableId(file.file_metadata, has_target_table_id,
+                                     target_table_id)) {
+          continue;
+        }
         auto table_iter = cfd_->table_cache()->NewIterator(
             read_options, soptions, cfd_->internal_comparator(),
             *file.file_metadata, /*range_del_agg=*/nullptr, mutable_cf_options_,
@@ -2470,10 +2533,24 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
         const auto& partition_files =
             storage_info_.Level0FilesForPartition(read_options.read_partition_id);
         for (FileMetaData* meta : partition_files) {
+          if (!FileMayMatchIteratorBounds(user_cmp, read_options, meta)) {
+            continue;
+          }
+          if (!FileMayMatchReadTableId(meta, has_target_table_id,
+                                       target_table_id)) {
+            continue;
+          }
           sample_file_read_inc(meta);
         }
       } else {
         for (FileMetaData* meta : storage_info_.LevelFiles(0)) {
+          if (!FileMayMatchIteratorBounds(user_cmp, read_options, meta)) {
+            continue;
+          }
+          if (!FileMayMatchReadTableId(meta, has_target_table_id,
+                                       target_table_id)) {
+            continue;
+          }
           sample_file_read_inc(meta);
         }
       }
