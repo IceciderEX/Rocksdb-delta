@@ -37,8 +37,8 @@ const int kNumCuids = 1000000;           // 100W CUID 总库
 const int kBatchSize = 512;             // 每次 Put 512 行
 const int kTargetPutBatches = 120;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
 const double kHotRatio = 0.15;          // 15% 的热点
-const int kHotScanTarget = 800;        // 热点访问目标
-const int kColdScanTarget = 100;        // 普通访问目标
+const int kHotScanTarget = 200;        // 热点访问目标
+const int kColdScanTarget = 50;        // 普通访问目标
 
 // ==========================================
 // 辅助工具与状态管理
@@ -182,7 +182,7 @@ class PerfRunner {
       }
 
       // 模拟业务节奏
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      // std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
       // 4. 判断该 CUID 是否终于走完了完整的轮回
       if (state.puts_done >= kTargetPutBatches && state.scans_done >= state.target_scans) {
@@ -240,13 +240,13 @@ class PerfRunner {
       start_key = GenerateKey(cuid, 0);
       end_key = GenerateKey(cuid + 1, 0);
     } else {
-      // 随机扫描 10%-75% 的数据范围
+      // 随机扫描 10%-50% 的数据范围
       if (cur_rows < 10) {
           start_key = GenerateKey(cuid, 0);
           end_key = GenerateKey(cuid, cur_rows);
       } else {
           int min_len = static_cast<int>(cur_rows * 0.1);
-          int max_len = static_cast<int>(cur_rows * 0.75);
+          int max_len = static_cast<int>(cur_rows * 0.5);
           std::uniform_int_distribution<int> len_dist(min_len, std::max(min_len + 1, max_len));
           int scan_len = len_dist(gen);
           
@@ -343,10 +343,10 @@ int main() {
 
       // --- Example 1: Programmatic Configuration of DeltaOptions ---
       // These can be set directly on the options object before opening the DB.
-      options.delta_options.hotspot_scan_threshold = 200;
+      options.delta_options.hotspot_scan_threshold = 80;
       options.delta_options.hotspot_scan_window_sec = 300;
-      options.delta_options.delta_merge_threshold = 3;
-      options.delta_options.sac_delta_count_threshold = 5;
+      options.delta_options.delta_merge_threshold = 6;
+      options.delta_options.sac_delta_count_threshold = 12;
       options.delta_options.sharding_count = 64; // Power of 2 recommended
       options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
       options.delta_options.hot_data_buffer_shards = 128;

@@ -4,6 +4,15 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+HotIndexTable::HotIndexTable(
+    const InternalKeyComparator* icmp,
+    std::shared_ptr<HotSstLifecycleManager> lifecycle_manager,
+    std::shared_ptr<Logger> info_log, size_t num_shards)
+    : icmp_(icmp),
+      shards_(num_shards),
+      lifecycle_manager_(lifecycle_manager),
+      info_log_(info_log) {}
+
 static bool HasActualDataInBuffer(uint64_t cuid, const std::string& start,
                                   const std::string& end, HotDataBuffer* buffer,
                                   const InternalKeyComparator* icmp) {
@@ -77,15 +86,17 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   bool found_phys_overlap = false;  // 是否有物理段与新 SST 重叠
   std::vector<DataSegment> next_segments;
 
-  std::string new_start = ExtractUserKey(new_segment.first_key).ToString();
-  std::string new_end = ExtractUserKey(new_segment.last_key).ToString();
+  std::string new_start_user = ExtractUserKey(new_segment.first_key).ToString();
+  std::string new_end_user = ExtractUserKey(new_segment.last_key).ToString();
 
   for (const auto& seg : entry.snapshot_segments) {
     std::string seg_start_user = ExtractUserKey(seg.first_key).ToString();
     std::string seg_end_user = ExtractUserKey(seg.last_key).ToString();
 
     // 检查区间重叠 (UserKey)
-    bool overlaps = !(new_end < seg_start_user || new_start > seg_end_user);
+    bool is_left = (icmp->user_comparator()->Compare(seg_end_user, new_start_user) < 0);
+    bool is_right = (icmp->user_comparator()->Compare(seg_start_user, new_end_user) > 0);
+    bool overlaps = !is_left && !is_right;
 
     if (overlaps) {
       if (seg.file_number != static_cast<uint64_t>(-1)) {
@@ -425,23 +436,23 @@ void HotIndexTable::ReplaceOverlappingSegments(
 
     std::vector<DataSegment> next_segments;
 
-    std::string new_start = ExtractUserKey(new_segment.first_key).ToString();
-    std::string new_end = ExtractUserKey(new_segment.last_key).ToString();
+    std::string new_start_user = ExtractUserKey(new_segment.first_key).ToString();
+    std::string new_end_user = ExtractUserKey(new_segment.last_key).ToString();
 
     // 判定与new snapshot相关的snapshot -> !(End < New.Start || Start > New.End)
     // 先将原先的 snapshots 进行分割+排序
     for (auto it = snapshots.begin(); it != snapshots.end(); ++it) {
-      std::string seg_start = ExtractUserKey(it->first_key).ToString();
-      std::string seg_end = ExtractUserKey(it->last_key).ToString();
+      std::string seg_start_user = ExtractUserKey(it->first_key).ToString();
+      std::string seg_end_user = ExtractUserKey(it->last_key).ToString();
 
-      bool is_left = (seg_end < new_start);
-      bool is_right = (seg_start > new_end);
+      bool is_left = (icmp_->user_comparator()->Compare(seg_end_user, new_start_user) < 0);
+      bool is_right = (icmp_->user_comparator()->Compare(seg_start_user, new_end_user) > 0);
 
       if (!is_left && !is_right) {
         // 重叠的情况: 无论物理段还是内存段，都保留不重叠的边缘部分（防止 scope
         // 缩小导致数据丢失）
         // 1. 左侧剩余部分
-        if (seg_start < new_start) {
+        if (icmp_->user_comparator()->Compare(seg_start_user, new_start_user) < 0) {
           DataSegment left_seg = *it;
           left_seg.last_key = new_segment.first_key;
           next_segments.push_back(left_seg);
@@ -451,7 +462,7 @@ void HotIndexTable::ReplaceOverlappingSegments(
           }
         }
         // 2. 右侧剩余部分
-        if (seg_end > new_end) {
+        if (icmp_->user_comparator()->Compare(seg_end_user, new_end_user) > 0) {
           DataSegment right_seg = *it;
           right_seg.first_key = new_segment.last_key;
           next_segments.push_back(right_seg);
@@ -473,10 +484,10 @@ void HotIndexTable::ReplaceOverlappingSegments(
 
     next_segments.push_back(new_segment);
 
-    // 重新排序
+    // 重新排序 (使用 InternalKeyComparator)
     std::sort(next_segments.begin(), next_segments.end(),
-              [](const DataSegment& a, const DataSegment& b) {
-                return a.first_key < b.first_key;
+              [this](const DataSegment& a, const DataSegment& b) {
+                return icmp_->Compare(a.first_key, b.first_key) < 0;
               });
 
     snapshots = std::move(next_segments);
@@ -555,10 +566,10 @@ size_t HotIndexTable::CountOverlappingDeltas(
 
   for (const auto& delta : entry.deltas) {
     // Key 范围重叠判断: !(delta.last < first || delta.first > last)
-    bool is_left = (ExtractUserKey(delta.last_key).ToString() <
-                    ExtractUserKey(first_key).ToString());
-    bool is_right = (ExtractUserKey(delta.first_key).ToString() >
-                     ExtractUserKey(last_key).ToString());
+    bool is_left = (icmp_->user_comparator()->Compare(ExtractUserKey(delta.last_key),
+                                                     ExtractUserKey(first_key)) < 0);
+    bool is_right = (icmp_->user_comparator()->Compare(ExtractUserKey(delta.first_key),
+                                                      ExtractUserKey(last_key)) > 0);
     if (!is_left && !is_right) {
       count++;
     }
@@ -611,10 +622,10 @@ void HotIndexTable::GetOverlappingSegments(
   // 收集重叠的 snapshot segments
   for (const auto& seg : entry.snapshot_segments) {
     // !(seg.last < first || seg.first > last)
-    bool is_left = (ExtractUserKey(seg.last_key).ToString() <
-                    ExtractUserKey(first_key).ToString());
-    bool is_right = (ExtractUserKey(seg.first_key).ToString() >
-                     ExtractUserKey(last_key).ToString());
+    bool is_left = (icmp_->user_comparator()->Compare(ExtractUserKey(seg.last_key),
+                                                     ExtractUserKey(first_key)) < 0);
+    bool is_right = (icmp_->user_comparator()->Compare(ExtractUserKey(seg.first_key),
+                                                      ExtractUserKey(last_key)) > 0);
     if (!is_left && !is_right) {
       overlapping_snapshots->push_back(seg);
     }
@@ -622,10 +633,10 @@ void HotIndexTable::GetOverlappingSegments(
 
   // 收集重叠的 delta segments
   for (const auto& seg : entry.deltas) {
-    bool is_left = (ExtractUserKey(seg.last_key).ToString() <
-                    ExtractUserKey(first_key).ToString());
-    bool is_right = (ExtractUserKey(seg.first_key).ToString() >
-                     ExtractUserKey(last_key).ToString());
+    bool is_left = (icmp_->user_comparator()->Compare(ExtractUserKey(seg.last_key),
+                                                     ExtractUserKey(first_key)) < 0);
+    bool is_right = (icmp_->user_comparator()->Compare(ExtractUserKey(seg.first_key),
+                                                      ExtractUserKey(last_key)) > 0);
     if (!is_left && !is_right) {
       overlapping_deltas->push_back(seg);
     }

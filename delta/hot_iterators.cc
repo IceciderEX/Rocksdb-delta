@@ -537,14 +537,18 @@ void HotSnapshotIterator::Next() {
       current_segment_read_count_++;
   }
 
-
   // Regression 检查：捕捉跨段/同步后的逻辑回退
-  if (Valid() &&
-      icmp_.user_comparator()->Compare(ExtractUserKey(Slice(prev_key_debug)),
+  if (Valid() && icmp_.user_comparator()->Compare(ExtractUserKey(Slice(prev_key_debug)),
                                        ExtractUserKey(key())) > 0) {
     fprintf(stderr, "[FATAL] HotSnapshotIterator Regression detected!\n");
     fprintf(stderr, "Prev: %s\n", FormatKeyDisplay(prev_key_debug).c_str());
     fprintf(stderr, "Curr: %s\n", FormatKeyDisplay(key()).c_str());
+    for (size_t i = 0; i < segments_.size(); ++i) {
+      fprintf(stderr, "Segment %zu: File %lu, Range [%s - %s]\n", i,
+              segments_[i].file_number,
+              FormatKeyDisplay(segments_[i].first_key).c_str(),
+              FormatKeyDisplay(segments_[i].last_key).c_str());
+    }
     // 强制失效以停止错误数据产出
     current_iter_.reset(nullptr);
   }

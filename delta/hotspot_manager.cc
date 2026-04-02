@@ -26,7 +26,8 @@ HotspotManager::HotspotManager(const Options& db_options,
       internal_comparator_(internal_comparator),
       lifecycle_manager_(std::make_shared<HotSstLifecycleManager>(db_options)),
       buffer_(db_options_.delta_options.hot_data_buffer_threshold_bytes, db_options_.delta_options.hot_data_buffer_shards),
-      index_table_(lifecycle_manager_, db_options_.info_log, db_options_.delta_options.sharding_count),
+      index_table_(internal_comparator, lifecycle_manager_, db_options.info_log,
+                   db_options.delta_options.sharding_count),
       frequency_table_(db_options_.delta_options.hotspot_scan_threshold,
                        db_options_.delta_options.hotspot_scan_window_sec,
                        db_options_.delta_options.sharding_count),
@@ -736,6 +737,15 @@ ScanAsCompactionStrategy HotspotManager::EvaluateScanAsCompactionStrategy(
       *out_involved_delta_count = 0;
     }
     return ScanAsCompactionStrategy::kFullReplace;
+  }
+
+  // 如果没有 Snapshot 不进行 PartialMerge
+  HotIndexEntry entry;
+  if (!index_table_.GetEntry(cuid, &entry) || !entry.HasSnapshot()) {
+    if (out_involved_delta_count) {
+      *out_involved_delta_count = 0;
+    }
+    return ScanAsCompactionStrategy::kNoAction;
   }
 
   // 小 Scan: 查看涉及多少个 delta segments

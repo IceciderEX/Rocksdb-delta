@@ -36,10 +36,10 @@ struct HotIndexEntry {
 class HotIndexTable {
  public:
   explicit HotIndexTable(
+      const InternalKeyComparator* icmp,
       std::shared_ptr<HotSstLifecycleManager> lifecycle_manager,
       std::shared_ptr<Logger> info_log = nullptr,
-      size_t num_shards = 128)
-      : shards_(num_shards), lifecycle_manager_(lifecycle_manager), info_log_(info_log) {}
+      size_t num_shards = 128);
  
   void UpdateSnapshot(uint64_t cuid,
                       const std::vector<DataSegment>& new_segments);
@@ -108,6 +108,7 @@ class HotIndexTable {
     return shards_[cuid % shards_.size()];
   }
 
+  const InternalKeyComparator* icmp_;
   std::vector<Shard> shards_;
   std::shared_ptr<HotSstLifecycleManager> lifecycle_manager_;
   std::shared_ptr<Logger> info_log_;
