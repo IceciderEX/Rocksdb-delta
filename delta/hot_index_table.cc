@@ -13,6 +13,37 @@ HotIndexTable::HotIndexTable(
       lifecycle_manager_(lifecycle_manager),
       info_log_(info_log) {}
 
+// Helper to extract row ID from key for gap detection
+static uint64_t ExtractRowID(const std::string& key) {
+  if (key.size() < 34) return 0;
+  try {
+    return std::stoull(key.substr(24, 10));
+  } catch (...) {
+    return 0;
+  }
+}
+
+static bool DetectSnapshotGap(uint64_t cuid, const std::vector<DataSegment>& segments, const char* context) {
+  if (segments.size() < 2) return false;
+  for (size_t i = 0; i + 1 < segments.size(); ++i) {
+    uint64_t last_id = ExtractRowID(segments[i].last_key);
+    uint64_t next_id = ExtractRowID(segments[i+1].first_key);
+    if (last_id != 0 && next_id != 0 && last_id + 1 != next_id && last_id < next_id) {
+      fprintf(stderr, "[DIAG_GAP_DETECTED] CUID %lu [%s] GAP between Seg%zu and Seg%zu! "
+              "Last (File %lu): %lu, Next (File %lu): %lu. Missing: %lu\n",
+              cuid, context, i, i+1, segments[i].file_number, last_id, 
+              segments[i+1].file_number, next_id, last_id + 1);
+      for (size_t j = 0; j < segments.size(); ++j) {
+        fprintf(stderr, "  Seg%zu: File %lu, Range [%s, %s]\n", j, segments[j].file_number,
+                FormatKeyDisplay(segments[j].first_key).c_str(),
+                FormatKeyDisplay(segments[j].last_key).c_str());
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool HasActualDataInBuffer(uint64_t cuid, const std::string& start,
                                   const std::string& end, HotDataBuffer* buffer,
                                   const InternalKeyComparator* icmp) {
@@ -20,14 +51,8 @@ static bool HasActualDataInBuffer(uint64_t cuid, const std::string& start,
 
   std::unique_ptr<InternalIterator> iter(buffer->NewIterator(cuid, icmp));
   iter->Seek(start);
-  if (!iter->Valid()) return false;
 
-  // We are looking for data STRICTLY between start and end.
-  // Because start and end are already covered by SSTs.
-  if (icmp->Compare(iter->key(), start) == 0) {
-    iter->Next();
-  }
-
+  // 如果找到的第一个 Key 已经超过了范围终点，则说明区间内无数据
   return iter->Valid() && icmp->Compare(iter->key(), end) < 0;
 }
 
@@ -85,6 +110,7 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   bool found_mem_overlap = false;   // 是否找到了可替换的 -1 内存段
   bool found_phys_overlap = false;  // 是否有物理段与新 SST 重叠
   std::vector<DataSegment> next_segments;
+  std::vector<DataSegment> clipped_mem_segments; // 记录被裁减的 mem 段
 
   std::string new_start_user = ExtractUserKey(new_segment.first_key).ToString();
   std::string new_end_user = ExtractUserKey(new_segment.last_key).ToString();
@@ -94,8 +120,10 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
     std::string seg_end_user = ExtractUserKey(seg.last_key).ToString();
 
     // 检查区间重叠 (UserKey)
-    bool is_left = (icmp->user_comparator()->Compare(seg_end_user, new_start_user) < 0);
-    bool is_right = (icmp->user_comparator()->Compare(seg_start_user, new_end_user) > 0);
+    bool is_left =
+        (icmp->user_comparator()->Compare(seg_end_user, new_start_user) < 0);
+    bool is_right =
+        (icmp->user_comparator()->Compare(seg_start_user, new_end_user) > 0);
     bool overlaps = !is_left && !is_right;
 
     if (overlaps) {
@@ -109,13 +137,14 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
         continue;
       }
 
-      found_mem_overlap = true; // found a -1 segment to replace
+      found_mem_overlap = true;  // found a -1 segment to replace
+      clipped_mem_segments.push_back(seg);
 
       // 只针对 Memory 段 (-1) 进行切分
       // 1. 左侧剩余: [seg.first, new.first)
       if (icmp->Compare(seg.first_key, new_segment.first_key) < 0) {
-        bool keep = HasActualDataInBuffer(cuid, seg.first_key, new_segment.first_key,
-                                       buffer, icmp);
+        bool keep = HasActualDataInBuffer(cuid, seg.first_key,
+                                          new_segment.first_key, buffer, icmp);
         if (keep) {
           DataSegment left = seg;
           left.last_key = new_segment.first_key;
@@ -124,8 +153,8 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
       }
       // 2. 右侧剩余: [new.last, seg.last)
       if (icmp->Compare(seg.last_key, new_segment.last_key) > 0) {
-        bool keep = HasActualDataInBuffer(cuid, new_segment.last_key, seg.last_key,
-                                       buffer, icmp);
+        bool keep = HasActualDataInBuffer(cuid, new_segment.last_key,
+                                          seg.last_key, buffer, icmp);
         if (keep) {
           DataSegment right = seg;
           right.first_key = new_segment.last_key;
@@ -136,32 +165,54 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
       // 3. 填入重叠部分的物理段，严格 clip 到原 mem segment 的边界
       DataSegment replacement = new_segment;
       if (icmp->Compare(seg.first_key, replacement.first_key) > 0) {
-         replacement.first_key = seg.first_key;
+        replacement.first_key = seg.first_key;
       }
       if (icmp->Compare(seg.last_key, replacement.last_key) < 0) {
-         replacement.last_key = seg.last_key;
+        replacement.last_key = seg.last_key;
       }
       next_segments.push_back(replacement);
 
       if (false) {
-        fprintf(stderr,
-        "[DIAG_PROMOTE] CUID %lu: Mem Segment [%s - %s] replaced by SST "
-        "%lu clipped to [%s - %s]\n",
-        cuid, FormatKeyDisplay(seg.first_key).c_str(),
-        FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
-        FormatKeyDisplay(replacement.first_key).c_str(),
-        FormatKeyDisplay(replacement.last_key).c_str());
+        fprintf(
+            stderr,
+            "[DIAG_PROMOTE] CUID %lu: Mem Segment [%s - %s] replaced by SST "
+            "%lu clipped to [%s - %s]\n",
+            cuid, FormatKeyDisplay(seg.first_key).c_str(),
+            FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
+            FormatKeyDisplay(replacement.first_key).c_str(),
+            FormatKeyDisplay(replacement.last_key).c_str());
       }
     } else {
       next_segments.push_back(seg);
     }
   }
 
+  if (DetectSnapshotGap(cuid, next_segments, "PromoteSnapshot")) {
+    for (size_t j = 0; j < entry.deltas.size(); ++j) {
+      fprintf(stderr, " Delta%zu:, Range [%s, %s]\n", j,
+              FormatKeyDisplay(entry.deltas[j].first_key).c_str(),
+              FormatKeyDisplay(entry.deltas[j].last_key).c_str());
+    }
+
+    fprintf(stderr, "[DIAG_POST_PROMOTE] new segment [%s - %s]\n",
+            FormatKeyDisplay(new_segment.first_key).c_str(),
+            FormatKeyDisplay(new_segment.last_key).c_str());
+    for (size_t i = 0; i < clipped_mem_segments.size(); ++i) {
+      fprintf(stderr, "[DIAG_POST_PROMOTE] Clipped Mem Segment %zu: [%s - %s]\n",
+              i, FormatKeyDisplay(clipped_mem_segments[i].first_key).c_str(),
+              FormatKeyDisplay(clipped_mem_segments[i].last_key).c_str());
+    }
+    int idx = 0;
+  }
+
   if (found_mem_overlap) {
     std::sort(next_segments.begin(), next_segments.end(),
               [icmp](const DataSegment& a, const DataSegment& b) {
-                return icmp->Compare(a.first_key, b.first_key) < 0;
+                int cmp = icmp->Compare(a.first_key, b.first_key);
+                if (cmp != 0) return cmp < 0;
+                return icmp->Compare(a.last_key, b.last_key) < 0;
               });
+
     entry.snapshot_segments = std::move(next_segments);
 
     if (lifecycle_manager_) {
@@ -169,8 +220,9 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
     }
   }
 
-  // 返回 true 的条件：找到了可替换的 -1 段，或者虽然只有物理段重叠但我们选择保护它们。
-  // 两种情况都不应走到 AppendSnapshotSegment 的 fallback 路径。
+  // 返回 true 的条件：找到了可替换的 -1
+  // 段，或者虽然只有物理段重叠但我们选择保护它们。 两种情况都不应走到
+  // AppendSnapshotSegment 的 fallback 路径。
   return found_mem_overlap || found_phys_overlap;
 }
 
@@ -183,21 +235,23 @@ void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {
     // 异常检测 1：时序倒挂检测 (Row ID 顺序)
     if (!entry.deltas.empty()) {
       const auto& last_delta = entry.deltas.back();
-      // 使用 string 比较，因为我们的 key 格式保证了 string 比较等效于 Row ID 比较
+      // 使用 string 比较，因为我们的 key 格式保证了 string 比较等效于 Row ID
+      // 比较
       if (delta.first_key < last_delta.last_key) {
-        fprintf(stderr,
-                "[WARNING_DELTA_ORDER] CUID %lu: New Delta (File %lu) starts at "
-                "%s, but previous Delta (File %lu) ended at %s!\n",
-                cuid, delta.file_number, FormatKeyDisplay(delta.first_key).c_str(),
-                last_delta.file_number,
-                FormatKeyDisplay(last_delta.last_key).c_str());
+        fprintf(
+            stderr,
+            "[WARNING_DELTA_ORDER] CUID %lu: New Delta (File %lu) starts at "
+            "%s, but previous Delta (File %lu) ended at %s!\n",
+            cuid, delta.file_number, FormatKeyDisplay(delta.first_key).c_str(),
+            last_delta.file_number,
+            FormatKeyDisplay(last_delta.last_key).c_str());
       }
     }
 
     // 异常检测 2：检测异常大的 Key Range (疑似 L0 Flush 进入 Delta)
     uint64_t first_rid = ExtractRowID(delta.first_key);
     uint64_t last_rid = ExtractRowID(delta.last_key);
-    if (last_rid > first_rid + 50000) { // 阈值设为 50,000
+    if (last_rid > first_rid + 50000) {  // 阈值设为 50,000
       fprintf(stderr,
               "[WARNING_HUGE_DELTA] CUID %lu: Delta (File %lu) has suspicious "
               "large range: %lu rows! [%s - %s]\n",
@@ -213,7 +267,6 @@ void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {
   //   lifecycle_manager_->Ref(delta.file_number);
   // }
 }
-
 
 bool HotIndexTable::GetEntry(uint64_t cuid, HotIndexEntry* entry) const {
   const Shard& shard = GetShard(cuid);
@@ -436,7 +489,8 @@ void HotIndexTable::ReplaceOverlappingSegments(
 
     std::vector<DataSegment> next_segments;
 
-    std::string new_start_user = ExtractUserKey(new_segment.first_key).ToString();
+    std::string new_start_user =
+        ExtractUserKey(new_segment.first_key).ToString();
     std::string new_end_user = ExtractUserKey(new_segment.last_key).ToString();
 
     // 判定与new snapshot相关的snapshot -> !(End < New.Start || Start > New.End)
@@ -445,14 +499,17 @@ void HotIndexTable::ReplaceOverlappingSegments(
       std::string seg_start_user = ExtractUserKey(it->first_key).ToString();
       std::string seg_end_user = ExtractUserKey(it->last_key).ToString();
 
-      bool is_left = (icmp_->user_comparator()->Compare(seg_end_user, new_start_user) < 0);
-      bool is_right = (icmp_->user_comparator()->Compare(seg_start_user, new_end_user) > 0);
+      bool is_left =
+          (icmp_->user_comparator()->Compare(seg_end_user, new_start_user) < 0);
+      bool is_right =
+          (icmp_->user_comparator()->Compare(seg_start_user, new_end_user) > 0);
 
       if (!is_left && !is_right) {
         // 重叠的情况: 无论物理段还是内存段，都保留不重叠的边缘部分（防止 scope
         // 缩小导致数据丢失）
         // 1. 左侧剩余部分
-        if (icmp_->user_comparator()->Compare(seg_start_user, new_start_user) < 0) {
+        if (icmp_->user_comparator()->Compare(seg_start_user, new_start_user) <
+            0) {
           DataSegment left_seg = *it;
           left_seg.last_key = new_segment.first_key;
           next_segments.push_back(left_seg);
@@ -482,13 +539,44 @@ void HotIndexTable::ReplaceOverlappingSegments(
       }
     }
 
+    // 检测单 Key 分段的来源
+    if (icmp_->user_comparator()->Compare(
+            ExtractUserKey(new_segment.first_key),
+            ExtractUserKey(new_segment.last_key)) == 0) {
+      fprintf(stderr,
+              "[DIAG_SINGLE_KEY_SEG] CUID %lu: New single-key segment [%s] "
+              "added.\n",
+              cuid, FormatKeyDisplay(new_segment.first_key).c_str());
+    }
+
     next_segments.push_back(new_segment);
 
     // 重新排序 (使用 InternalKeyComparator)
     std::sort(next_segments.begin(), next_segments.end(),
               [this](const DataSegment& a, const DataSegment& b) {
-                return icmp_->Compare(a.first_key, b.first_key) < 0;
+                int cmp = icmp_->Compare(a.first_key, b.first_key);
+                if (cmp != 0) return cmp < 0;
+                return icmp_->Compare(a.last_key, b.last_key) < 0;
               });
+    
+    if (DetectSnapshotGap(cuid, next_segments, "ReplaceOverlappingSegments")) {
+      for (size_t j = 0; j < entry.deltas.size(); ++j) {
+        fprintf(stderr, " Delta%zu:, Range [%s, %s]\n", j,
+                FormatKeyDisplay(entry.deltas[j].first_key).c_str(),
+                FormatKeyDisplay(entry.deltas[j].last_key).c_str());
+      }
+
+      fprintf(stderr, "[DIAG_POST_REPLACE] new segment [%s - %s]\n",
+              FormatKeyDisplay(new_segment.first_key).c_str(),
+              FormatKeyDisplay(new_segment.last_key).c_str());
+      for (size_t i = 0; i < next_segments.size(); ++i) {
+        fprintf(stderr, "[DIAG_POST_REPLACE] SNAPSHOTS %zu: [%s - %s]\n",
+                i, FormatKeyDisplay(next_segments[i].first_key).c_str(),
+                FormatKeyDisplay(next_segments[i].last_key).c_str());
+      }
+      int idx = 0;
+    }
+    // DetectSnapshotGap(cuid, snapshots, "ReplaceOverlappingSegments");
 
     snapshots = std::move(next_segments);
 
@@ -566,10 +654,12 @@ size_t HotIndexTable::CountOverlappingDeltas(
 
   for (const auto& delta : entry.deltas) {
     // Key 范围重叠判断: !(delta.last < first || delta.first > last)
-    bool is_left = (icmp_->user_comparator()->Compare(ExtractUserKey(delta.last_key),
-                                                     ExtractUserKey(first_key)) < 0);
-    bool is_right = (icmp_->user_comparator()->Compare(ExtractUserKey(delta.first_key),
-                                                      ExtractUserKey(last_key)) > 0);
+    bool is_left =
+        (icmp_->user_comparator()->Compare(ExtractUserKey(delta.last_key),
+                                           ExtractUserKey(first_key)) < 0);
+    bool is_right =
+        (icmp_->user_comparator()->Compare(ExtractUserKey(delta.first_key),
+                                           ExtractUserKey(last_key)) > 0);
     if (!is_left && !is_right) {
       count++;
     }
@@ -622,10 +712,12 @@ void HotIndexTable::GetOverlappingSegments(
   // 收集重叠的 snapshot segments
   for (const auto& seg : entry.snapshot_segments) {
     // !(seg.last < first || seg.first > last)
-    bool is_left = (icmp_->user_comparator()->Compare(ExtractUserKey(seg.last_key),
-                                                     ExtractUserKey(first_key)) < 0);
-    bool is_right = (icmp_->user_comparator()->Compare(ExtractUserKey(seg.first_key),
-                                                      ExtractUserKey(last_key)) > 0);
+    bool is_left =
+        (icmp_->user_comparator()->Compare(ExtractUserKey(seg.last_key),
+                                           ExtractUserKey(first_key)) < 0);
+    bool is_right =
+        (icmp_->user_comparator()->Compare(ExtractUserKey(seg.first_key),
+                                           ExtractUserKey(last_key)) > 0);
     if (!is_left && !is_right) {
       overlapping_snapshots->push_back(seg);
     }
@@ -633,10 +725,12 @@ void HotIndexTable::GetOverlappingSegments(
 
   // 收集重叠的 delta segments
   for (const auto& seg : entry.deltas) {
-    bool is_left = (icmp_->user_comparator()->Compare(ExtractUserKey(seg.last_key),
-                                                     ExtractUserKey(first_key)) < 0);
-    bool is_right = (icmp_->user_comparator()->Compare(ExtractUserKey(seg.first_key),
-                                                      ExtractUserKey(last_key)) > 0);
+    bool is_left =
+        (icmp_->user_comparator()->Compare(ExtractUserKey(seg.last_key),
+                                           ExtractUserKey(first_key)) < 0);
+    bool is_right =
+        (icmp_->user_comparator()->Compare(ExtractUserKey(seg.first_key),
+                                           ExtractUserKey(last_key)) > 0);
     if (!is_left && !is_right) {
       overlapping_deltas->push_back(seg);
     }

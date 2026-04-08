@@ -25,6 +25,8 @@
 #include "rocksdb/slice.h"
 #include "rocksdb/write_batch.h"
 #include "rocksdb/statistics.h"
+#include "db/db_impl/db_impl.h"
+#include "delta/hotspot_manager.h"
 
 // ==========================================
 // 配置常量
@@ -32,13 +34,13 @@
 const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_native";
 const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_delta";
 const int kNumThreads = 32;
-const int kTestDurationSec = 2500;       // s
+const int kTestDurationSec = 3600;       // s
 const int kNumCuids = 1000000;           // 100W CUID 总库
 const int kBatchSize = 512;             // 每次 Put 512 行
 const int kTargetPutBatches = 120;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
 const double kHotRatio = 0.15;          // 15% 的热点
-const int kHotScanTarget = 200;        // 热点访问目标
-const int kColdScanTarget = 50;        // 普通访问目标
+const int kHotScanTarget = 100;        // 热点访问目标
+const int kColdScanTarget = 20;        // 普通访问目标
 
 // ==========================================
 // 辅助工具与状态管理
@@ -76,6 +78,13 @@ uint64_t ExtractCUID(const rocksdb::Slice& key) {
     c = (c << 8) | p[i];
   }
   return c;
+}
+
+std::string FormatKeyDisplay(const rocksdb::Slice& key) {
+  std::string cuid_part =
+      std::to_string(key.size() >= 24 ? ExtractCUID(key) : 0);
+  std::string suffix = key.size() > 24 ? key.ToString().substr(24) : "";
+  return cuid_part + "..." + suffix;
 }
 
 struct ThreadStats {
@@ -192,6 +201,70 @@ class PerfRunner {
           std::cerr << "[ERROR] Thread " << thread_id << " - CUID " << state.cuid 
                     << " final full scan mismatch! Expected: " << final_rows 
                     << ", Actual: " << final_scan_count << std::endl;
+
+          std::vector<int> missing_rows;
+          rocksdb::ReadOptions diag_ro = read_opts;
+          diag_ro.delta_full_scan = true;
+          rocksdb::Iterator* diag_it = db_->NewIterator(diag_ro);
+          diag_it->Seek(GenerateKey(state.cuid, 0));
+          int current_expected = 0;
+          while (diag_it->Valid() && ExtractCUID(diag_it->key()) == state.cuid) {
+            std::string key_str = diag_it->key().ToString();
+            int row_id = std::stoi(key_str.substr(24, 10)); // 从 key_str 中提取 row_id
+            while (current_expected < row_id && current_expected < final_rows) {
+              missing_rows.push_back(current_expected);
+              current_expected++;
+            }
+            current_expected = std::max(current_expected, row_id + 1);
+            diag_it->Next();
+          }
+          while (current_expected < final_rows) {
+            missing_rows.push_back(current_expected);
+            current_expected++;
+          }
+          delete diag_it;
+
+          if (!missing_rows.empty()) {
+            std::cerr << "[DIAG] Missing row_ids count: " << missing_rows.size() << "\n[DIAG] First missing row_ids: ";
+            for (size_t i = 0; i < std::min<size_t>(5, missing_rows.size()); i++) {
+              std::cerr << missing_rows[i] << " ";
+            }
+            std::cerr << "\n";
+            if (missing_rows.size() > 5) {
+              std::cerr << "[DIAG] Last missing row_ids: ";
+              size_t start_idx = std::max<size_t>(5, missing_rows.size() - 5);
+              for (size_t i = start_idx; i < missing_rows.size(); i++) {
+                std::cerr << missing_rows[i] << " ";
+              }
+              std::cerr << "\n";
+            }
+          }
+          
+          auto hotspot_mgr = static_cast<rocksdb::DBImpl*>(db_)->GetHotspotManager();
+          if (hotspot_mgr) {
+            rocksdb::HotIndexEntry diag_entry;
+            if (hotspot_mgr->GetHotIndexEntry(state.cuid, &diag_entry)) {
+              std::cerr << "[DIAG] CUID " << state.cuid << " snapshot_segments="
+                        << diag_entry.snapshot_segments.size()
+                        << " deltas=" << diag_entry.deltas.size() << std::endl;
+              for (size_t si = 0; si < diag_entry.snapshot_segments.size(); si++) {
+                const auto& seg = diag_entry.snapshot_segments[si];
+                std::cerr << "[DIAG]   snap[" << si
+                          << "] file=" << (int64_t)seg.file_number
+                          << " first_key=" << FormatKeyDisplay(seg.first_key)
+                          << " last_key=" << FormatKeyDisplay(seg.last_key)
+                          << std::endl;
+              }
+              for (size_t di = 0; di < diag_entry.deltas.size(); di++) {
+                const auto& seg = diag_entry.deltas[di];
+                std::cerr << "[DIAG]   delta[" << di
+                          << "] file=" << (int64_t)seg.file_number
+                          << " first_key=" << FormatKeyDisplay(seg.first_key)
+                          << " last_key=" << FormatKeyDisplay(seg.last_key)
+                          << std::endl;
+              }
+            }
+          }
         }
         
         // 移入延迟删除队列（不马上删，让数据有命沉淀到底层）
@@ -343,7 +416,7 @@ int main() {
 
       // --- Example 1: Programmatic Configuration of DeltaOptions ---
       // These can be set directly on the options object before opening the DB.
-      options.delta_options.hotspot_scan_threshold = 80;
+      options.delta_options.hotspot_scan_threshold = 50;
       options.delta_options.hotspot_scan_window_sec = 300;
       options.delta_options.delta_merge_threshold = 6;
       options.delta_options.sac_delta_count_threshold = 12;

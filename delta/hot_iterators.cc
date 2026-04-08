@@ -620,13 +620,6 @@ bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
   // 定位到 prev_key 及其之后
   current_iter_->Seek(prev_key);
 
-  // 重要：跳过已读过的 prev_key 自身，确保单调前进
-  while (current_iter_->Valid() &&
-         icmp_.user_comparator()->Compare(ExtractUserKey(current_iter_->key()),
-                                          ExtractUserKey(prev_key)) <= 0) {
-    current_iter_->Next();
-  }
-
   /*
   if (cuid_ == 1003) {
     fprintf(stderr,

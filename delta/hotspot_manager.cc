@@ -541,6 +541,33 @@ void HotspotManager::TriggerBufferFlush() {
   }
 }
 
+// Helper to extract row ID from key for gap detection
+static uint64_t ExtractRowID(const std::string& key) {
+  if (key.size() < 34) return 0;
+  try {
+    return std::stoull(key.substr(24, 10));
+  } catch (...) {
+    return 0;
+  }
+}
+
+static bool DetectSnapshotGap(uint64_t cuid, const std::vector<DataSegment>& segments, const char* context) {
+  if (segments.size() < 2) return false;
+  for (size_t i = 0; i + 1 < segments.size(); ++i) {
+    uint64_t last_id = ExtractRowID(segments[i].last_key);
+    uint64_t next_id = ExtractRowID(segments[i+1].first_key);
+    if (last_id != 0 && next_id != 0 && last_id + 1 != next_id && last_id < next_id) {
+      fprintf(stderr, "[DIAG_GAP_DETECTED] CUID %lu [%s] GAP between Seg%zu and Seg%zu! "
+              "Last (File %lu): %lu, Next (File %lu): %lu. Missing: %lu\n",
+              cuid, context, i, i+1, segments[i].file_number, last_id, 
+              segments[i+1].file_number, next_id, last_id + 1);
+      return true;
+    }
+  }
+  return false;
+
+}
+
 void HotspotManager::FinalizeScanAsCompaction(
     uint64_t cuid, const std::unordered_set<uint64_t>& visited_files,
     const std::string& scan_first_key, const std::string& scan_last_key) {
@@ -620,10 +647,10 @@ void HotspotManager::FinalizeScanAsCompaction(
         final_segments[i].last_key = final_segments[i + 1].first_key;
       }
     }
-    // 移除裁剪后失效的空段 (first_key >= last_key)
+    // 移除裁剪后失效的空段 (first_key > last_key)
     for (auto it = final_segments.begin(); it != final_segments.end(); ) {
       if (!it->last_key.empty() && 
-          internal_comparator_->Compare(it->first_key, it->last_key) >= 0) {
+          internal_comparator_->Compare(it->first_key, it->last_key) > 0) {
         // 释放 pending 路径的 Ref，防止泄漏
         if (it->file_number != static_cast<uint64_t>(-1)) {
           lifecycle_manager_->Unref(it->file_number);
@@ -676,6 +703,8 @@ void HotspotManager::FinalizeScanAsCompaction(
     return;
   }
 
+  
+
   // 【debug】验证拼接出来的 final_segments 是不是重叠的
   if (final_segments.size() > 1) {
     for (size_t i = 0; i < final_segments.size() - 1; ++i) {
@@ -688,6 +717,8 @@ void HotspotManager::FinalizeScanAsCompaction(
       // 检测方法 B: 重叠检测 (i 的终点不能跨过 i+1 的起点)
       bool overlapping = internal_comparator_->Compare(s1.last_key, s2.first_key) > 0;
       
+      // 检测方法 C：检测Gap
+      bool gap_detected = DetectSnapshotGap(cuid, final_segments, "FINALIZE");
       if (unsorted || overlapping) {
         fprintf(stderr, "\n[DIAGNOSE_FATAL] FinalizeScanAsCompaction Inconsistency detected!\n");
         fprintf(stderr, "CUID: %lu, Issue: %s\n", cuid, unsorted ? "UNSORTED" : "OVERLAPPING");
@@ -697,6 +728,16 @@ void HotspotManager::FinalizeScanAsCompaction(
         fprintf(stderr, "Seg[%zu] [%s - %s], file: %lu\n", 
                 i+1, FormatKeyDisplay(s2.first_key).c_str(), 
                 FormatKeyDisplay(s2.last_key).c_str(), s2.file_number);
+        fprintf(stderr, "--------------\n");
+      }
+      if (gap_detected) {
+        fprintf(stderr, "\n[DIAGNOSE_GAP] Gap detected in final_segments!\n");
+        for (size_t j = 0; j < final_segments.size(); ++j) {
+          const auto& seg = final_segments[j];
+          fprintf(stderr, "Seg[%zu] [%s - %s], file: %lu\n", 
+                  j, FormatKeyDisplay(seg.first_key).c_str(), 
+                  FormatKeyDisplay(seg.last_key).c_str(), seg.file_number);
+        }
         fprintf(stderr, "--------------\n");
       }
     }
