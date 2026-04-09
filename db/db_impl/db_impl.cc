@@ -7174,8 +7174,6 @@ void DBImpl::ProcessPendingPartialMerge() {
     }
 
     processed_count++;
-    // fprintf(stderr, "[DIAG_SV] Processing PartialMerge for CUID %lu in batch
-    // (SV:%p)\n", (unsigned long)task.cuid, sv);
 
     // 获取重叠的 segments
     std::vector<DataSegment> overlapping_snaps, overlapping_deltas;
@@ -7185,6 +7183,16 @@ void DBImpl::ProcessPendingPartialMerge() {
 
     // 如果没有重叠数据，使用 FullReplace 逻辑
     if (overlapping_snaps.empty() && overlapping_deltas.empty()) {
+      // PartialMerge 任务却找不到任何重叠数据，这是可疑状态，记录下来
+      HotIndexEntry entry_dbg;
+      hotspot_manager_->GetIndexTable().GetEntry(task.cuid, &entry_dbg);
+      fprintf(stderr, "[DIAG][PartialMerge] CUID %lu: NO overlapping data for scan=[%s - %s]. "
+              "Snapshot segs=%zu deltas=%zu. Falling back to FullReplace.\n",
+              (unsigned long)task.cuid,
+              FormatKeyDisplay(task.scan_first_key).c_str(),
+              FormatKeyDisplay(task.scan_last_key).c_str(),
+              entry_dbg.snapshot_segments.size(),
+              entry_dbg.deltas.size());
       DataSegment new_segment;
       new_segment.file_number = static_cast<uint64_t>(-1);
       new_segment.first_key = task.scan_first_key;

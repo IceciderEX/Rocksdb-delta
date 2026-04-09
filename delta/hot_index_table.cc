@@ -65,6 +65,23 @@ void HotIndexTable::UpdateSnapshot(
     auto& entry = shard.table[cuid];
     // Old Snapshot
     if (entry.HasSnapshot()) {
+      // 检测新 snapshot 是否有 GAP，有则打印完整上下文
+      if (DetectSnapshotGap(cuid, new_segments, "UpdateSnapshot")) {
+        fprintf(stderr, "[DIAG][UpdateSnapshot] CUID %lu: %zu old segs -> %zu new segs (GAP above)\n",
+                cuid, entry.snapshot_segments.size(), new_segments.size());
+        for (size_t i = 0; i < entry.snapshot_segments.size(); ++i) {
+          fprintf(stderr, "  old[%zu] file=%lu [%s - %s]\n", i,
+                  entry.snapshot_segments[i].file_number,
+                  FormatKeyDisplay(entry.snapshot_segments[i].first_key).c_str(),
+                  FormatKeyDisplay(entry.snapshot_segments[i].last_key).c_str());
+        }
+        for (size_t i = 0; i < new_segments.size(); ++i) {
+          fprintf(stderr, "  new[%zu] file=%lu [%s - %s]\n", i,
+                  new_segments[i].file_number,
+                  FormatKeyDisplay(new_segments[i].first_key).c_str(),
+                  FormatKeyDisplay(new_segments[i].last_key).c_str());
+        }
+      }
       segments_to_unref.insert(segments_to_unref.end(),
                                entry.snapshot_segments.begin(),
                                entry.snapshot_segments.end());
@@ -84,6 +101,10 @@ void HotIndexTable::UpdateSnapshot(
 
 void HotIndexTable::AppendSnapshotSegment(uint64_t cuid,
                                           const DataSegment& segment) {
+  fprintf(stderr, "[DIAG][AppendSnapshotSegment] CUID %lu: file=%lu [%s - %s]\n",
+          cuid, segment.file_number,
+          FormatKeyDisplay(segment.first_key).c_str(),
+          FormatKeyDisplay(segment.last_key).c_str());
   {
     Shard& shard = GetShard(cuid);
     std::unique_lock<std::shared_mutex> lock(shard.mutex);
@@ -163,6 +184,9 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
           DataSegment right = seg;
           right.first_key = new_segment.last_key;
           next_segments.push_back(right);
+          fprintf(stderr, "[DIAG][PromoteSnapshot] CUID %lu: RIGHT remnant KEPT [%s - %s)\n",
+                  cuid, FormatKeyDisplay(new_segment.last_key).c_str(),
+                  FormatKeyDisplay(seg.last_key).c_str());
         } else {
           fprintf(stderr, "[DIAG_CLIP_RIGHT] CUID %lu: Mem Seg right remnant discarded! Range: [%s - %s). Keep = false\n",
                   cuid, FormatKeyDisplay(new_segment.last_key).c_str(), FormatKeyDisplay(seg.last_key).c_str());
@@ -220,11 +244,37 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
                 return icmp->Compare(a.last_key, b.last_key) < 0;
               });
 
+    // GAP 检测：只在出现间隙时打印上下文
+    if (DetectSnapshotGap(cuid, next_segments, "PromoteSnapshot")) {
+      fprintf(stderr, "[DIAG][PromoteSnapshot] CUID %lu: GAP! newSST file=%lu [%s - %s]. Clipped mem segs=%zu\n",
+              cuid, new_segment.file_number,
+              FormatKeyDisplay(new_segment.first_key).c_str(),
+              FormatKeyDisplay(new_segment.last_key).c_str(),
+              clipped_mem_segments.size());
+      for (size_t i = 0; i < clipped_mem_segments.size(); ++i) {
+        fprintf(stderr, "  clipped_mem[%zu] [%s - %s]\n", i,
+                FormatKeyDisplay(clipped_mem_segments[i].first_key).c_str(),
+                FormatKeyDisplay(clipped_mem_segments[i].last_key).c_str());
+      }
+      for (size_t i = 0; i < next_segments.size(); ++i) {
+        fprintf(stderr, "  result[%zu] file=%lu [%s - %s]\n", i,
+                next_segments[i].file_number,
+                FormatKeyDisplay(next_segments[i].first_key).c_str(),
+                FormatKeyDisplay(next_segments[i].last_key).c_str());
+      }
+    }
+
     entry.snapshot_segments = std::move(next_segments);
 
     if (lifecycle_manager_) {
       lifecycle_manager_->Ref(new_segment.file_number);
     }
+  } else if (found_phys_overlap) {
+    // 新 SST 与物理段重叠但未被加入 snapshot：记录以便排查数据丢失
+    fprintf(stderr, "[DIAG][PromoteSnapshot] CUID %lu: PHYS_OVERLAP_ONLY newSST file=%lu [%s - %s] skipped (no -1 seg matched)\n",
+            cuid, new_segment.file_number,
+            FormatKeyDisplay(new_segment.first_key).c_str(),
+            FormatKeyDisplay(new_segment.last_key).c_str());
   }
 
   // 返回 true 的条件：找到了可替换的 -1
@@ -238,34 +288,6 @@ void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {
     Shard& shard = GetShard(cuid);
     std::unique_lock<std::shared_mutex> lock(shard.mutex);
     auto& entry = shard.table[cuid];
-
-    // 异常检测 1：时序倒挂检测 (Row ID 顺序)
-    if (!entry.deltas.empty()) {
-      const auto& last_delta = entry.deltas.back();
-      // 使用 string 比较，因为我们的 key 格式保证了 string 比较等效于 Row ID
-      // 比较
-      if (delta.first_key < last_delta.last_key) {
-        fprintf(
-            stderr,
-            "[WARNING_DELTA_ORDER] CUID %lu: New Delta (File %lu) starts at "
-            "%s, but previous Delta (File %lu) ended at %s!\n",
-            cuid, delta.file_number, FormatKeyDisplay(delta.first_key).c_str(),
-            last_delta.file_number,
-            FormatKeyDisplay(last_delta.last_key).c_str());
-      }
-    }
-
-    // 异常检测 2：检测异常大的 Key Range (疑似 L0 Flush 进入 Delta)
-    uint64_t first_rid = ExtractRowID(delta.first_key);
-    uint64_t last_rid = ExtractRowID(delta.last_key);
-    if (last_rid > first_rid + 50000) {  // 阈值设为 50,000
-      fprintf(stderr,
-              "[WARNING_HUGE_DELTA] CUID %lu: Delta (File %lu) has suspicious "
-              "large range: %lu rows! [%s - %s]\n",
-              cuid, delta.file_number, (last_rid - first_rid + 1),
-              FormatKeyDisplay(delta.first_key).c_str(),
-              FormatKeyDisplay(delta.last_key).c_str());
-    }
 
     shard.table[cuid].deltas.push_back(delta);
   }
@@ -567,21 +589,22 @@ void HotIndexTable::ReplaceOverlappingSegments(
               });
     
     if (DetectSnapshotGap(cuid, next_segments, "ReplaceOverlappingSegments")) {
-      // for (size_t j = 0; j < entry.deltas.size(); ++j) {
-      //   fprintf(stderr, " Delta%zu:, Range [%s, %s]\n", j,
-      //           FormatKeyDisplay(entry.deltas[j].first_key).c_str(),
-      //           FormatKeyDisplay(entry.deltas[j].last_key).c_str());
-      // }
-
-      // fprintf(stderr, "[DIAG_POST_REPLACE] new segment [%s - %s]\n",
-      //         FormatKeyDisplay(new_segment.first_key).c_str(),
-      //         FormatKeyDisplay(new_segment.last_key).c_str());
-      // for (size_t i = 0; i < next_segments.size(); ++i) {
-      //   fprintf(stderr, "[DIAG_POST_REPLACE] SNAPSHOTS %zu: [%s - %s]\n",
-      //           i, FormatKeyDisplay(next_segments[i].first_key).c_str(),
-      //           FormatKeyDisplay(next_segments[i].last_key).c_str());
-      // }
-      int idx = 0;
+      fprintf(stderr, "[DIAG][ReplaceOverlapping] CUID %lu: GAP! new={file=%lu [%s - %s]}\n",
+              cuid, new_segment.file_number,
+              FormatKeyDisplay(new_segment.first_key).c_str(),
+              FormatKeyDisplay(new_segment.last_key).c_str());
+      for (size_t i = 0; i < next_segments.size(); ++i) {
+        fprintf(stderr, "  result[%zu] file=%lu [%s - %s]\n", i,
+                next_segments[i].file_number,
+                FormatKeyDisplay(next_segments[i].first_key).c_str(),
+                FormatKeyDisplay(next_segments[i].last_key).c_str());
+      }
+      for (size_t j = 0; j < entry.deltas.size(); ++j) {
+        fprintf(stderr, "  delta[%zu] file=%lu [%s - %s]\n", j,
+                entry.deltas[j].file_number,
+                FormatKeyDisplay(entry.deltas[j].first_key).c_str(),
+                FormatKeyDisplay(entry.deltas[j].last_key).c_str());
+      }
     }
     // DetectSnapshotGap(cuid, snapshots, "ReplaceOverlappingSegments");
 
