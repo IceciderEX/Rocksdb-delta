@@ -89,15 +89,42 @@ bool HotspotManager::RegisterScan(uint64_t cuid, bool is_full_scan,
   return is_hot;
 }
 
+// Helper to extract row ID from key for gap detection
+static uint64_t ExtractRowID(const std::string& key) {
+  if (key.size() < 34) return 0;
+  try {
+    return std::stoull(key.substr(24, 10));
+  } catch (...) {
+    return 0;
+  }
+}
+
+static std::unordered_map<uint64_t, uint64_t> diag_last_appended_row_id;
+static std::mutex diag_append_mutex;
+
+static std::unordered_map<uint64_t, uint64_t> diag_last_flushed_row_id;
+
 bool HotspotManager::BufferHotData(uint64_t cuid, const Slice& key,
                                    const Slice& value) {
   {
     std::lock_guard<std::mutex> lock(buffered_cuids_mutex_);
     active_buffered_cuids_.insert(cuid);
   }
-  // if (cuid == 1003) {
-  //   fprintf(stderr, "[DIAG_APPEND] CUID 1003 appending key size: %zu\n", key.size());
-  // }
+  
+  uint64_t curr_id = ExtractRowID(key.ToString());
+  if (curr_id != 0) {
+    std::lock_guard<std::mutex> lock(diag_append_mutex);
+    auto it = diag_last_appended_row_id.find(cuid);
+    if (it != diag_last_appended_row_id.end() && it->second != 0) {
+      if (it->second + 1 != curr_id && it->second < curr_id && curr_id - it->second < 50000) {
+        fprintf(stderr, "[DIAG_APPEND_GAP] CUID %lu GAP detected on append! "
+                "Prev: %lu, Curr: %lu. Missing: %lu\n",
+                cuid, it->second, curr_id, it->second + 1);
+      }
+    }
+    diag_last_appended_row_id[cuid] = curr_id;
+  }
+
   return buffer_.Append(cuid, key, value);
 }
 
@@ -418,7 +445,29 @@ Status HotspotManager::FlushBlockToSharedSST(
     bool is_first_entry_in_segment = true;
     int written_count = 0;
 
+    uint64_t first_id = ExtractRowID(first_entry.key);
+    uint64_t last_id = ExtractRowID(bucket_entries.back().key);
+    
+    auto it = diag_last_flushed_row_id.find(current_cuid);
+    if (it != diag_last_flushed_row_id.end()) {
+      if (it->second != 0 && first_id != 0 && it->second + 1 != first_id && it->second < first_id) {
+         fprintf(stderr, "[DIAG_FLUSH_ACROSS_GAP] CUID %lu GAP detected across flushes! "
+                 "Last flushed: %lu, This flush starts at: %lu. Missing: %lu\n",
+                 current_cuid, it->second, first_id, it->second + 1);
+      }
+    }
+    diag_last_flushed_row_id[current_cuid] = last_id;
+
+    uint64_t prev_id = 0;
     for (const HotEntry& entry : bucket_entries) {
+      uint64_t curr_id = ExtractRowID(entry.key);
+      if (prev_id != 0 && prev_id + 1 != curr_id && prev_id < curr_id && curr_id - prev_id < 50000) {
+          fprintf(stderr, "[DIAG_FLUSH_INNER_GAP] CUID %lu GAP detected inside bucket! "
+                  "Prev: %lu, Curr: %lu. Missing: %lu\n",
+                  current_cuid, prev_id, curr_id, prev_id + 1);
+      }
+      prev_id = curr_id;
+
       Slice entry_key(entry.key);
       Slice current_user_key_slice = ExtractUserKey(entry_key);
       std::string current_user_key = current_user_key_slice.ToString();
@@ -477,7 +526,8 @@ Status HotspotManager::FlushBlockToSharedSST(
   return Status::OK();
 }
 
-void HotspotManager::TriggerBufferFlush() {
+void HotspotManager::TriggerBufferFlush(const char* source,
+                                        uint64_t source_cuid) {
   // 防止多次 flush 
   std::lock_guard<std::mutex> flush_lock(flush_mutex_);
   // 轮转 Buffer，传入 InternalKeyComparator 保证排序严格有序
@@ -492,6 +542,36 @@ void HotspotManager::TriggerBufferFlush() {
                   "[HotspotManager] Buffer rotated. Preparing to flush block.");
   auto block = buffer_.GetFrontBlockForFlush();
   while (block) {
+    std::string block_min_key;
+    std::string block_max_key;
+    bool has_block_range = false;
+    for (const auto& kv : block->bounds) {
+      const auto& b = kv.second;
+      if (b.min_key.empty() || b.max_key.empty()) {
+        continue;
+      }
+      if (!has_block_range) {
+        block_min_key = b.min_key;
+        block_max_key = b.max_key;
+        has_block_range = true;
+      } else {
+        if (internal_comparator_->Compare(b.min_key, block_min_key) < 0) {
+          block_min_key = b.min_key;
+        }
+        if (internal_comparator_->Compare(b.max_key, block_max_key) > 0) {
+          block_max_key = b.max_key;
+        }
+      }
+    }
+
+    fprintf(stderr,
+            "[DIAG_FLUSH_CALL] source=%s source_cuid=%" PRIu64
+            " block_cuids=%zu has_range=%d range=[%s - %s]\n",
+            source ? source : "UNKNOWN", source_cuid, block->bounds.size(),
+            has_block_range ? 1 : 0,
+            has_block_range ? FormatKeyDisplay(block_min_key).c_str() : "N/A",
+            has_block_range ? FormatKeyDisplay(block_max_key).c_str() : "N/A");
+
     std::unordered_map<uint64_t, DataSegment> new_segments;
     // to share SST
     Status s = FlushBlockToSharedSST(std::move(block), &new_segments);
@@ -541,18 +621,10 @@ void HotspotManager::TriggerBufferFlush() {
   }
 }
 
-// Helper to extract row ID from key for gap detection
-static uint64_t ExtractRowID(const std::string& key) {
-  if (key.size() < 34) return 0;
-  try {
-    return std::stoull(key.substr(24, 10));
-  } catch (...) {
-    return 0;
-  }
-}
+// ExtractRowID moved to top
 
-static bool DetectSnapshotGap(uint64_t cuid, const std::vector<DataSegment>& segments, const char* context) {
-  if (segments.size() < 2) return false;
+static void DetectSnapshotGap(uint64_t cuid, const std::vector<DataSegment>& segments, const char* context) {
+  if (segments.size() < 2) return;
   for (size_t i = 0; i + 1 < segments.size(); ++i) {
     uint64_t last_id = ExtractRowID(segments[i].last_key);
     uint64_t next_id = ExtractRowID(segments[i+1].first_key);
@@ -561,11 +633,8 @@ static bool DetectSnapshotGap(uint64_t cuid, const std::vector<DataSegment>& seg
               "Last (File %lu): %lu, Next (File %lu): %lu. Missing: %lu\n",
               cuid, context, i, i+1, segments[i].file_number, last_id, 
               segments[i+1].file_number, next_id, last_id + 1);
-      return true;
     }
   }
-  return false;
-
 }
 
 void HotspotManager::FinalizeScanAsCompaction(
@@ -598,8 +667,9 @@ void HotspotManager::FinalizeScanAsCompaction(
         }
 
         // 如果裁剪后发现 seg first >= last，这段 segment 无效
-        if (internal_comparator_->Compare(seg_it->first_key,
-                                          seg_it->last_key) >= 0) {
+        int cmp =
+            internal_comparator_->Compare(seg_it->first_key, seg_it->last_key);
+        if (cmp > 0) {
           // 释放 pending 路径的 Ref，防止泄漏
           if (seg_it->file_number != static_cast<uint64_t>(-1)) {
             lifecycle_manager_->Unref(seg_it->file_number);
@@ -662,6 +732,9 @@ void HotspotManager::FinalizeScanAsCompaction(
     }
   }
 
+  // 边界数据连续性检测
+  DetectSnapshotGap(cuid, final_segments, "FinalizeScanAsCompaction");
+
   // ===== 第二步：基于排序后的结果计算 tail_min 并创建 -1 尾段 =====
   std::string tail_min;
   if (final_segments.empty()) {
@@ -703,8 +776,6 @@ void HotspotManager::FinalizeScanAsCompaction(
     return;
   }
 
-  
-
   // 【debug】验证拼接出来的 final_segments 是不是重叠的
   if (final_segments.size() > 1) {
     for (size_t i = 0; i < final_segments.size() - 1; ++i) {
@@ -717,8 +788,6 @@ void HotspotManager::FinalizeScanAsCompaction(
       // 检测方法 B: 重叠检测 (i 的终点不能跨过 i+1 的起点)
       bool overlapping = internal_comparator_->Compare(s1.last_key, s2.first_key) > 0;
       
-      // 检测方法 C：检测Gap
-      bool gap_detected = DetectSnapshotGap(cuid, final_segments, "FINALIZE");
       if (unsorted || overlapping) {
         fprintf(stderr, "\n[DIAGNOSE_FATAL] FinalizeScanAsCompaction Inconsistency detected!\n");
         fprintf(stderr, "CUID: %lu, Issue: %s\n", cuid, unsorted ? "UNSORTED" : "OVERLAPPING");
@@ -728,16 +797,6 @@ void HotspotManager::FinalizeScanAsCompaction(
         fprintf(stderr, "Seg[%zu] [%s - %s], file: %lu\n", 
                 i+1, FormatKeyDisplay(s2.first_key).c_str(), 
                 FormatKeyDisplay(s2.last_key).c_str(), s2.file_number);
-        fprintf(stderr, "--------------\n");
-      }
-      if (gap_detected) {
-        fprintf(stderr, "\n[DIAGNOSE_GAP] Gap detected in final_segments!\n");
-        for (size_t j = 0; j < final_segments.size(); ++j) {
-          const auto& seg = final_segments[j];
-          fprintf(stderr, "Seg[%zu] [%s - %s], file: %lu\n", 
-                  j, FormatKeyDisplay(seg.first_key).c_str(), 
-                  FormatKeyDisplay(seg.last_key).c_str(), seg.file_number);
-        }
         fprintf(stderr, "--------------\n");
       }
     }

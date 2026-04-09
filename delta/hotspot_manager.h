@@ -62,7 +62,8 @@ class HotspotManager {
     std::shared_ptr<HotDataBlock> block,
     std::unordered_map<uint64_t, DataSegment>* output_segments);
 
-  void TriggerBufferFlush();
+  void TriggerBufferFlush(const char* source = "UNKNOWN",
+                          uint64_t source_cuid = 0);
 
   bool ShouldTriggerScanAsCompaction(uint64_t cuid);
 

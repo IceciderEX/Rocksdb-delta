@@ -1701,5 +1701,5 @@ if(WITH_BENCHMARK)
 endif()
 
 # for delta
-add_executable(rocksdb_scan test/rocksdb_scan.cc db/db_test_util.cc)
+add_executable(rocksdb_scan test/rocksdb_scan.cc)
 target_link_libraries(rocksdb_scan rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})

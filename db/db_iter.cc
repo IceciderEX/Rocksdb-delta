@@ -687,7 +687,7 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                   bool buffer_full = hotspot_manager_->BufferHotData(
                       cuid, Slice(delta_ctx_.key_encode_buf), value());
                   if (buffer_full) {
-                    hotspot_manager_->TriggerBufferFlush();
+                    hotspot_manager_->TriggerBufferFlush("FullScan", cuid);
                   }
                 } else if (!read_options_.is_metadata_scan &&
                            !read_options_.delta_full_scan) {

@@ -7298,7 +7298,7 @@ void DBImpl::ProcessPendingPartialMerge() {
           task.cuid, new_segment, obsolete_files);
 
       if (trigger_flush) {
-        hotspot_manager_->TriggerBufferFlush();
+        hotspot_manager_->TriggerBufferFlush("PartialMerge", task.cuid);
       }
 
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
