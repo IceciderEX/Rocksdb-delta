@@ -7181,56 +7181,64 @@ void DBImpl::ProcessPendingPartialMerge() {
         task.cuid, task.scan_first_key, task.scan_last_key, &overlapping_snaps,
         &overlapping_deltas);
 
-    // [DIAG_PM_RANGE] 打印 PM 任务范围 + 所有重叠片段，用于分析 GAP 来源
-    // {
-    //   HotIndexEntry entry_dbg;
-    //   hotspot_manager_->GetIndexTable().GetEntry(task.cuid, &entry_dbg);
-    //   fprintf(stderr,
-    //           "[DIAG_PM_RANGE] CUID %lu: pm_scan=[%s - %s] "
-    //           "total_snaps=%zu total_deltas=%zu "
-    //           "overlap_snaps=%zu overlap_deltas=%zu\n",
-    //           (unsigned long)task.cuid,
-    //           FormatKeyDisplay(task.scan_first_key).c_str(),
-    //           FormatKeyDisplay(task.scan_last_key).c_str(),
-    //           entry_dbg.snapshot_segments.size(),
-    //           entry_dbg.deltas.size(),
-    //           overlapping_snaps.size(),
-    //           overlapping_deltas.size());
-    //   // 打印所有 snapshot 段，标注是否在重叠集合中
-    //   for (size_t i = 0; i < entry_dbg.snapshot_segments.size(); ++i) {
-    //     const auto& s = entry_dbg.snapshot_segments[i];
-    //     bool in_overlap = false;
-    //     for (const auto& os : overlapping_snaps) {
-    //       if (os.file_number == s.file_number &&
-    //           os.first_key == s.first_key && os.last_key == s.last_key) {
-    //         in_overlap = true; break;
-    //       }
-    //     }
-    //     fprintf(stderr,
-    //             "[DIAG_PM_RANGE]   snap[%zu] file=%lu [%s - %s] %s\n",
-    //             i, s.file_number,
-    //             FormatKeyDisplay(s.first_key).c_str(),
-    //             FormatKeyDisplay(s.last_key).c_str(),
-    //             in_overlap ? "OVERLAPPING" : "NOT-overlapping");
-    //   }
-    //   // 打印所有 delta 段，标注是否在重叠集合中
-    //   for (size_t i = 0; i < entry_dbg.deltas.size(); ++i) {
-    //     const auto& d = entry_dbg.deltas[i];
-    //     bool in_overlap = false;
-    //     for (const auto& od : overlapping_deltas) {
-    //       if (od.file_number == d.file_number &&
-    //           od.first_key == d.first_key && od.last_key == d.last_key) {
-    //         in_overlap = true; break;
-    //       }
-    //     }
-    //     fprintf(stderr,
-    //             "[DIAG_PM_RANGE]   delta[%zu] file=%lu [%s - %s] %s\n",
-    //             i, d.file_number,
-    //             FormatKeyDisplay(d.first_key).c_str(),
-    //             FormatKeyDisplay(d.last_key).c_str(),
-    //             in_overlap ? "OVERLAPPING" : "NOT-overlapping");
-    //   }
-    // }
+    {
+      HotIndexEntry entry_dbg;
+      hotspot_manager_->GetIndexTable().GetEntry(task.cuid, &entry_dbg);
+      fprintf(stderr,
+              "[DIAG_PM_RANGE] CUID %lu: pm_scan=[%s - %s] "
+              "total_snaps=%zu total_deltas=%zu "
+              "overlap_snaps=%zu overlap_deltas=%zu scan_data=%zu\n",
+              (unsigned long)task.cuid,
+              FormatKeyDisplay(task.scan_first_key).c_str(),
+              FormatKeyDisplay(task.scan_last_key).c_str(),
+              entry_dbg.snapshot_segments.size(),
+              entry_dbg.deltas.size(),
+              overlapping_snaps.size(),
+              overlapping_deltas.size(),
+              task.scan_data.size());
+      
+      // 检查 scan_data 是否包含了预期的起始 Key
+      if (!task.scan_data.empty()) {
+        fprintf(stderr, "[DIAG_PM_RANGE]   scan_data range [%s - %s]\n",
+                FormatKeyDisplay(task.scan_data.front().first).c_str(),
+                FormatKeyDisplay(task.scan_data.back().first).c_str());
+      }
+
+      // 打印所有 snapshot 段，标注是否在重叠集合中
+      for (size_t i = 0; i < entry_dbg.snapshot_segments.size(); ++i) {
+        const auto& s = entry_dbg.snapshot_segments[i];
+        bool in_overlap = false;
+        for (const auto& os : overlapping_snaps) {
+          if (os.file_number == s.file_number &&
+              os.first_key == s.first_key && os.last_key == s.last_key) {
+            in_overlap = true; break;
+          }
+        }
+        fprintf(stderr,
+                "[DIAG_PM_RANGE]   snap[%zu] file=%lu [%s - %s] %s\n",
+                i, s.file_number,
+                FormatKeyDisplay(s.first_key).c_str(),
+                FormatKeyDisplay(s.last_key).c_str(),
+                in_overlap ? "OVERLAPPING" : "NOT-overlapping");
+      }
+      // 打印所有 delta 段，标注是否在重叠集合中
+      for (size_t i = 0; i < entry_dbg.deltas.size(); ++i) {
+        const auto& d = entry_dbg.deltas[i];
+        bool in_overlap = false;
+        for (const auto& od : overlapping_deltas) {
+          if (od.file_number == d.file_number &&
+              od.first_key == d.first_key && od.last_key == d.last_key) {
+            in_overlap = true; break;
+          }
+        }
+        fprintf(stderr,
+                "[DIAG_PM_RANGE]   delta[%zu] file=%lu [%s - %s] %s\n",
+                i, d.file_number,
+                FormatKeyDisplay(d.first_key).c_str(),
+                FormatKeyDisplay(d.last_key).c_str(),
+                in_overlap ? "OVERLAPPING" : "NOT-overlapping");
+      }
+    }
 
     // 如果没有重叠数据，使用 FullReplace 逻辑
     if (overlapping_snaps.empty() && overlapping_deltas.empty()) {
@@ -7337,6 +7345,20 @@ void DBImpl::ProcessPendingPartialMerge() {
     delete merging_iter;
 
     if (written_count > 0) {
+      // [DIAG_PM_RANGE_UNDERCUT] 检测范围收缩情况
+      if (icmp.user_comparator()->Compare(ExtractUserKey(segment_first_key), 
+                                          ExtractUserKey(task.scan_first_key)) > 0) {
+        fprintf(stderr, 
+                "[DIAG_PM_RANGE_UNDERCUT] CUID %lu: segment_range=[%s - %s] "
+                "scan_range=[%s - %s] written=%zu\n",
+                (unsigned long)task.cuid,
+                FormatKeyDisplay(segment_first_key).c_str(),
+                FormatKeyDisplay(segment_last_key).c_str(),
+                FormatKeyDisplay(task.scan_first_key).c_str(),
+                FormatKeyDisplay(task.scan_last_key).c_str(),
+                written_count);
+        fprintf(stderr, "  \xe2\x86\x92 PM output starts LATER than scan request! Possible data loss if obsolete deltas contained the prefix.\n");
+      }
       // 收集需要清理的旧文件
       std::vector<uint64_t> obsolete_files;
       for (const auto& seg : overlapping_snaps) {

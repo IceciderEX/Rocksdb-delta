@@ -4,6 +4,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -80,7 +81,7 @@ std::string FormatKeyDisplay(const Slice& key) {
 
 void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
   uint64_t next_rid = 0;
-  uint64_t target_cuid = 1003;
+  uint64_t target_cuid = cuids[rand() % cuids.size()];
   WriteOptions wo;
   while (!stop_test) {
     WriteBatch batch;
@@ -111,24 +112,62 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
     ro.enable_delta_diag_logging = true;
   }
 
+  std::mt19937 gen(id + static_cast<uint32_t>(time(0)));
   while (!stop_test) {
-    uint64_t cuid = 1003;
-    ro.delta_full_scan = (rand() % 2 == 0);
-    if (ro.enable_delta_diag_logging) {
-      std::cout << "[Reader " << id << "] Starting scan for CUID " << cuid
-                << ", delta_full_scan=" << ro.delta_full_scan << std::endl;
+    uint64_t cuid = cuids[gen() % cuids.size()];
+    ro.delta_full_scan = false;
+
+    // 获取当前数据的总量
+    size_t cur_total_rows = 0;
+    {
+      std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
+      cur_total_rows = ground_truths[cuid]->row_ids.size();
     }
 
-    std::string start_key = GenerateKey(cuid, 0);
-    std::string upper_bound = GenerateKey(cuid + 1, 0);
+    if (cur_total_rows == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+
+    // 随机扫描 10%-50% 的数据范围
+    uint64_t scan_len = 0;
+    uint64_t start_row = 0;
+    
+    if (cur_total_rows < 10) {
+      scan_len = cur_total_rows;
+      start_row = 0;
+    } else {
+      uint64_t min_len = static_cast<uint64_t>(cur_total_rows * 0.1);
+      uint64_t max_len = static_cast<uint64_t>(cur_total_rows * 0.5);
+      std::uniform_int_distribution<uint64_t> len_dist(min_len, std::max(min_len + 1, max_len));
+      scan_len = len_dist(gen);
+
+      std::uniform_int_distribution<uint64_t> start_dist(0, cur_total_rows - scan_len);
+      start_row = start_dist(gen);
+    }
+
+    uint64_t end_row = start_row + scan_len;
+
+    if (ro.enable_delta_diag_logging) {
+      std::cout << "[Reader " << id << "] Starting scan for CUID " << cuid
+                << ", range [" << start_row << ", " << end_row 
+                << "), len=" << scan_len << ", total=" << cur_total_rows << std::endl;
+    }
+
+    std::string start_key = GenerateKey(cuid, start_row);
+    std::string upper_bound = GenerateKey(cuid, end_row);
     Slice ub_slice = upper_bound;
     ro.iterate_upper_bound = &ub_slice;
 
-    // Take snapshot of expected rows before starting the scan
+    // Take snapshot of expected rows before starting the scan, filtered by range
     std::set<uint64_t> expected;
     {
       std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
-      expected = ground_truths[cuid]->row_ids;
+      auto it_low = ground_truths[cuid]->row_ids.lower_bound(start_row);
+      auto it_high = ground_truths[cuid]->row_ids.lower_bound(end_row);
+      for (auto it = it_low; it != it_high; ++it) {
+        expected.insert(*it);
+      }
     }
 
     std::unique_ptr<Iterator> it(db->NewIterator(ro));
@@ -204,19 +243,6 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
                       << std::endl;
           }
 
-          // Check buffer data count
-          // auto* buf_iter = hotspot_mgr->NewBufferIterator(cuid, nullptr);
-          // if (buf_iter) {
-          //   size_t buf_count = 0;
-          //   for (buf_iter->SeekToFirst(); buf_iter->Valid();
-          //   buf_iter->Next()) {
-          //     buf_count++;
-          //   }
-          //   std::cerr << "[DIAG] Buffer data count for CUID " << cuid << ": "
-          //             << buf_count << std::endl;
-          //   delete buf_iter;
-          // }
-
           int count = 0;
           int mod = ground_truths[cuid]->row_ids.size() / 10;
           std::unique_ptr<Iterator> it2(db->NewIterator(ro));
@@ -231,7 +257,7 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
           int i = 0;
           count = i;
         } 
-      } else if (rand() % 100 < 5 && ro.enable_delta_diag_logging) {
+      } else if (gen() % 100 < 5 && ro.enable_delta_diag_logging) {
         // Log diagnostic information for a small percentage of scans
         auto hotspot_mgr = dynamic_cast<DBImpl*>(db)->GetHotspotManager();
         HotIndexEntry diag_entry;
@@ -285,8 +311,8 @@ int main() {
   Options options;
   options.create_if_missing = true;
   options.enable_delta = true;
-  options.write_buffer_size = 2 * 1024 * 1024;
-  options.target_file_size_base = 2 * 1024 * 1024;
+  options.write_buffer_size = 16 * 1024 * 1024;
+  options.target_file_size_base = 16 * 1024 * 1024;
 
   // --- Example 1: Programmatic Configuration of DeltaOptions ---
   // These can be set directly on the options object before opening the DB.
@@ -295,7 +321,7 @@ int main() {
   options.delta_options.delta_merge_threshold = 3;
   options.delta_options.sac_delta_count_threshold = 5;
   options.delta_options.sharding_count = 64;  // Power of 2 recommended
-  options.delta_options.hot_data_buffer_threshold_bytes = 8 * 1024 * 1024;
+  options.delta_options.hot_data_buffer_threshold_bytes = 16 * 1024 * 1024;
   options.delta_options.hot_data_buffer_shards = 128;
   options.delta_options.compaction_l0_trigger_count = 20;
   options.delta_options.compaction_l0_trigger_age_sec = 3600;
@@ -324,9 +350,11 @@ int main() {
     ground_truths[cuid] = new CuidGroundTruth();
   }
 
-  std::cout << "Starting Deep Stress Test for 30 seconds..." << std::endl;
+  std::cout << "Starting Deep Stress Test for 90000 seconds..." << std::endl;
 
-  std::thread writer(WriterThread, db, cuids);
+  std::thread writer1(WriterThread, db, cuids);
+  std::thread writer2(WriterThread, db, cuids);
+  std::thread writer3(WriterThread, db, cuids);
   std::thread reader1(ReaderThread, db, cuids, 1);
   std::thread reader2(ReaderThread, db, cuids, 2);
   std::thread reader3(ReaderThread, db, cuids, 3);
@@ -343,7 +371,9 @@ int main() {
   }
 
   stop_test = true;
-  writer.join();
+  writer1.join();
+  writer2.join();
+  writer3.join();
   reader1.join();
   reader2.join();
   reader3.join();

@@ -722,11 +722,16 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
 
       if (!is_left && !is_right) {
         // 与 PM 范围重叠：保留不重叠的边缘部分
+        fprintf(stderr, "[DIAG][AtomicReplace] CUID %lu: Seg Overlap detected. Seg=[%s - %s] PM=[%s - %s]\n",
+                cuid, FormatKeyDisplay(seg.first_key).c_str(), FormatKeyDisplay(seg.last_key).c_str(),
+                FormatKeyDisplay(pm_range_first).c_str(), FormatKeyDisplay(pm_range_last).c_str());
         // 1. 左侧剩余
         if (icmp_->user_comparator()->Compare(seg_start, pm_start_user) < 0) {
           DataSegment left = seg;
           left.last_key = pm_range_first;
           next_segments.push_back(left);
+          fprintf(stderr, "  → Created LEFT remnant: [%s - %s]\n",
+                  FormatKeyDisplay(left.first_key).c_str(), FormatKeyDisplay(left.last_key).c_str());
           // 左残余与原始段共享文件，额外 Ref
           if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
             lifecycle_manager_->Ref(seg.file_number);
@@ -737,6 +742,8 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
           DataSegment right = seg;
           right.first_key = pm_range_last;
           next_segments.push_back(right);
+          fprintf(stderr, "  → Created RIGHT remnant: [%s - %s]\n",
+                  FormatKeyDisplay(right.first_key).c_str(), FormatKeyDisplay(right.last_key).c_str());
           if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
             lifecycle_manager_->Ref(seg.file_number);
           }
@@ -823,6 +830,8 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
       buf_seg.file_number = static_cast<uint64_t>(-1);
       buf_seg.first_key   = buf_min;
       buf_seg.last_key    = buf_max;
+      fprintf(stderr, "[DIAG][AtomicReplace] CUID %lu: Adding Buffer Segment (File -1) [%s - %s]\n",
+              cuid, FormatKeyDisplay(buf_seg.first_key).c_str(), FormatKeyDisplay(buf_seg.last_key).c_str());
       next_segments.push_back(buf_seg);
     }
 
