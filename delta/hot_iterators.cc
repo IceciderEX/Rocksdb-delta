@@ -258,6 +258,31 @@ HotSnapshotIterator::HotSnapshotIterator(
   RefSegments(segments_);
 }
 
+// SegmentsPreRefed 构造函数：调用方已通过 GetEntryAndRefSnapshots
+// 在 shared_lock 内完成 Ref，此处跳过 RefSegments 避免双重计数
+HotSnapshotIterator::HotSnapshotIterator(
+    SegmentsPreRefed,
+    const std::vector<DataSegment>& segments, uint64_t cuid,
+    HotspotManager* hotspot_manager, TableCache* table_cache,
+    const ReadOptions& read_options, const FileOptions& file_options,
+    const InternalKeyComparator& icmp,
+    const MutableCFOptions& mutable_cf_options,
+    std::shared_ptr<HotSstLifecycleManager> lifecycle_manager)
+    : segments_(segments),
+      cuid_(cuid),
+      hotspot_manager_(hotspot_manager),
+      table_cache_(table_cache),
+      read_options_(read_options),
+      file_options_(file_options),
+      icmp_(icmp),
+      mutable_cf_options_(mutable_cf_options),
+      current_segment_index_(-1),
+      status_(Status::OK()),
+      lifecycle_manager_(lifecycle_manager),
+      current_segment_read_count_(0) {
+  // Segments are already Ref'd by the caller; do NOT call RefSegments here
+}
+
 HotSnapshotIterator::~HotSnapshotIterator() {
   // Unref all physical segments held by this Iterator
   UnrefSegments(segments_);
@@ -425,13 +450,11 @@ void HotSnapshotIterator::Seek(const Slice& target) {
 
       SegmentInitStatus status = InitIterForSegment(index);
       if (status == SegmentInitStatus::kSnapshotChanged) {
-        // snapshots 已变，重新获取并定位
+         // snapshots 已变，原子获取并 Ref 新段，释放旧段
         HotIndexEntry latest_entry;
-        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
-          // Swap refs on segment reassignment
+        if (hotspot_manager_->GetHotIndexEntryAndRefSnapshots(cuid_, &latest_entry)) {
           std::vector<DataSegment> old_segs = std::move(segments_);
-          segments_ = latest_entry.snapshot_segments;
-          RefSegments(segments_);
+          segments_ = latest_entry.snapshot_segments;  // 已预 Ref
           UnrefSegments(old_segs);
           current_segment_index_ = -1;
           continue;  // 重新进行 lower_bound
@@ -558,12 +581,15 @@ void HotSnapshotIterator::Next() {
 // 从最新索引重新获取段列表，并利用 prev_key 定位到正确的位置继续读
 bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
   HotIndexEntry latest_entry;
-  if (!hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry) ||
+  // atomic Get+Ref：在 shared_lock 内完成 Ref，防止复制后
+  // AtomicReplaceForPartialMerge 的锁外 Unref 把文件 GC 掉
+  if (!hotspot_manager_->GetHotIndexEntryAndRefSnapshots(cuid_, &latest_entry) ||
       !latest_entry.HasSnapshot()) {
+    // snapshot_segments 为空，GetEntryAndRefSnapshots 未 Ref 任何段
     return false;
   }
 
-  // segments 没变 => EOF
+  // segments 没变 => EOF；释放预 Ref 后返回
   const auto& new_segs = latest_entry.snapshot_segments;
   if (!segments_.empty() && segments_.size() == new_segs.size()) {
     bool identical = true;
@@ -575,14 +601,17 @@ bool HotSnapshotIterator::ReSyncToLatestSegments(const Slice& prev_key) {
         break;
       }
     }
-    if (identical) return false;
+    if (identical) {
+      // 未采用新段，释放刚才预 Ref 的引用
+      UnrefSegments(new_segs);
+      return false;
+    }
   }
 
-  // Save old segments for Unref, then swap refs
+  // 采用新段（已预 Ref），释放旧段引用
   std::vector<DataSegment> old_segments = std::move(segments_);
   segments_ = new_segs;
-
-  RefSegments(segments_);
+  // 不再调用 RefSegments(segments_)，new_segs 已由 GetHotIndexEntryAndRefSnapshots 预 Ref
   UnrefSegments(old_segments);
 
   //如果segments_空了 => EOF
@@ -644,11 +673,9 @@ void HotSnapshotIterator::SwitchToNextSegment() {
     SegmentInitStatus status = InitIterForSegment(target_index);
     if (status == SegmentInitStatus::kSnapshotChanged) {
       HotIndexEntry latest_entry;
-      if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
-        // Swap refs on segment reassignment
+      if (hotspot_manager_->GetHotIndexEntryAndRefSnapshots(cuid_, &latest_entry)) {
         std::vector<DataSegment> old_segs = std::move(segments_);
-        segments_ = latest_entry.snapshot_segments;
-        RefSegments(segments_);
+        segments_ = latest_entry.snapshot_segments;  // 已预 Ref
         UnrefSegments(old_segs);
         continue;
       }
@@ -693,11 +720,9 @@ void HotSnapshotIterator::SeekToFirst() {
 
     if (status == SegmentInitStatus::kSnapshotChanged) {
         HotIndexEntry latest_entry;
-        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
-            // Swap refs on segment reassignment
+        if (hotspot_manager_->GetHotIndexEntryAndRefSnapshots(cuid_, &latest_entry)) {
             std::vector<DataSegment> old_segs = std::move(segments_);
-            segments_ = latest_entry.snapshot_segments;
-            RefSegments(segments_);
+            segments_ = latest_entry.snapshot_segments;  // 已预 Ref
             UnrefSegments(old_segs);
             continue;
         }
@@ -739,11 +764,9 @@ void HotSnapshotIterator::SeekToLast() {
 
     if (status == SegmentInitStatus::kSnapshotChanged) {
         HotIndexEntry latest_entry;
-        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
-            // Swap refs on segment reassignment
+        if (hotspot_manager_->GetHotIndexEntryAndRefSnapshots(cuid_, &latest_entry)) {
             std::vector<DataSegment> old_segs = std::move(segments_);
-            segments_ = latest_entry.snapshot_segments;
-            RefSegments(segments_);
+            segments_ = latest_entry.snapshot_segments;  // 已预 Ref
             UnrefSegments(old_segs);
             continue;
         }
@@ -801,11 +824,9 @@ void HotSnapshotIterator::SwitchToPrevSegment() {
 
       if (status == SegmentInitStatus::kSnapshotChanged) {
         HotIndexEntry latest_entry;
-        if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry)) {
-          // Swap refs on segment reassignment
+        if (hotspot_manager_->GetHotIndexEntryAndRefSnapshots(cuid_, &latest_entry)) {
           std::vector<DataSegment> old_segs = std::move(segments_);
-          segments_ = latest_entry.snapshot_segments;
-          RefSegments(segments_);
+          segments_ = latest_entry.snapshot_segments;  // 已预 Ref
           UnrefSegments(old_segs);
           continue;
         }
@@ -894,9 +915,10 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
     hot_iter_ = nullptr;
   }
 
-  // 1. 获取元数据
+  // 1. 获取元数据，并在 shared_lock 持有期间原子地 Ref 所有物理 snapshot 段
+  // 防止 GetEntry → Ref 之间 AtomicReplaceForPartialMerge Unref 到 0 的竞态
   HotIndexEntry entry;
-  if (!hotspot_manager_->GetHotIndexEntry(cuid, &entry)) {
+  if (!hotspot_manager_->GetHotIndexEntryAndRefSnapshots(cuid, &entry)) {
     if (read_options_.enable_delta_diag_logging) {
       fprintf(stderr, "[DIAG_HOT_PATH] CUID %lu: InitHotIter failed - No Index Entry found\n", cuid);
     }
@@ -904,15 +926,17 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
   }
 
   if (!entry.HasSnapshot()) {
+    // Snapshot 为空，预 Ref 也为空（nothing to Unref）
     if (read_options_.enable_delta_diag_logging) {
       fprintf(stderr, "[DIAG_HOT_PATH] CUID %lu: InitHotIter failed - No Snapshot segments yet (Initial scan might be in progress)\n", cuid);
     }
     return false;
   }
 
-  // snapshot and delta
+  // snapshot_segments 已预 Ref
   InternalIterator* snapshot_iter =
-      new HotSnapshotIterator(entry.snapshot_segments, cuid, hotspot_manager_,
+      new HotSnapshotIterator(HotSnapshotIterator::SegmentsPreRefed{},
+                              entry.snapshot_segments, cuid, hotspot_manager_,
                               version_->cfd()->table_cache(), read_options_,
                               file_options_, icmp_, mutable_cf_options_,
                               hotspot_manager_->GetLifecycleManager());

@@ -83,6 +83,11 @@ class HotDataBuffer {
                        std::string* max_key,
                        const InternalKeyComparator* icmp);
 
+  // 检查当前活跃数据（尚未 Rotate 的 active_block）是否超过阈值
+  bool ExceedsThreshold() const {
+    return total_active_size_.load(std::memory_order_relaxed) >= threshold_bytes_;
+  }
+
   // for reading
   InternalIterator* NewIterator(uint64_t cuid,
                                 const InternalKeyComparator* icmp);

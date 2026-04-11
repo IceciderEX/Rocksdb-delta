@@ -144,6 +144,12 @@ class HotspotManager {
     return index_table_.GetEntry(cuid, out_entry);
   }
 
+  // 原子地复制 entry 并在 shared_lock 内 Ref 所有物理 snapshot 段
+  // 返回的 out_entry->snapshot_segments 已预 Ref，调用方负责最终 Unref
+  bool GetHotIndexEntryAndRefSnapshots(uint64_t cuid, HotIndexEntry* out_entry) {
+    return index_table_.GetEntryAndRefSnapshots(cuid, out_entry);
+  }
+
   InternalIterator* NewBufferIterator(uint64_t cuid,
                                       const InternalKeyComparator* icmp);
 
@@ -216,9 +222,6 @@ class HotspotManager {
   // FinalizeScanAsCompaction -> IndexTable
   std::unordered_map<uint64_t, std::vector<DataSegment>> pending_snapshots_;
   std::mutex pending_mutex_;
-  std::unordered_set<uint64_t> active_buffered_cuids_;
-  std::mutex buffered_cuids_mutex_;
-
   // 待补全物理 ID 计数的扫描队列
   std::vector<uint64_t> pending_metadata_scans_;
   mutable std::mutex pending_metadata_mutex_;
@@ -231,6 +234,10 @@ class HotspotManager {
   // 正在进行的 CUID 操作 (防止并发)
   std::unordered_set<uint64_t> in_progress_cuids_;
   mutable std::mutex in_progress_mutex_;
+  // PartialMerge 进行期间（BufferHotData ~ ReplaceOverlappingSegments），
+  // 跨线程 TriggerBufferFlush 对该 CUID 产生的 SST 暂存于此
+  std::unordered_map<uint64_t, std::vector<DataSegment>> pm_pending_snapshots_;
+  std::mutex pm_pending_mutex_;
 
  public:
   // 加入 Partial Merge 队列 (前台调用，不阻塞)
@@ -249,6 +256,35 @@ class HotspotManager {
 
   // 取出一个待处理的 Partial Merge 任务 (供 db_impl 调用)
   bool PopPendingPartialMerge(PartialMergePendingTask* task);
+
+  // 向 pm_pending_snapshots_ 注册该 cuid 的空列表
+  void RegisterPmPending(uint64_t cuid);
+
+  // 取出 pm_pending_snapshots_[cuid] 中当前积累的 SSTs，重置为空 vector 但不删除 cuid
+  std::vector<DataSegment> SwapOutPmPending(uint64_t cuid) {
+    std::lock_guard<std::mutex> lock(pm_pending_mutex_);
+    auto it = pm_pending_snapshots_.find(cuid);
+    if (it == pm_pending_snapshots_.end()) return {};
+    auto result = std::move(it->second);
+    it->second.clear();  // 重置为空，保留 key（entry 继续活跃）
+    return result;
+  }
+
+  // 查询 buffer 中是否有该 CUID 的数据，以及数据的实际范围。
+  // 用于为 AtomicReplaceForPartialMerge 提供准确的 -1 段范围，
+  // 避免 -1 段声称覆盖已被 flush 到物理 SST 的范围。
+  bool GetBufferBoundaryKeys(uint64_t cuid,
+                             std::string* min_key,
+                             std::string* max_key) {
+    return buffer_.GetBoundaryKeys(cuid, min_key, max_key, internal_comparator_);
+  }
+
+  // 检查当前活跃 buffer 总大小是否达到 flush 阈值
+  bool BufferExceedsThreshold() const {
+    return buffer_.ExceedsThreshold();
+  }
+
+  void FinalizePmPendingSnapshots(uint64_t cuid);
 };
 
 }  // namespace ROCKSDB_NAMESPACE

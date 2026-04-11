@@ -7181,6 +7181,57 @@ void DBImpl::ProcessPendingPartialMerge() {
         task.cuid, task.scan_first_key, task.scan_last_key, &overlapping_snaps,
         &overlapping_deltas);
 
+    // [DIAG_PM_RANGE] 打印 PM 任务范围 + 所有重叠片段，用于分析 GAP 来源
+    // {
+    //   HotIndexEntry entry_dbg;
+    //   hotspot_manager_->GetIndexTable().GetEntry(task.cuid, &entry_dbg);
+    //   fprintf(stderr,
+    //           "[DIAG_PM_RANGE] CUID %lu: pm_scan=[%s - %s] "
+    //           "total_snaps=%zu total_deltas=%zu "
+    //           "overlap_snaps=%zu overlap_deltas=%zu\n",
+    //           (unsigned long)task.cuid,
+    //           FormatKeyDisplay(task.scan_first_key).c_str(),
+    //           FormatKeyDisplay(task.scan_last_key).c_str(),
+    //           entry_dbg.snapshot_segments.size(),
+    //           entry_dbg.deltas.size(),
+    //           overlapping_snaps.size(),
+    //           overlapping_deltas.size());
+    //   // 打印所有 snapshot 段，标注是否在重叠集合中
+    //   for (size_t i = 0; i < entry_dbg.snapshot_segments.size(); ++i) {
+    //     const auto& s = entry_dbg.snapshot_segments[i];
+    //     bool in_overlap = false;
+    //     for (const auto& os : overlapping_snaps) {
+    //       if (os.file_number == s.file_number &&
+    //           os.first_key == s.first_key && os.last_key == s.last_key) {
+    //         in_overlap = true; break;
+    //       }
+    //     }
+    //     fprintf(stderr,
+    //             "[DIAG_PM_RANGE]   snap[%zu] file=%lu [%s - %s] %s\n",
+    //             i, s.file_number,
+    //             FormatKeyDisplay(s.first_key).c_str(),
+    //             FormatKeyDisplay(s.last_key).c_str(),
+    //             in_overlap ? "OVERLAPPING" : "NOT-overlapping");
+    //   }
+    //   // 打印所有 delta 段，标注是否在重叠集合中
+    //   for (size_t i = 0; i < entry_dbg.deltas.size(); ++i) {
+    //     const auto& d = entry_dbg.deltas[i];
+    //     bool in_overlap = false;
+    //     for (const auto& od : overlapping_deltas) {
+    //       if (od.file_number == d.file_number &&
+    //           od.first_key == d.first_key && od.last_key == d.last_key) {
+    //         in_overlap = true; break;
+    //       }
+    //     }
+    //     fprintf(stderr,
+    //             "[DIAG_PM_RANGE]   delta[%zu] file=%lu [%s - %s] %s\n",
+    //             i, d.file_number,
+    //             FormatKeyDisplay(d.first_key).c_str(),
+    //             FormatKeyDisplay(d.last_key).c_str(),
+    //             in_overlap ? "OVERLAPPING" : "NOT-overlapping");
+    //   }
+    // }
+
     // 如果没有重叠数据，使用 FullReplace 逻辑
     if (overlapping_snaps.empty() && overlapping_deltas.empty()) {
       // PartialMerge 任务却找不到任何重叠数据，这是可疑状态，记录下来
@@ -7199,6 +7250,8 @@ void DBImpl::ProcessPendingPartialMerge() {
       new_segment.last_key = task.scan_last_key;
       hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
           task.cuid, new_segment, std::vector<uint64_t>{});
+      // -1 段已建立，处理 pm_pending 中可能积累的跨线程 flush SST
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
       hotspot_manager_->UnlockCuid(task.cuid);
       continue;
     }
@@ -7231,6 +7284,8 @@ void DBImpl::ProcessPendingPartialMerge() {
     }
 
     if (children.empty()) {
+      // 无迭代器（理论上已被前面的 early-exit 拦截），清理 pm_pending 防止 Ref 泄漏
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
       hotspot_manager_->UnlockCuid(task.cuid);
       continue;
     }
@@ -7243,7 +7298,6 @@ void DBImpl::ProcessPendingPartialMerge() {
     std::string last_user_key;
     std::string segment_first_key, segment_last_key;
     size_t written_count = 0;
-    bool trigger_flush = false;
 
     for (merging_iter->SeekToFirst(); merging_iter->Valid();
          merging_iter->Next()) {
@@ -7251,7 +7305,7 @@ void DBImpl::ProcessPendingPartialMerge() {
 
       // 提取 CUID 并进行过滤
       uint64_t current_cuid = hotspot_manager_->ExtractCUID(key);
-      // Key 是按照 CUID 有序排列的，一旦超过目标 CUID 停止扫描
+      // Key 是按照 CUID 有序排列的？一旦超过目标 CUID 停止扫描
       if (current_cuid > task.cuid) {
         break;
       }
@@ -7271,7 +7325,6 @@ void DBImpl::ProcessPendingPartialMerge() {
 
       // 写入 Buffer
       if (hotspot_manager_->BufferHotData(task.cuid, key, value)) {
-        trigger_flush = true;
       }
 
       if (segment_first_key.empty()) {
@@ -7284,12 +7337,6 @@ void DBImpl::ProcessPendingPartialMerge() {
     delete merging_iter;
 
     if (written_count > 0) {
-      // 构造新的 DataSegment
-      DataSegment new_segment;
-      new_segment.file_number = static_cast<uint64_t>(-1);
-      new_segment.first_key = segment_first_key;
-      new_segment.last_key = segment_last_key;
-
       // 收集需要清理的旧文件
       std::vector<uint64_t> obsolete_files;
       for (const auto& seg : overlapping_snaps) {
@@ -7301,11 +7348,32 @@ void DBImpl::ProcessPendingPartialMerge() {
         obsolete_files.push_back(seg.file_number);
       }
 
-      // 这里先处理为 {-1} 的内存 segment 替换，后续再触发 Buffer Flush
-      hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
-          task.cuid, new_segment, obsolete_files);
+      // ① 取出当前 pm_pending SSTs【过程中 flush 的 SST】
+      auto pm_sst_segs = hotspot_manager_->SwapOutPmPending(task.cuid);
 
-      if (trigger_flush) {
+      // ② 查询 buffer 中该 CUID 当前的数据范围
+      std::string buf_min, buf_max;
+      bool has_buf_data = hotspot_manager_->GetBufferBoundaryKeys(
+          task.cuid, &buf_min, &buf_max);
+
+      // ③ 原子替换 snapshot
+      hotspot_manager_->GetIndexTable().AtomicReplaceForPartialMerge(
+          task.cuid,
+          segment_first_key, segment_last_key,
+          pm_sst_segs,
+          has_buf_data, buf_min, buf_max,
+          obsolete_files);
+
+      // ④ -1 段已建立（若 has_buf_data），处理步骤 ①~③ 期间
+      //    积累在 pm_pending[cuid] 的新跨线程 flush SST。
+      //    FinalizePmPendingSnapshots 会通过 PromoteSnapshot 找到 -1 段替换，
+      //    并在最后 erase pm_pending[cuid] entry
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
+
+      // ⑤ 检查 buffer 当前活跃数据量是否真正超过 flush 阈值。
+      //    使用原子读取 total_active_size_，反映此刻实际状态，
+      //    避免 trigger_flush=true 但 buffer 实际已空或低于阈值的误触发。
+      if (hotspot_manager_->BufferExceedsThreshold()) {
         hotspot_manager_->TriggerBufferFlush("PartialMerge", task.cuid);
       }
 
@@ -7313,6 +7381,14 @@ void DBImpl::ProcessPendingPartialMerge() {
                      "[DBImpl] PartialMerge completed for CUID %" PRIu64
                      ": merged %zu entries into HotDataBuffer (SV:%p)",
                      task.cuid, written_count, sv);
+    } else {
+      // written_count==0：归并有overlapping数据却无输出（异常状态）。
+      // 无 -1 段建立，FinalizePmPendingSnapshots 会顷 AppendSnapshotSegment 兜底。
+      fprintf(stderr,
+              "[DIAG][PartialMerge] CUID %lu: written_count=0 after merge "
+              "with overlapping data. This is unexpected.\n",
+              (unsigned long)task.cuid);
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
     }
     hotspot_manager_->UnlockCuid(task.cuid);
   }
@@ -7337,7 +7413,7 @@ void DBImpl::MaybeScheduleDeltaWork() {
     return;
   }
   // 允许多个后台线程并发处理 delta 任务，使用系统的 LOW 优先级线程池
-    int max_delta_threads = 1;
+  int max_delta_threads = 1;
   auto* cfd = versions_->GetColumnFamilySet()->GetDefault();
   if (cfd != nullptr) {
     max_delta_threads = cfd->GetLatestMutableCFOptions().delta_options.max_delta_threads;
@@ -7363,15 +7439,6 @@ void DBImpl::BackgroundDeltaWork() {
   
   if (hotspot_manager_) {
     hotspot_manager_->CompactAndFlushGDCTLogIfNeeded();
-
-    // DIAG: Check queue sizes
-    // static int log_counter = 0;
-    // if (++log_counter % 10 == 0) {
-    //     fprintf(stderr, "[DIAG_BG] Processing BG Work... Pending Tasks: Hot=%d, Metadata=%d, PartialMerge=%d\n",
-    //                     (int)hotspot_manager_->HasPendingInitCuids(),
-    //                     (int)hotspot_manager_->HasPendingMetadataScans(),
-    //                     (int)hotspot_manager_->HasPendingPartialMerge());
-    // }
     
     ProcessPendingHotCuids();
     ProcessPendingMetadataScans();

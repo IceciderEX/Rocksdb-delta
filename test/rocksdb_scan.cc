@@ -137,7 +137,7 @@ class PerfRunner {
     // 单个 CUID 数据量约：128 batch * 500 rows/batch * 72 bytes/row ≈ 4.3945 MB
     // 实现 100GB 常驻数据需 100,000 / 4.3945 ≈ 22,750 个 CUID
     // 设 32 线程，则每线程需维持 22,750 / 32 ≈ 711 个 CUID (活跃 + 待删除)
-    const size_t kMaxActiveCuids = 50;   
+    const size_t kMaxActiveCuids = 50;
     const size_t kDeleteWindowSize = 150; 
 
     auto add_new_cuid = [&]() {
@@ -184,8 +184,8 @@ class PerfRunner {
         DoPut(state.cuid, state.puts_done * kBatchSize, stats);
         state.puts_done++;
       } else {
-        bool full_scan = (dist(gen) < 0.2); // 20% Full Scan (SAC) / 80% Partial Scan
-        DoScan(state.cuid, state.puts_done * kBatchSize, full_scan, read_opts, stats, gen);
+        bool full_scan = false; // Full Scan SAC 机制已移除
+        DoScan(state.cuid, state.puts_done * kBatchSize, full_scan, read_opts, stats, gen, thread_id);
         state.scans_done++;
         // state.last_scan_time = now;
       }
@@ -196,7 +196,7 @@ class PerfRunner {
       // 4. 判断该 CUID 是否终于走完了完整的轮回
       if (state.puts_done >= kTargetPutBatches && state.scans_done >= state.target_scans) {
         int final_rows = state.puts_done * kBatchSize;
-        int final_scan_count = DoScan(state.cuid, final_rows, true, read_opts, stats, gen);
+        int final_scan_count = DoScan(state.cuid, final_rows, true, read_opts, stats, gen, thread_id);
         if (final_scan_count != final_rows) {
           std::cerr << "[ERROR] Thread " << thread_id << " - CUID " << state.cuid 
                     << " final full scan mismatch! Expected: " << final_rows 
@@ -307,47 +307,147 @@ class PerfRunner {
     stats->AddPut(std::chrono::duration<double, std::milli>(end - start).count());
   }
 
-  int DoScan(uint64_t cuid, int cur_rows, bool full_scan, const rocksdb::ReadOptions& ro, ThreadStats* stats, std::default_random_engine& gen) {
+  int DoScan(uint64_t cuid, int cur_rows, bool full_scan, const rocksdb::ReadOptions& ro,
+             ThreadStats* stats, std::default_random_engine& gen, int thread_id) {
     std::string start_key, end_key;
+    int expected_start_row = 0;
+    int expected_count = 0;
+
     if (full_scan) {
       start_key = GenerateKey(cuid, 0);
       end_key = GenerateKey(cuid + 1, 0);
+      expected_start_row = 0;
+      expected_count = cur_rows;
     } else {
       // 随机扫描 10%-50% 的数据范围
       if (cur_rows < 10) {
-          start_key = GenerateKey(cuid, 0);
-          end_key = GenerateKey(cuid, cur_rows);
+        start_key = GenerateKey(cuid, 0);
+        end_key = GenerateKey(cuid, cur_rows);
+        expected_start_row = 0;
+        expected_count = cur_rows;
       } else {
-          int min_len = static_cast<int>(cur_rows * 0.1);
-          int max_len = static_cast<int>(cur_rows * 0.5);
-          std::uniform_int_distribution<int> len_dist(min_len, std::max(min_len + 1, max_len));
-          int scan_len = len_dist(gen);
-          
-          std::uniform_int_distribution<int> start_dist(0, std::max(0, cur_rows - scan_len));
-          int start_row = start_dist(gen);
-          start_key = GenerateKey(cuid, start_row);
-          end_key = GenerateKey(cuid, start_row + scan_len);
+        int min_len = static_cast<int>(cur_rows * 0.1);
+        int max_len = static_cast<int>(cur_rows * 0.5);
+        std::uniform_int_distribution<int> len_dist(min_len, std::max(min_len + 1, max_len));
+        int scan_len = len_dist(gen);
+
+        std::uniform_int_distribution<int> start_dist(0, std::max(0, cur_rows - scan_len));
+        int start_row = start_dist(gen);
+        start_key = GenerateKey(cuid, start_row);
+        end_key = GenerateKey(cuid, start_row + scan_len);
+        expected_start_row = start_row;
+        expected_count = scan_len;
       }
     }
 
     rocksdb::Slice upper_bound(end_key);
     rocksdb::ReadOptions ro_copy = ro;
     ro_copy.iterate_upper_bound = &upper_bound;
-    ro_copy.delta_full_scan = full_scan;
+    ro_copy.delta_full_scan = false;  // 用户扫描不再触发 SAC，仅由后台 Init Scan 负责
 
     auto t_start = std::chrono::high_resolution_clock::now();
     rocksdb::Iterator* it = db_->NewIterator(ro_copy);
     it->Seek(start_key);
 
     int count = 0;
+    int expected_row = expected_start_row;
     while (it->Valid()) {
       if (ExtractCUID(it->key()) != cuid) break;
+
+      // 行 ID 连续性检查
+      std::string key_str = it->key().ToString();
+      int actual_row = std::stoi(key_str.substr(24, 10));
+      if (actual_row != expected_row) {
+        int gap_start_row = expected_row;
+        int gap_end_row   = actual_row;
+        fprintf(stderr,
+                "[SCAN_GAP] Thread %d CUID %lu: expected row %d, got row %d "
+                "(missing %d rows). full_scan=%d expected_range=[%d,%d)\n",
+                thread_id, (unsigned long)cuid,
+                gap_start_row, gap_end_row, gap_end_row - gap_start_row,
+                (int)full_scan, expected_start_row,
+                expected_start_row + expected_count);
+
+        // ── 诊断①：冷路径验证 gap 范围内数据是否存在于 RocksDB ──
+        {
+          std::string cold_start = GenerateKey(cuid, gap_start_row);
+          std::string cold_end   = GenerateKey(cuid, gap_end_row);
+          rocksdb::Slice cold_upper(cold_end);
+          rocksdb::ReadOptions cold_ro_diag;
+          cold_ro_diag.skip_hot_path = true;   // 绕过热路径，走原生 RocksDB
+          cold_ro_diag.delta_full_scan = false;
+          cold_ro_diag.iterate_upper_bound = &cold_upper;
+          rocksdb::Iterator* cold_it = db_->NewIterator(cold_ro_diag);
+          cold_it->Seek(cold_start);
+          int cold_count = 0;
+          while (cold_it->Valid() && ExtractCUID(cold_it->key()) == cuid) {
+            cold_count++;
+            cold_it->Next();
+          }
+          delete cold_it;
+          fprintf(stderr,
+                  "[SCAN_GAP_DIAG] Cold path sees %d/%d rows in gap [%d,%d). "
+                  "→ %s\n",
+                  cold_count, gap_end_row - gap_start_row,
+                  gap_start_row, gap_end_row,
+                  cold_count > 0
+                    ? "Data IN RocksDB but INVISIBLE to hot path (memtable not flushed yet)"
+                    : "Data NOT in RocksDB (write failure or premature delete)");
+        }
+
+        // ── 诊断②：热点索引状态 ──
+        auto hotspot_mgr =
+            static_cast<rocksdb::DBImpl*>(db_)->GetHotspotManager();
+        if (hotspot_mgr) {
+          bool is_hot = hotspot_mgr->IsHot(cuid);
+          rocksdb::HotIndexEntry diag_entry;
+          bool has_entry = hotspot_mgr->GetHotIndexEntry(cuid, &diag_entry);
+          fprintf(stderr,
+                  "[SCAN_GAP_DIAG] CUID %lu is_hot=%d has_index=%d "
+                  "snaps=%zu deltas=%zu\n",
+                  (unsigned long)cuid, (int)is_hot, (int)has_entry,
+                  has_entry ? diag_entry.snapshot_segments.size() : 0,
+                  has_entry ? diag_entry.deltas.size() : 0);
+          if (has_entry) {
+            for (size_t si = 0; si < diag_entry.snapshot_segments.size(); si++) {
+              const auto& seg = diag_entry.snapshot_segments[si];
+              fprintf(stderr,
+                      "[SCAN_GAP_DIAG]   snap[%zu] file=%ld [%s - %s]\n",
+                      si, (int64_t)seg.file_number,
+                      FormatKeyDisplay(rocksdb::Slice(seg.first_key)).c_str(),
+                      FormatKeyDisplay(rocksdb::Slice(seg.last_key)).c_str());
+            }
+            for (size_t di = 0; di < diag_entry.deltas.size(); di++) {
+              const auto& seg = diag_entry.deltas[di];
+              fprintf(stderr,
+                      "[SCAN_GAP_DIAG]   delta[%zu] file=%ld [%s - %s]\n",
+                      di, (int64_t)seg.file_number,
+                      FormatKeyDisplay(rocksdb::Slice(seg.first_key)).c_str(),
+                      FormatKeyDisplay(rocksdb::Slice(seg.last_key)).c_str());
+            }
+          }
+        }
+
+        expected_row = actual_row + 1;  // 重新对齐，继续检查后续行
+      } else {
+        expected_row++;
+      }
       count++;
       it->Next();
     }
     delete it;
     auto t_end = std::chrono::high_resolution_clock::now();
     stats->AddScan(std::chrono::duration<double, std::milli>(t_end - t_start).count(), count);
+
+    // 总行数检查（cur_rows==0 时跳过，刚开始写入时 expected_count 为 0 是正常的）
+    if (expected_count > 0 && count != expected_count) {
+      fprintf(stderr,
+              "[SCAN_COUNT] Thread %d CUID %lu: count mismatch, "
+              "expected %d got %d full_scan=%d range=[%d,%d)\n",
+              thread_id, (unsigned long)cuid, expected_count, count,
+              (int)full_scan, expected_start_row,
+              expected_start_row + expected_count);
+    }
 
     return count;
   }
@@ -416,7 +516,7 @@ int main() {
 
       // --- Example 1: Programmatic Configuration of DeltaOptions ---
       // These can be set directly on the options object before opening the DB.
-      options.delta_options.hotspot_scan_threshold = 50;
+      options.delta_options.hotspot_scan_threshold = 5;
       options.delta_options.hotspot_scan_window_sec = 300;
       options.delta_options.delta_merge_threshold = 6;
       options.delta_options.sac_delta_count_threshold = 12;

@@ -55,7 +55,20 @@ class HotDeltaIterator : public InternalIterator {
 
 class HotSnapshotIterator : public InternalIterator {
  public:
+  // 普通构造函数：内部对 segments 调用 RefSegments
   HotSnapshotIterator(const std::vector<DataSegment>& segments, uint64_t cuid,
+                      HotspotManager* hotspot_manager, TableCache* table_cache,
+                      const ReadOptions& read_options,
+                      const FileOptions& file_options,
+                      const InternalKeyComparator& icmp,
+                      const MutableCFOptions& mutable_cf_options,
+                      std::shared_ptr<HotSstLifecycleManager> lifecycle_manager);
+
+  // 预 Ref 构造函数：调用方已通过 GetEntryAndRefSnapshots 完成 Ref，
+  // 构造函数跳过内部 RefSegments，避免双重计数
+  struct SegmentsPreRefed {};
+  HotSnapshotIterator(SegmentsPreRefed,
+                      const std::vector<DataSegment>& segments, uint64_t cuid,
                       HotspotManager* hotspot_manager, TableCache* table_cache,
                       const ReadOptions& read_options,
                       const FileOptions& file_options,

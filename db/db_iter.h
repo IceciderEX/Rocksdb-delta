@@ -186,13 +186,6 @@ class DBIter final : public Iterator {
       }
     }
 
-    // for delta: 异步补全元数据 (当热路径 Full Scan 结束时入队)
-    // 非后台扫描 (!skip_hot_path) 才允许触发下一次扫描，防止无限递归
-    if (hotspot_manager_ && read_options_.delta_full_scan &&
-        delta_ctx_.is_current_hot && !read_options_.skip_hot_path) {
-      hotspot_manager_->EnqueueMetadataScan(delta_ctx_.last_cuid);
-    }
-
     // for delta: 唤醒后台线程处理待执行的 tasks（condition variable）
     if (cfh_ && hotspot_manager_) {
       auto db_impl = static_cast<DBImpl*>(cfh_->db());

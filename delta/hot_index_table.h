@@ -61,6 +61,10 @@ class HotIndexTable {
 
   bool GetEntry(uint64_t cuid, HotIndexEntry* entry) const;
 
+  // 原子地复制 entry 并在 shared_lock 持有期间 Ref 所有物理 snapshot 段
+  // 调用方负责最终 Unref（析构或 UnrefSegments）
+  bool GetEntryAndRefSnapshots(uint64_t cuid, HotIndexEntry* out_entry) const;
+
   void RemoveCUID(uint64_t cuid);
 
   void UpdateDeltaIndex(uint64_t cuid, const std::vector<uint64_t>& input_files,
@@ -77,6 +81,18 @@ class HotIndexTable {
   // replace涉及的 Snapshot 或 Delta 段
   void ReplaceOverlappingSegments(
       uint64_t cuid, const DataSegment& new_segment,
+      const std::vector<uint64_t>& obsolete_delta_files);
+
+  // PartialMerge 专用的无窗口原子替换方法。
+  // 在单次 shard.mutex unique_lock
+  void AtomicReplaceForPartialMerge(
+      uint64_t cuid,
+      const std::string& pm_range_first,
+      const std::string& pm_range_last,
+      const std::vector<DataSegment>& pm_sst_segs,
+      bool has_buf_data,
+      const std::string& buf_min,
+      const std::string& buf_max,
       const std::vector<uint64_t>& obsolete_delta_files);
 
   // 统计与给定 key 范围重叠的 delta 数量

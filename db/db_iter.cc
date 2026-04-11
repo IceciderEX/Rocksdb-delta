@@ -549,11 +549,6 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
               uint64_t cuid =
                   hotspot_manager_->ExtractCUID(saved_key_.GetUserKey());
               if (cuid != 0) {
-                // [DIAG_KEY] Log buffered key size
-                // if (cuid == 1003 && read_options_.delta_full_scan) {
-                //   fprintf(stderr, "[DIAG_BUFFER] CUID 1003 buffering key size: %zu, UserKey size: %zu\n", 
-                //           iter_.key().size(), saved_key_.GetUserKey().size());
-                // }
                 // 如果 CUID 已被删除，跳过
                 // 缓存 deleted 状态：同一 CUID optimization
                 if (delta_ctx_.cached_deleted_check_cuid != cuid) {
@@ -597,12 +592,6 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                     }
                   }
 
-                  // fullscan 需要进行一次coldpath，更新GDCT
-                  if (read_options_.delta_full_scan &&
-                      delta_ctx_.is_current_hot && delta_ctx_.last_cuid != 0) {
-                    hotspot_manager_->EnqueueMetadataScan(delta_ctx_.last_cuid);
-                  }
-
                   delta_ctx_.last_cuid = cuid;
                   delta_ctx_.visited_units_for_cuid.clear();
                   delta_ctx_.scan_first_key.clear();
@@ -623,27 +612,15 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                   } else if (delta_ctx_.is_current_hot &&
                              read_options_.skip_hot_path &&
                              !read_options_.is_metadata_scan) {
-                    // 冷路径 scan（如 Init Scan）触发 SAC（全量缓冲）
+                    // 冷路径 scan（Init Scan）触发 SAC（全量缓冲）
                     // trylock cuid
                     if (hotspot_manager_->ShouldTriggerScanAsCompaction(cuid)) {
                       if (hotspot_manager_->PrepareForFullReplace(cuid)) {
                         delta_ctx_.trigger_scan_as_compaction = true;
                       }
                     }
-                  } else if (delta_ctx_.is_current_hot &&
-                             !read_options_.skip_hot_path &&
-                             read_options_.delta_full_scan) {
-                    // 用户热路径 Full Scan：同样根据条件触发 SAC
-                    // 条件：已有 snapshot 且 delta 数 >= threshold
-                    // trylock cuid
-                    if (hotspot_manager_->ShouldTriggerScanAsCompaction(cuid)) {
-                      if (hotspot_manager_->PrepareForFullReplace(cuid)) {
-                         delta_ctx_.trigger_scan_as_compaction = true;
-                      }
-                    }
                   } else {
-                    // 小 Scan 或其他情况：不缓冲数据，PartialMerge 依赖
-                    // scan_data
+                    // 小 Scan 或其他情况：不缓冲数据，PartialMerge 依赖 scan_data
                     delta_ctx_.trigger_scan_as_compaction = false;
                   }
                 }
@@ -682,7 +659,7 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                 }
     
                 if (delta_ctx_.trigger_scan_as_compaction) {
-                  // Full Scan / Init Scan: 缓冲数据
+                  // Init Scan: 缓冲数据
                   delta_ctx_.scan_last_key = delta_ctx_.key_encode_buf;
                   bool buffer_full = hotspot_manager_->BufferHotData(
                       cuid, Slice(delta_ctx_.key_encode_buf), value());
@@ -825,12 +802,6 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
             delta_ctx_.GetScanLastKey(), delta_ctx_.visited_units_for_cuid,
             delta_ctx_.scan_data);
       }
-    }
-
-    // 如果是 Full Scan 且允许跳入冷数据，入队更新 GDCT 的 Metadata Scan
-    if (read_options_.delta_full_scan && delta_ctx_.is_current_hot &&
-        !read_options_.skip_hot_path && delta_ctx_.last_cuid != 0) {
-      hotspot_manager_->EnqueueMetadataScan(delta_ctx_.last_cuid);
     }
 
     delta_ctx_.Reset();

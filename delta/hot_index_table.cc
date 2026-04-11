@@ -108,7 +108,18 @@ void HotIndexTable::AppendSnapshotSegment(uint64_t cuid,
   {
     Shard& shard = GetShard(cuid);
     std::unique_lock<std::shared_mutex> lock(shard.mutex);
-    shard.table[cuid].snapshot_segments.push_back(segment);
+    auto& segments = shard.table[cuid].snapshot_segments;
+    // 使用排序插入而非 push_back。
+    // 当 FinalizePmPendingSnapshots 有多个 pm_pending SST 时，
+    // 第一个 SST 消耗了 -1 段（right remnant 被 discarded），后续 SST
+    // 找不到 -1 段而走此路径。若 snapshot 中还有 PM 范围之后的段（Seg-C），
+    // 直接 push_back 会使 SST 排在 Seg-C 之后，造成乱序。
+    auto pos = std::lower_bound(
+        segments.begin(), segments.end(), segment,
+        [this](const DataSegment& a, const DataSegment& b) {
+          return icmp_->Compare(a.first_key, b.first_key) < 0;
+        });
+    segments.insert(pos, segment);
   }
 
   if (lifecycle_manager_) {
@@ -218,23 +229,8 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
     }
   }
 
-  if (DetectSnapshotGap(cuid, next_segments, "PromoteSnapshot")) {
-    // for (size_t j = 0; j < entry.deltas.size(); ++j) {
-    //   fprintf(stderr, " Delta%zu:, Range [%s, %s]\n", j,
-    //           FormatKeyDisplay(entry.deltas[j].first_key).c_str(),
-    //           FormatKeyDisplay(entry.deltas[j].last_key).c_str());
-    // }
-
-    // fprintf(stderr, "[DIAG_POST_PROMOTE] new segment [%s - %s]\n",
-    //         FormatKeyDisplay(new_segment.first_key).c_str(),
-    //         FormatKeyDisplay(new_segment.last_key).c_str());
-    // for (size_t i = 0; i < clipped_mem_segments.size(); ++i) {
-    //   fprintf(stderr, "[DIAG_POST_PROMOTE] Clipped Mem Segment %zu: [%s - %s]\n",
-    //           i, FormatKeyDisplay(clipped_mem_segments[i].first_key).c_str(),
-    //           FormatKeyDisplay(clipped_mem_segments[i].last_key).c_str());
-    // }
-    int idx = 0;
-  }
+  // if (DetectSnapshotGap(cuid, next_segments, "PromoteSnapshot")) {
+  // }
 
   if (found_mem_overlap) {
     std::sort(next_segments.begin(), next_segments.end(),
@@ -245,24 +241,24 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
               });
 
     // GAP 检测：只在出现间隙时打印上下文
-    if (DetectSnapshotGap(cuid, next_segments, "PromoteSnapshot")) {
-      fprintf(stderr, "[DIAG][PromoteSnapshot] CUID %lu: GAP! newSST file=%lu [%s - %s]. Clipped mem segs=%zu\n",
-              cuid, new_segment.file_number,
-              FormatKeyDisplay(new_segment.first_key).c_str(),
-              FormatKeyDisplay(new_segment.last_key).c_str(),
-              clipped_mem_segments.size());
-      for (size_t i = 0; i < clipped_mem_segments.size(); ++i) {
-        fprintf(stderr, "  clipped_mem[%zu] [%s - %s]\n", i,
-                FormatKeyDisplay(clipped_mem_segments[i].first_key).c_str(),
-                FormatKeyDisplay(clipped_mem_segments[i].last_key).c_str());
-      }
-      for (size_t i = 0; i < next_segments.size(); ++i) {
-        fprintf(stderr, "  result[%zu] file=%lu [%s - %s]\n", i,
-                next_segments[i].file_number,
-                FormatKeyDisplay(next_segments[i].first_key).c_str(),
-                FormatKeyDisplay(next_segments[i].last_key).c_str());
-      }
-    }
+    // if (DetectSnapshotGap(cuid, next_segments, "PromoteSnapshot")) {
+    //   fprintf(stderr, "[DIAG][PromoteSnapshot] CUID %lu: GAP! newSST file=%lu [%s - %s]. Clipped mem segs=%zu\n",
+    //           cuid, new_segment.file_number,
+    //           FormatKeyDisplay(new_segment.first_key).c_str(),
+    //           FormatKeyDisplay(new_segment.last_key).c_str(),
+    //           clipped_mem_segments.size());
+    //   for (size_t i = 0; i < clipped_mem_segments.size(); ++i) {
+    //     fprintf(stderr, "  clipped_mem[%zu] [%s - %s]\n", i,
+    //             FormatKeyDisplay(clipped_mem_segments[i].first_key).c_str(),
+    //             FormatKeyDisplay(clipped_mem_segments[i].last_key).c_str());
+    //   }
+    //   for (size_t i = 0; i < next_segments.size(); ++i) {
+    //     fprintf(stderr, "  result[%zu] file=%lu [%s - %s]\n", i,
+    //             next_segments[i].file_number,
+    //             FormatKeyDisplay(next_segments[i].first_key).c_str(),
+    //             FormatKeyDisplay(next_segments[i].last_key).c_str());
+    //   }
+    // }
 
     entry.snapshot_segments = std::move(next_segments);
 
@@ -308,6 +304,28 @@ bool HotIndexTable::GetEntry(uint64_t cuid, HotIndexEntry* entry) const {
     return true;
   }
   return false;
+}
+
+bool HotIndexTable::GetEntryAndRefSnapshots(uint64_t cuid,
+                                            HotIndexEntry* out_entry) const {
+  const Shard& shard = GetShard(cuid);
+  std::shared_lock<std::shared_mutex> lock(shard.mutex);
+  auto it = shard.table.find(cuid);
+  if (it == shard.table.end()) return false;
+  if (out_entry) {
+    *out_entry = it->second;
+    // 在 shared_lock 持有期间 Ref 所有物理段：
+    // 此时写路径的 unique_lock 无法同时持有，保证 Ref 发生在任何
+    // AtomicReplaceForPartialMerge 的锁外 Unref 之前。
+    if (lifecycle_manager_) {
+      for (const auto& seg : out_entry->snapshot_segments) {
+        if (seg.file_number != static_cast<uint64_t>(-1)) {
+          lifecycle_manager_->Ref(seg.file_number);
+        }
+      }
+    }
+  }
+  return true;
 }
 
 void HotIndexTable::MarkDeltasAsObsolete(
@@ -665,6 +683,209 @@ void HotIndexTable::ReplaceOverlappingSegments(
     if (new_segment.file_number != static_cast<uint64_t>(-1)) {
       lifecycle_manager_->Ref(new_segment.file_number);
     }
+    for (const auto& seg : segments_to_unref) {
+      lifecycle_manager_->Unref(seg.file_number);
+    }
+  }
+}
+
+void HotIndexTable::AtomicReplaceForPartialMerge(
+    uint64_t cuid,
+    const std::string& pm_range_first,
+    const std::string& pm_range_last,
+    const std::vector<DataSegment>& pm_sst_segs,
+    bool has_buf_data,
+    const std::string& buf_min,
+    const std::string& buf_max,
+    const std::vector<uint64_t>& obsolete_delta_files) {
+  // 在 shard lock 外收集待 Unref 的旧段（避免锁内调用 lifecycle_manager_→死锁风险）
+  std::vector<DataSegment> segments_to_unref;
+
+  {
+    Shard& shard = GetShard(cuid);
+    std::unique_lock<std::shared_mutex> lock(shard.mutex);
+    auto& entry = shard.table[cuid];
+    auto& snapshots = entry.snapshot_segments;
+
+    std::string pm_start_user = ExtractUserKey(pm_range_first).ToString();
+    std::string pm_end_user   = ExtractUserKey(pm_range_last).ToString();
+
+    std::vector<DataSegment> next_segments;
+
+    // ① 裁剪与 PM 输出范围重叠的旧 snapshot 段（逻辑与 ReplaceOverlappingSegments 相同）
+    for (const auto& seg : snapshots) {
+      std::string seg_start = ExtractUserKey(seg.first_key).ToString();
+      std::string seg_end   = ExtractUserKey(seg.last_key).ToString();
+
+      bool is_left  = (icmp_->user_comparator()->Compare(seg_end,   pm_start_user) < 0);
+      bool is_right = (icmp_->user_comparator()->Compare(seg_start, pm_end_user)   > 0);
+
+      if (!is_left && !is_right) {
+        // 与 PM 范围重叠：保留不重叠的边缘部分
+        // 1. 左侧剩余
+        if (icmp_->user_comparator()->Compare(seg_start, pm_start_user) < 0) {
+          DataSegment left = seg;
+          left.last_key = pm_range_first;
+          next_segments.push_back(left);
+          // 左残余与原始段共享文件，额外 Ref
+          if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+            lifecycle_manager_->Ref(seg.file_number);
+          }
+        }
+        // 2. 右侧剩余
+        if (icmp_->user_comparator()->Compare(seg_end, pm_end_user) > 0) {
+          DataSegment right = seg;
+          right.first_key = pm_range_last;
+          next_segments.push_back(right);
+          if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+            lifecycle_manager_->Ref(seg.file_number);
+          }
+        }
+        // 原始段收集待 Unref（物理段需要减少 snapshot Ref）
+        if (seg.file_number != static_cast<uint64_t>(-1)) {
+          segments_to_unref.push_back(seg);
+        }
+      } else {
+        // 不重叠：原样保留
+        next_segments.push_back(seg);
+      }
+    }
+
+    // ② 插入 pm_sst_segs（pm_pending Ref 就地转移为 snapshot Ref，不额外 Ref）
+    // 同时移除 next_segments 中被 pm_sst_seg 覆盖的旧 -1 段：
+    // -1 段的 buffer 数据已被 flush 生成了此 SST，-1 段需被 SST 替代，否则
+    // 读者访问旧 -1 段时 buffer 已无数据，造成 kSnapshotChanged
+    for (const auto& sst_seg : pm_sst_segs) {
+      // pm_sst_seg 来自 buffer flush，其实际 first/last_key 可能超出 pm_range
+      // （buffer 中可能含有来自普通写入的、pm_range 范围之外的 CUID 数据）。
+      // 必须将其 clip 到 pm_range，防止与 step① 保留的 pm_range 之外的物理段重叠。
+      // 逻辑与 PromoteSnapshot 将 SST clip 到 -1 段边界完全对称。
+      DataSegment clipped_seg = sst_seg;
+      if (icmp_->user_comparator()->Compare(
+              ExtractUserKey(clipped_seg.first_key), pm_start_user) < 0) {
+        clipped_seg.first_key = pm_range_first;
+      }
+      if (icmp_->user_comparator()->Compare(
+              ExtractUserKey(clipped_seg.last_key), pm_end_user) > 0) {
+        clipped_seg.last_key = pm_range_last;
+      }
+
+      // Clip 后若范围变为空（SST 完全位于 pm_range 之外），释放 Ref 并跳过
+      if (icmp_->user_comparator()->Compare(
+              ExtractUserKey(clipped_seg.first_key),
+              ExtractUserKey(clipped_seg.last_key)) > 0) {
+        if (lifecycle_manager_) {
+          lifecycle_manager_->Unref(sst_seg.file_number);
+        }
+        continue;
+      }
+
+      std::string sst_start = ExtractUserKey(clipped_seg.first_key).ToString();
+      std::string sst_end   = ExtractUserKey(clipped_seg.last_key).ToString();
+
+      std::vector<DataSegment> after_promote;
+      for (const auto& seg : next_segments) {
+        if (seg.file_number != static_cast<uint64_t>(-1)) {
+          // 物理段不受影响，原样保留
+          after_promote.push_back(seg);
+          continue;
+        }
+        // -1 段：检查是否与 sst_seg 重叠
+        std::string seg_start = ExtractUserKey(seg.first_key).ToString();
+        std::string seg_end   = ExtractUserKey(seg.last_key).ToString();
+        bool is_left  = icmp_->user_comparator()->Compare(seg_end,   sst_start) < 0;
+        bool is_right = icmp_->user_comparator()->Compare(seg_start, sst_end)   > 0;
+        if (is_left || is_right) {
+          // 不重叠，保留
+          after_promote.push_back(seg);
+        } else {
+          // 重叠：-1 段被 SST 替代，保留左/右残余（-1 段无需 Unref，file_number=-1）
+          if (icmp_->user_comparator()->Compare(seg_start, sst_start) < 0) {
+            DataSegment left = seg;
+            left.last_key = clipped_seg.first_key;
+            after_promote.push_back(left);
+          }
+          if (icmp_->user_comparator()->Compare(seg_end, sst_end) > 0) {
+            DataSegment right = seg;
+            right.first_key = clipped_seg.last_key;
+            after_promote.push_back(right);
+          }
+          // 中间 -1 段（被 SST 完全替代）直接丢弃，无 Ref/Unref 操作
+        }
+      }
+      next_segments = std::move(after_promote);
+      next_segments.push_back(clipped_seg);
+    }
+
+    // ③ 若 buffer 有剩余数据，插入 -1 段覆盖实际 buffer 范围
+    if (has_buf_data) {
+      DataSegment buf_seg;
+      buf_seg.file_number = static_cast<uint64_t>(-1);
+      buf_seg.first_key   = buf_min;
+      buf_seg.last_key    = buf_max;
+      next_segments.push_back(buf_seg);
+    }
+
+    // ④ 排序
+    std::sort(next_segments.begin(), next_segments.end(),
+              [this](const DataSegment& a, const DataSegment& b) {
+                int cmp = icmp_->Compare(a.first_key, b.first_key);
+                if (cmp != 0) return cmp < 0;
+                return icmp_->Compare(a.last_key, b.last_key) < 0;
+              });
+
+    // ④ 合并相邻 -1 段（排序后相邻 -1 直接合并）
+    std::vector<DataSegment> merged;
+    for (auto& s : next_segments) {
+      if (!merged.empty() &&
+          merged.back().file_number == static_cast<uint64_t>(-1) &&
+          s.file_number == static_cast<uint64_t>(-1)) {
+        if (icmp_->Compare(s.last_key, merged.back().last_key) > 0) {
+          merged.back().last_key = s.last_key;
+        }
+      } else {
+        merged.push_back(std::move(s));
+      }
+    }
+    next_segments = std::move(merged);
+
+    // GAP 诊断
+    if (DetectSnapshotGap(cuid, next_segments, "AtomicReplaceForPartialMerge")) {
+      fprintf(stderr,
+              "[DIAG][AtomicReplace] CUID %lu: GAP! pm_range=[%s - %s] "
+              "has_buf=%d pm_ssts=%zu\n",
+              cuid,
+              FormatKeyDisplay(pm_range_first).c_str(),
+              FormatKeyDisplay(pm_range_last).c_str(),
+              (int)has_buf_data, pm_sst_segs.size());
+      for (size_t i = 0; i < next_segments.size(); ++i) {
+        fprintf(stderr, "  result[%zu] file=%lu [%s - %s]\n", i,
+                next_segments[i].file_number,
+                FormatKeyDisplay(next_segments[i].first_key).c_str(),
+                FormatKeyDisplay(next_segments[i].last_key).c_str());
+      }
+    }
+
+    snapshots = std::move(next_segments);
+
+    // ⑤ 处理 obsolete_delta_files
+    if (!obsolete_delta_files.empty()) {
+      auto& deltas = entry.deltas;
+      for (uint64_t file_num : obsolete_delta_files) {
+        for (auto it = deltas.begin(); it != deltas.end();) {
+          if (it->file_number == file_num) {
+            entry.obsolete_deltas.push_back(*it);
+            it = deltas.erase(it);
+          } else {
+            ++it;
+          }
+        }
+      }
+    }
+  }  // shard.mutex 
+
+  // ⑥ 锁外释放旧段持有的 snapshot Ref（不影响新 snapshot 的可见性）
+  if (lifecycle_manager_) {
     for (const auto& seg : segments_to_unref) {
       lifecycle_manager_->Unref(seg.file_number);
     }
