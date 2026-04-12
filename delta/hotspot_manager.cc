@@ -556,6 +556,9 @@ void HotspotManager::TriggerBufferFlush(const char* source,
         uint64_t cuid = kv.first;
         const DataSegment& real_segment = kv.second;
 
+        // 注意，这里必须要先调用 PromoteSnapshot
+        // 否则之前的 scan 结果 -1 segment 不能正确地被替换
+
         // 【1】PartialMerge
         // -1 段尚未建立，将 SST 存入 pm_pending 并 Ref，跳过 PromoteSnapshot
         // 在 FinalizePmPendingSnapshots 统一通过 PromoteSnapshot 更新

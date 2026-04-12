@@ -142,6 +142,7 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
 
   bool found_mem_overlap = false;   // 是否找到了可替换的 -1 内存段
   bool found_phys_overlap = false;  // 是否有物理段与新 SST 重叠
+  int replacement_count = 0;        // 记录替换物理段数量，用于正确 Ref
   std::vector<DataSegment> next_segments;
   std::vector<DataSegment> clipped_mem_segments; // 记录被裁减的 mem 段
 
@@ -213,6 +214,7 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
         replacement.last_key = seg.last_key;
       }
       next_segments.push_back(replacement);
+      replacement_count++;
 
       if (false) {
         fprintf(
@@ -263,7 +265,11 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
     entry.snapshot_segments = std::move(next_segments);
 
     if (lifecycle_manager_) {
-      lifecycle_manager_->Ref(new_segment.file_number);
+      // [FIX] 移除 -1 段合并后，可能有多个 -1 段同时被一个 SST 覆盖，
+      // 每个 replacement 都持有同一个 file_number，需要 Ref 相应次数。
+      for (int i = 0; i < replacement_count; i++) {
+        lifecycle_manager_->Ref(new_segment.file_number);
+      }
     }
   } else if (found_phys_overlap) {
     // 新 SST 与物理段重叠但未被加入 snapshot：记录以便排查数据丢失
@@ -758,15 +764,150 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
       }
     }
 
-    // ② 插入 pm_sst_segs（pm_pending Ref 就地转移为 snapshot Ref，不额外 Ref）
-    // 同时移除 next_segments 中被 pm_sst_seg 覆盖的旧 -1 段：
-    // -1 段的 buffer 数据已被 flush 生成了此 SST，-1 段需被 SST 替代，否则
-    // 读者访问旧 -1 段时 buffer 已无数据，造成 kSnapshotChanged
+    // ②-prep: 若 buffer 有剩余数据，先将 buf_seg (-1) 插入 next_segments。
+    // 后续步骤②会将 pm_sst_segs 的物理 SST 与此 -1 段进行裁剪，自动消除重叠。
+    // [FIX] 之前 buf_seg 在步骤②之后插入，导致它与已插入的 pm_sst_segs 物理段重叠，
+    //       后续 PromoteSnapshot 无法消除这种重叠，最终产生 Regression。
+    if (has_buf_data) {
+      DataSegment buf_seg;
+      buf_seg.file_number = static_cast<uint64_t>(-1);
+      buf_seg.first_key   = buf_min;
+      buf_seg.last_key    = buf_max;
+      
+      // 裁剪到 pm_range 内
+      if (icmp_->user_comparator()->Compare(ExtractUserKey(buf_seg.first_key), pm_start_user) < 0) {
+        buf_seg.first_key = pm_range_first;
+      }
+      if (icmp_->user_comparator()->Compare(ExtractUserKey(buf_seg.last_key), pm_end_user) > 0) {
+        buf_seg.last_key = pm_range_last;
+      }
+
+      if (icmp_->user_comparator()->Compare(ExtractUserKey(buf_seg.first_key), 
+                                            ExtractUserKey(buf_seg.last_key)) <= 0) {
+        fprintf(stderr, "[DIAG][AtomicReplace] CUID %lu: Pre-inserting Buffer Segment (File -1) [%s - %s] (will be split by pm_sst_segs)\n",
+                cuid, FormatKeyDisplay(buf_seg.first_key).c_str(), FormatKeyDisplay(buf_seg.last_key).c_str());
+        next_segments.push_back(buf_seg);
+      }
+    }
+
+    // ② 处理 pm_sst_segs（pm_pending 期间 flush 产生的 SST）
+    // pm_sst_seg 可能同时包含：
+    //   (a) pm_range 范围外的旧 -1 段数据（InitScan 或上次 PM 的尾部）
+    //   (b) pm_range 范围内的本次 PM 输出数据（中途 flush 的部分）
+    // 两种数据需要不同处理方式：
+    //   (a) → 像 PromoteSnapshot 一样 clip 到 -1 段边界，替换旧 -1 段
+    //   (b) → clip 到 pm_range，填充 buf_seg 左侧空隙
+    //
+    // [FIX] 之前只有 (b)（pm_range clip），导致 (a) 部分被 Unref 丢弃，
+    //       旧 -1 段指向的 buffer 数据已被 PopFrontBlock 移走 → 数据丢失。
+
+    // 收集 pm_sst 的 file_number，用于 ②-b 区分「原始物理段」和「本轮 pm_sst 插入的物理段」
+    // 后者可以被后续 pm_sst_seg 裁剪，前者不可修改。
+    // 处理场景：多次 flush 产生重叠的 pm_sst_segs（例如 [0,4000] 和 [2400,6000]）
+    std::unordered_set<uint64_t> pm_sst_file_numbers;
+    for (const auto& sst : pm_sst_segs) {
+      pm_sst_file_numbers.insert(sst.file_number);
+    }
+
     for (const auto& sst_seg : pm_sst_segs) {
-      // pm_sst_seg 来自 buffer flush，其实际 first/last_key 可能超出 pm_range
-      // （buffer 中可能含有来自普通写入的、pm_range 范围之外的 CUID 数据）。
-      // 必须将其 clip 到 pm_range，防止与 step① 保留的 pm_range 之外的物理段重叠。
-      // 逻辑与 PromoteSnapshot 将 SST clip 到 -1 段边界完全对称。
+      std::string sst_start_user = ExtractUserKey(sst_seg.first_key).ToString();
+      std::string sst_end_user   = ExtractUserKey(sst_seg.last_key).ToString();
+
+      bool extends_left  = icmp_->user_comparator()->Compare(sst_start_user, pm_start_user) < 0;
+      bool extends_right = icmp_->user_comparator()->Compare(sst_end_user,   pm_end_user)   > 0;
+
+      // ②-a: 处理超出 pm_range 的部分（PromoteSnapshot 逻辑）
+      // 将超出部分 clip 到每个重叠 -1 段的边界，精确替换旧 -1 段。
+      // 物理段不受影响。每个 replacement 都需要额外 Ref。
+      auto promote_out_of_range = [&](const DataSegment& portion) {
+        std::string por_start = ExtractUserKey(portion.first_key).ToString();
+        std::string por_end   = ExtractUserKey(portion.last_key).ToString();
+
+        std::vector<DataSegment> after;
+        for (const auto& seg : next_segments) {
+          // 原始物理段（非 -1 且非 pm_sst 来源）：不可修改
+          bool is_original_phys = (seg.file_number != static_cast<uint64_t>(-1) &&
+                                   pm_sst_file_numbers.find(seg.file_number) == pm_sst_file_numbers.end());
+          if (is_original_phys) {
+            after.push_back(seg);
+            continue;
+          }
+          std::string seg_s = ExtractUserKey(seg.first_key).ToString();
+          std::string seg_e = ExtractUserKey(seg.last_key).ToString();
+          bool il = icmp_->user_comparator()->Compare(seg_e, por_start) < 0;
+          bool ir = icmp_->user_comparator()->Compare(seg_s, por_end)   > 0;
+          if (il || ir) {
+            after.push_back(seg);
+          } else {
+            // 重叠：用 SST 替换，保留左/右残余
+            if (icmp_->user_comparator()->Compare(seg_s, por_start) < 0) {
+              DataSegment left = seg;
+              left.last_key = portion.first_key;
+              after.push_back(left);
+              if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+                lifecycle_manager_->Ref(seg.file_number);
+              }
+            }
+            if (icmp_->user_comparator()->Compare(seg_e, por_end) > 0) {
+              DataSegment right = seg;
+              right.first_key = portion.last_key;
+              after.push_back(right);
+              if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+                lifecycle_manager_->Ref(seg.file_number);
+              }
+            }
+            // 被替换的 pm_sst 物理段需要 Unref
+            if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+              lifecycle_manager_->Unref(seg.file_number);
+            }
+            // 创建 replacement：clip SST 到段的边界
+            DataSegment rep = portion;
+            if (icmp_->user_comparator()->Compare(seg_s, por_start) > 0) {
+              rep.first_key = seg.first_key;
+            }
+            if (icmp_->user_comparator()->Compare(seg_e, por_end) < 0) {
+              rep.last_key = seg.last_key;
+            }
+            after.push_back(rep);
+            // 每个 replacement 需要 1 个 Ref（pm_pending 的 Ref 留给 ②-b 使用）
+            if (lifecycle_manager_) {
+              lifecycle_manager_->Ref(sst_seg.file_number);
+            }
+            fprintf(stderr, "[DIAG][AtomicReplace] CUID %lu: ②-a Out-of-range SST file=%lu "
+                    "replaced seg [%s - %s] → SST clipped [%s - %s]\n",
+                    cuid, sst_seg.file_number,
+                    FormatKeyDisplay(seg.first_key).c_str(),
+                    FormatKeyDisplay(seg.last_key).c_str(),
+                    FormatKeyDisplay(rep.first_key).c_str(),
+                    FormatKeyDisplay(rep.last_key).c_str());
+          }
+
+        }
+        next_segments = std::move(after);
+      };
+
+      if (extends_left) {
+        DataSegment left_portion = sst_seg;
+        left_portion.last_key = pm_range_first;
+        // 确认范围有效
+        if (icmp_->user_comparator()->Compare(
+                ExtractUserKey(left_portion.first_key),
+                ExtractUserKey(left_portion.last_key)) <= 0) {
+          promote_out_of_range(left_portion);
+        }
+      }
+      if (extends_right) {
+        DataSegment right_portion = sst_seg;
+        right_portion.first_key = pm_range_last;
+        if (icmp_->user_comparator()->Compare(
+                ExtractUserKey(right_portion.first_key),
+                ExtractUserKey(right_portion.last_key)) <= 0) {
+          promote_out_of_range(right_portion);
+        }
+      }
+
+      // ②-b: 处理 pm_range 内的部分（原有逻辑）
+      // clip 到 pm_range，替换 pm_range 内的 -1 段（buf_seg 及 step① 残余）
       DataSegment clipped_seg = sst_seg;
       if (icmp_->user_comparator()->Compare(
               ExtractUserKey(clipped_seg.first_key), pm_start_user) < 0) {
@@ -777,7 +918,7 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
         clipped_seg.last_key = pm_range_last;
       }
 
-      // Clip 后若范围变为空（SST 完全位于 pm_range 之外），释放 Ref 并跳过
+      // Clip 后若范围变为空（SST 完全位于 pm_range 之外），释放 pm_pending Ref 并跳过
       if (icmp_->user_comparator()->Compare(
               ExtractUserKey(clipped_seg.first_key),
               ExtractUserKey(clipped_seg.last_key)) > 0) {
@@ -787,52 +928,58 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
         continue;
       }
 
+      fprintf(stderr, "[DIAG][AtomicReplace] CUID %lu: ②-b In-range pm_sst_seg file=%lu [%s - %s]\n",
+              cuid, clipped_seg.file_number,
+              FormatKeyDisplay(clipped_seg.first_key).c_str(),
+              FormatKeyDisplay(clipped_seg.last_key).c_str());
+
       std::string sst_start = ExtractUserKey(clipped_seg.first_key).ToString();
       std::string sst_end   = ExtractUserKey(clipped_seg.last_key).ToString();
 
       std::vector<DataSegment> after_promote;
       for (const auto& seg : next_segments) {
-        if (seg.file_number != static_cast<uint64_t>(-1)) {
-          // 物理段不受影响，原样保留
+        // 原始 snapshot 物理段（非 -1 且非 pm_sst 来源）：不可修改
+        bool is_original_phys = (seg.file_number != static_cast<uint64_t>(-1) &&
+                                 pm_sst_file_numbers.find(seg.file_number) == pm_sst_file_numbers.end());
+        if (is_original_phys) {
           after_promote.push_back(seg);
           continue;
         }
-        // -1 段：检查是否与 sst_seg 重叠
+        // -1 段 或 本轮 pm_sst 插入的物理段：可被后续 pm_sst_seg 裁剪
         std::string seg_start = ExtractUserKey(seg.first_key).ToString();
         std::string seg_end   = ExtractUserKey(seg.last_key).ToString();
         bool is_left  = icmp_->user_comparator()->Compare(seg_end,   sst_start) < 0;
         bool is_right = icmp_->user_comparator()->Compare(seg_start, sst_end)   > 0;
         if (is_left || is_right) {
-          // 不重叠，保留
           after_promote.push_back(seg);
         } else {
-          // 重叠：-1 段被 SST 替代，保留左/右残余（-1 段无需 Unref，file_number=-1）
+          // 重叠：裁剪，保留左/右残余
           if (icmp_->user_comparator()->Compare(seg_start, sst_start) < 0) {
             DataSegment left = seg;
             left.last_key = clipped_seg.first_key;
             after_promote.push_back(left);
+            // pm_sst 物理段被裁剪：残余保留原 Ref，新 clip 区域需额外 Ref
+            if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+              lifecycle_manager_->Ref(seg.file_number);
+            }
           }
           if (icmp_->user_comparator()->Compare(seg_end, sst_end) > 0) {
             DataSegment right = seg;
             right.first_key = clipped_seg.last_key;
             after_promote.push_back(right);
+            if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+              lifecycle_manager_->Ref(seg.file_number);
+            }
           }
-          // 中间 -1 段（被 SST 完全替代）直接丢弃，无 Ref/Unref 操作
+          // 被替换的 pm_sst 物理段需要 Unref
+          if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+            lifecycle_manager_->Unref(seg.file_number);
+          }
         }
       }
       next_segments = std::move(after_promote);
+      // pm_pending 的 1 个 Ref 转移为 snapshot Ref（不额外 Ref）
       next_segments.push_back(clipped_seg);
-    }
-
-    // ③ 若 buffer 有剩余数据，插入 -1 段覆盖实际 buffer 范围
-    if (has_buf_data) {
-      DataSegment buf_seg;
-      buf_seg.file_number = static_cast<uint64_t>(-1);
-      buf_seg.first_key   = buf_min;
-      buf_seg.last_key    = buf_max;
-      fprintf(stderr, "[DIAG][AtomicReplace] CUID %lu: Adding Buffer Segment (File -1) [%s - %s]\n",
-              cuid, FormatKeyDisplay(buf_seg.first_key).c_str(), FormatKeyDisplay(buf_seg.last_key).c_str());
-      next_segments.push_back(buf_seg);
     }
 
     // ④ 排序
@@ -843,20 +990,10 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
                 return icmp_->Compare(a.last_key, b.last_key) < 0;
               });
 
-    // ④ 合并相邻 -1 段（排序后相邻 -1 直接合并）
-    std::vector<DataSegment> merged;
-    for (auto& s : next_segments) {
-      if (!merged.empty() &&
-          merged.back().file_number == static_cast<uint64_t>(-1) &&
-          s.file_number == static_cast<uint64_t>(-1)) {
-        if (icmp_->Compare(s.last_key, merged.back().last_key) > 0) {
-          merged.back().last_key = s.last_key;
-        }
-      } else {
-        merged.push_back(std::move(s));
-      }
-    }
-    next_segments = std::move(merged);
+
+    // [FIX] 不再合并相邻 -1 段。步骤 ②-a 已正确处理了旧 -1 段的替换，
+    // 不同来源的 -1 段保持独立，可确保每个被其对应的 flush SST 精确替换。
+
 
     // GAP 诊断
     if (DetectSnapshotGap(cuid, next_segments, "AtomicReplaceForPartialMerge")) {

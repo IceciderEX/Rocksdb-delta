@@ -7,6 +7,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <filesystem>
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
@@ -307,7 +308,20 @@ void ManagerThread(DBImpl* db_impl) {
   }
 }
 
+bool CleanupDBPath(const std::string& path) {
+  std::error_code ec;
+  if (path != kDBPath) {
+    std::cerr << "Refusing to delete non-test path: " << path << std::endl;
+    return false;
+  }
+  std::filesystem::remove_all(path, ec);
+  return true;
+}
+
 int main() {
+  const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_tmp";
+  CleanupDBPath(kDBPath);  
+
   Options options;
   options.create_if_missing = true;
   options.enable_delta = true;
@@ -335,7 +349,7 @@ int main() {
   options.num_levels = 1;
   options.level0_file_num_compaction_trigger = 20;
   options.level_compaction_dynamic_level_bytes = false;
-  DestroyDB(kDBPath, options);
+  // DestroyDB(kDBPath, options);
 
   DB* db = nullptr;
   Status s = DB::Open(options, kDBPath, &db);

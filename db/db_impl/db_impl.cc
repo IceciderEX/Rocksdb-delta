@@ -7337,10 +7337,38 @@ void DBImpl::ProcessPendingPartialMerge() {
 
       if (segment_first_key.empty()) {
         segment_first_key = key.ToString();
+      } else {
+        // 检测相邻 key 之间的异常巨大跨度（证明产生的 segment 是虚胖的，内部有空洞）
+        // 这里只是简单用 user_key 比较？提取 sequence 比较复杂，我们可以用 string 比较。
+        // 不过我们也可以记录是否有段并未覆盖该范围。
+        // （直接打印出来即可，如果出现跳变我们可以看到）
       }
+      
+      // 如果这不是第一个 key，并且与前一个 key 跨度很大？
+      // 因为 key 包含 sequence，不好直接算数字差。但我们可以记录首尾或者每隔 10000 条打印一次进度，
+      // 包含当前的 key，以便确认扫描在什么阶段跳跃了。
+      if (written_count == 0) {
+        fprintf(stderr, "[DIAG_PM_MERGE] CUID %lu: First merged key: %s\n", (unsigned long)task.cuid, FormatKeyDisplay(key.ToString()).c_str());
+      } else if (!last_user_key.empty()) {
+          // 这里可以尝试简单的比较或者为了不发大洪水，只打头尾？
+      }
+
       segment_last_key = key.ToString();
       written_count++;
+      
+      if (written_count == 1 || written_count % 100000 == 0) {
+         fprintf(stderr, "[DIAG_PM_MERGE] CUID %lu: Merging... count=%zu current_key=%s\n", 
+                 (unsigned long)task.cuid, written_count, FormatKeyDisplay(key.ToString()).c_str());
+      }
     }
+
+    if (written_count > 0) {
+      fprintf(stderr, "[DIAG_PM_MERGE] CUID %lu: Merge finished. Count=%zu. First=%s, Last=%s\n",
+              (unsigned long)task.cuid, written_count, 
+              FormatKeyDisplay(segment_first_key).c_str(),
+              FormatKeyDisplay(segment_last_key).c_str());
+    }
+
 
     delete merging_iter;
 
@@ -7377,6 +7405,64 @@ void DBImpl::ProcessPendingPartialMerge() {
       std::string buf_min, buf_max;
       bool has_buf_data = hotspot_manager_->GetBufferBoundaryKeys(
           task.cuid, &buf_min, &buf_max);
+
+      // [DIAG_PM_REPLACE] 打印 AtomicReplace 的所有输入，确认 pm_range 是否虚胖
+      {
+        fprintf(stderr,
+                "[DIAG_PM_REPLACE] CUID %lu: segment_range=[%s - %s] "
+                "has_buf=%d buf=[%s - %s] pm_ssts=%zu\n",
+                (unsigned long)task.cuid,
+                FormatKeyDisplay(segment_first_key).c_str(),
+                FormatKeyDisplay(segment_last_key).c_str(),
+                (int)has_buf_data,
+                has_buf_data ? FormatKeyDisplay(buf_min).c_str() : "N/A",
+                has_buf_data ? FormatKeyDisplay(buf_max).c_str() : "N/A",
+                pm_sst_segs.size());
+        // 打印 overlapping_snaps（PM 实际读取的 snapshot 段）
+        for (size_t i = 0; i < overlapping_snaps.size(); ++i) {
+          fprintf(stderr,
+                  "[DIAG_PM_REPLACE]   overlap_snap[%zu] file=%lu [%s - %s]\n",
+                  i, overlapping_snaps[i].file_number,
+                  FormatKeyDisplay(overlapping_snaps[i].first_key).c_str(),
+                  FormatKeyDisplay(overlapping_snaps[i].last_key).c_str());
+        }
+        // 打印 overlapping_deltas（PM 实际读取的 delta 段）
+        for (size_t i = 0; i < overlapping_deltas.size(); ++i) {
+          fprintf(stderr,
+                  "[DIAG_PM_REPLACE]   overlap_delta[%zu] file=%lu [%s - %s]\n",
+                  i, overlapping_deltas[i].file_number,
+                  FormatKeyDisplay(overlapping_deltas[i].first_key).c_str(),
+                  FormatKeyDisplay(overlapping_deltas[i].last_key).c_str());
+        }
+        // 检测 pm_range 是否超出 overlapping 段的 union
+        // overlap_union = min(overlap_snaps.first, overlap_deltas.first) .. max(...)
+        std::string overlap_min, overlap_max;
+        for (const auto& s : overlapping_snaps) {
+          std::string fk = ExtractUserKey(s.first_key).ToString();
+          std::string lk = ExtractUserKey(s.last_key).ToString();
+          if (overlap_min.empty() || icmp.user_comparator()->Compare(fk, overlap_min) < 0) overlap_min = fk;
+          if (overlap_max.empty() || icmp.user_comparator()->Compare(lk, overlap_max) > 0) overlap_max = lk;
+        }
+        for (const auto& d : overlapping_deltas) {
+          std::string fk = ExtractUserKey(d.first_key).ToString();
+          std::string lk = ExtractUserKey(d.last_key).ToString();
+          if (overlap_min.empty() || icmp.user_comparator()->Compare(fk, overlap_min) < 0) overlap_min = fk;
+          if (overlap_max.empty() || icmp.user_comparator()->Compare(lk, overlap_max) > 0) overlap_max = lk;
+        }
+        std::string seg_first_user = ExtractUserKey(segment_first_key).ToString();
+        std::string seg_last_user = ExtractUserKey(segment_last_key).ToString();
+        bool pm_extends_before = !overlap_min.empty() && icmp.user_comparator()->Compare(seg_first_user, overlap_min) < 0;
+        bool pm_extends_after  = !overlap_max.empty() && icmp.user_comparator()->Compare(seg_last_user, overlap_max) > 0;
+        if (pm_extends_before || pm_extends_after) {
+          fprintf(stderr,
+                  "[DIAG_PM_REPLACE] *** BLOATED pm_range! segment=[%s - %s] "
+                  "overlap_union=[%s - %s] extends_before=%d extends_after=%d\n",
+                  FormatKeyDisplay(segment_first_key).c_str(),
+                  FormatKeyDisplay(segment_last_key).c_str(),
+                  overlap_min.c_str(), overlap_max.c_str(),
+                  (int)pm_extends_before, (int)pm_extends_after);
+        }
+      }
 
       // ③ 原子替换 snapshot
       hotspot_manager_->GetIndexTable().AtomicReplaceForPartialMerge(

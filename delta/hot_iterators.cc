@@ -335,9 +335,27 @@ HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
     InternalIterator* mem_iter =
         hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
 
+    // [DIAG_ITER] 诊断 Buffer 段初始化
+    if (read_options_.enable_delta_diag_logging) {
+      fprintf(stderr, "[DIAG_BUF_INIT] CUID %lu index %zu: Buffer Seg [%s - %s]\n",
+              cuid_, index, FormatKeyDisplay(seg.first_key).c_str(), 
+              FormatKeyDisplay(seg.last_key).c_str());
+    }
+
     // 检查 buffer 是否还有数据。如果为空，由于 SAC 机制，很可能是发生了 Flush
     // 导致 segments changed 
     mem_iter->Seek(seg.first_key);
+    
+    if (read_options_.enable_delta_diag_logging) {
+      if (!mem_iter->Valid()) {
+        fprintf(stderr, "[DIAG_BUF_INIT] CUID %lu: mem_iter Seek NOT VALID for %s\n",
+                cuid_, FormatKeyDisplay(seg.first_key).c_str());
+      } else {
+        fprintf(stderr, "[DIAG_BUF_INIT] CUID %lu: mem_iter Seek landed at %s\n",
+                cuid_, FormatKeyDisplay(mem_iter->key()).c_str());
+      }
+    }
+
     if (!mem_iter->Valid() ||
         icmp_.Compare(mem_iter->key(), seg.first_key) > 0) {
       HotIndexEntry latest_entry;
@@ -357,6 +375,9 @@ HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
         }
 
         if (snapshot_changed) {
+          if (read_options_.enable_delta_diag_logging) {
+            fprintf(stderr, "[DIAG_BUF_INIT] CUID %lu: Snapshot changed detected, triggering ReSync\n", cuid_);
+          }
           delete mem_iter;
           // 不在这里更新 segments_，交给 Next() 循环处理 ReSync
           return SegmentInitStatus::kSnapshotChanged;
