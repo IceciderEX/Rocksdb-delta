@@ -47,9 +47,11 @@ class HotIndexTable {
   void AppendSnapshotSegment(uint64_t cuid, const DataSegment& segment);
 
   // 将内存中的 Snapshot (file_id = -1) 替换为真实 new_segment
-  // 返回 true 表示成功找到并替换，false 表示未找到 -1 记录
+  // 返回 true 表示成功找到并替换了 -1 段，false 表示未替换。
+  // out_phys_overlap: 若非 nullptr，输出是否检测到与物理段重叠（但无 -1 段可替换）
   bool PromoteSnapshot(uint64_t cuid, const DataSegment& new_segment,
-                       HotDataBuffer* buffer, const InternalKeyComparator* icmp);
+                       HotDataBuffer* buffer, const InternalKeyComparator* icmp,
+                       bool* out_phys_overlap = nullptr);
 
   void AddDelta(uint64_t cuid, const DataSegment& segment);
 
@@ -90,6 +92,7 @@ class HotIndexTable {
       const std::string& pm_range_first,
       const std::string& pm_range_last,
       const std::vector<DataSegment>& pm_sst_segs,
+      const std::vector<DataSegment>& pm_promoted_segs,
       bool has_buf_data,
       const std::string& buf_min,
       const std::string& buf_max,

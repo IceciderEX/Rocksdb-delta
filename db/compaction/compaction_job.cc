@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include "util/extract_cuid.h"
 #include <memory>
 #include <optional>
 #include <set>
@@ -153,8 +154,24 @@ struct DeltaCompactionContext {
             for (auto fid : current_input_files) {
                 input_str += std::to_string(fid) + " ";
             }
-            // fprintf(stdout, "[Compaction] CUID %lu generated Output File %lu from Input Files: [%s]\n",
-            //     current_cuid, actual_file_number, input_str.c_str());
+
+            // [DIAG] 检测 compaction 输出是否稀疏（key range 内有空洞）
+            uint64_t first_rid = ExtractRowID(Slice(current_first_key));
+            uint64_t last_rid  = ExtractRowID(Slice(current_last_key));
+            if (first_rid > 0 && last_rid > 0 && last_rid >= first_rid) {
+              uint64_t expected_dense = last_rid - first_rid + 1;
+              if (current_entry_count < expected_dense) {
+                fprintf(stderr,
+                    "[DIAG_COMPACTION_SPARSE] CUID %lu: output file=%lu "
+                    "range=[rid %lu - %lu] expected_dense=%lu actual=%lu "
+                    "MISSING=%lu rows. input_files=[%s]\n",
+                    current_cuid, actual_file_number,
+                    first_rid, last_rid, expected_dense,
+                    current_entry_count,
+                    expected_dense - current_entry_count,
+                    input_str.c_str());
+              }
+            }
 
             pending_outputs->push_back({
                 current_cuid,
@@ -1141,12 +1158,18 @@ Status CompactionJob::Install(bool* compaction_released) {
               std::sort(input_files_vec.begin(), input_files_vec.end());
 
               // 2. 计算 Output Count & Info
+              // 注意：拆分 segment 后同一物理文件可能产生多个 DeltaOutputInfo，
+              // 但 GDCT 引用计数以物理文件为单位，需要去重统计唯一文件数。
               int32_t output_count = 0;
               uint64_t output_file_id = 0; // 用于 Verify，取第一个即可
               
               auto out_it = output_map.find(cuid);
               if (out_it != output_map.end()) {
-                  output_count = static_cast<int32_t>(out_it->second.size());
+                  std::unordered_set<uint64_t> unique_out_files;
+                  for (const auto& seg : out_it->second) {
+                    unique_out_files.insert(seg.file_number);
+                  }
+                  output_count = static_cast<int32_t>(unique_out_files.size());
                   if (output_count > 0) {
                       output_file_id = out_it->second[0].file_number;
                   }
@@ -1717,6 +1740,20 @@ Status CompactionJob::ProcessKeyValue(
              delta_ctx->FlushSegment(delta_ctx->current_file_number);
              // newcuid
              delta_ctx->current_cuid = cuid; 
+        } else {
+          // [FIX] 同一 CUID 内，若 CompactionIterator 刚完成了一次 obsolete delta skip，
+          // 说明输出数据中有 gap，需截断当前 segment，新起一段（避免注册稀疏 delta range）。
+          uint64_t gap_cuid = c_iter->ConsumeSkipGap();
+          if (gap_cuid == cuid && delta_ctx->has_started_segment) {
+            fprintf(stderr,
+                    "[DIAG_COMPACTION_GAP_SPLIT] CUID %lu: obsolete-file gap detected, "
+                    "splitting segment at last_key=%s, next_key=%s\n",
+                    cuid,
+                    delta_ctx->current_last_key.substr(0, 40).c_str(),
+                    c_iter->key().ToString().substr(0, 40).c_str());
+            delta_ctx->FlushSegment(delta_ctx->current_file_number);
+            // 重置，但保持 current_cuid 不变（同一 CUID 继续追踪，新段开始）
+          }
         }
 
         // internal key?

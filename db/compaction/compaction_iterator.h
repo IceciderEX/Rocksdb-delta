@@ -543,10 +543,21 @@ class CompactionIterator {
   std::vector<uint64_t> input_file_numbers_;
   std::unordered_set<uint64_t>* involved_cuids_ = nullptr;
   std::map<uint64_t, std::unordered_set<uint64_t>>* input_map_ = nullptr;
+  // 当某 (cuid, file_id) 整体被 skip（obsolete delta），
+  // 且跳过后紧接着同 cuid 的下一条合法 key 出现时，置为该 cuid。
+  // 主循环检测到此标志后须截断当前 segment，否则新旧数据的边界会凭空产生 gap。
+  uint64_t cuid_gap_after_skip_ = 0;
 
 public: 
   uint64_t input_file_number() {
       return input_.GetPhysicalId();
+  }
+
+  // 消费并返回 cuid_gap_after_skip_ 标志（返回非 0 表示该 CUID 需要截断 segment）
+  uint64_t ConsumeSkipGap() {
+    uint64_t v = cuid_gap_after_skip_;
+    cuid_gap_after_skip_ = 0;
+    return v;
   }
 
   void SetInputMap(std::map<uint64_t, std::unordered_set<uint64_t>>* map) {

@@ -60,7 +60,7 @@ class HotspotManager {
 
   Status FlushBlockToSharedSST(
     std::shared_ptr<HotDataBlock> block,
-    std::unordered_map<uint64_t, DataSegment>* output_segments);
+    std::unordered_map<uint64_t, std::vector<DataSegment>>* output_segments);
 
   void TriggerBufferFlush(const char* source = "UNKNOWN",
                           uint64_t source_cuid = 0);
@@ -237,7 +237,11 @@ class HotspotManager {
   // PartialMerge 进行期间（BufferHotData ~ ReplaceOverlappingSegments），
   // 跨线程 TriggerBufferFlush 对该 CUID 产生的 SST 暂存于此
   std::unordered_map<uint64_t, std::vector<DataSegment>> pm_pending_snapshots_;
-  std::mutex pm_pending_mutex_;
+  // PM 活跃期间 PromoteSnapshot 成功消费的 SST 记录于此。
+  // AtomicReplaceForPartialMerge 步骤① 需要保留这些 SST，不能将其移除。
+  // (PromoteSnapshot 成功后 SST 已在 snapshot 中且正确 Ref，AtomicReplace 不额外 Ref/Unref)
+  std::unordered_map<uint64_t, std::vector<DataSegment>> pm_promoted_snapshots_;
+  std::mutex pm_pending_mutex_;  // 同一把锁保护 pm_pending 和 pm_promoted
 
  public:
   // 加入 Partial Merge 队列 (前台调用，不阻塞)
@@ -267,6 +271,16 @@ class HotspotManager {
     if (it == pm_pending_snapshots_.end()) return {};
     auto result = std::move(it->second);
     it->second.clear();  // 重置为空，保留 key（entry 继续活跃）
+    return result;
+  }
+
+  // 取出 pm_promoted_snapshots_[cuid] 并清空（PM 结束时调用，传给 AtomicReplace）
+  std::vector<DataSegment> SwapOutPmPromoted(uint64_t cuid) {
+    std::lock_guard<std::mutex> lock(pm_pending_mutex_);
+    auto it = pm_promoted_snapshots_.find(cuid);
+    if (it == pm_promoted_snapshots_.end()) return {};
+    auto result = std::move(it->second);
+    pm_promoted_snapshots_.erase(it);
     return result;
   }
 

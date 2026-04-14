@@ -35,6 +35,41 @@ static FileMetaData MakeFileMetaFromSegment(const DataSegment& seg,
   return meta;
 }
 
+// Wraps a BlockBasedTableIterator to fix SeekToFirst() ignoring
+// iterate_lower_bound. BlockBasedTableIterator::SeekToFirst() calls
+// SeekImpl(nullptr) which starts from the physical file beginning without
+// checking the lower bound. For split delta segments (e.g. file=132 covering
+// both [0,54271] and [1197056,2518015]), SeekToFirst() on the
+// [1197056,2518015] child would incorrectly return data from row 0.
+// This wrapper redirects SeekToFirst() to Seek(lower_bound_ikey) instead.
+class LowerBoundedSSTIterator : public InternalIterator {
+ public:
+  LowerBoundedSSTIterator(InternalIterator* inner,
+                          const std::string& lower_bound_ikey)
+      : inner_(inner), lower_bound_ikey_(lower_bound_ikey) {}
+
+  ~LowerBoundedSSTIterator() override { delete inner_; }
+
+  bool Valid() const override { return inner_->Valid(); }
+  void SeekToFirst() override { inner_->Seek(Slice(lower_bound_ikey_)); }
+  void SeekToLast() override { inner_->SeekToLast(); }
+  void Seek(const Slice& target) override { inner_->Seek(target); }
+  void SeekForPrev(const Slice& target) override {
+    inner_->SeekForPrev(target);
+  }
+  void Next() override { inner_->Next(); }
+  void Prev() override { inner_->Prev(); }
+  Slice key() const override { return inner_->key(); }
+  Slice value() const override { return inner_->value(); }
+  Status status() const override { return inner_->status(); }
+  bool PrepareValue() override { return inner_->PrepareValue(); }
+  uint64_t GetPhysicalId() override { return inner_->GetPhysicalId(); }
+
+ private:
+  InternalIterator* inner_;
+  std::string lower_bound_ikey_;
+};
+
 // ======================= HotDeltaIterator ==========================
 
 HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
@@ -50,17 +85,6 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
   if (deltas_.empty()) {
     merging_iter_ = NewEmptyInternalIterator<Slice>(nullptr);
     return;
-  }
-
-  if (read_options.enable_delta_diag_logging) {
-    std::stringstream ss;
-    ss << "[";
-    for (size_t i = 0; i < deltas_.size(); ++i) {
-      ss << deltas_[i].file_number << (i == deltas_.size() - 1 ? "" : ", ");
-    }
-    ss << "]";
-    fprintf(stderr, "[DIAG_DELTA_INIT] CUID %lu, Delta Files: %s\n",
-                   cuid_, ss.str().c_str());
   }
 
   bounds_storage_.reserve(deltas_.size() * 2);
@@ -100,7 +124,7 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
         0, nullptr, nullptr, allow_unprepared_value, nullptr, nullptr);
 
     if (iter) {
-      children.push_back(iter);
+      children.push_back(new LowerBoundedSSTIterator(iter, delta.first_key));
     }
   }
 
@@ -211,6 +235,8 @@ class BoundedMemIterator : public InternalIterator {
 
   bool PrepareValue() override { return iter_->PrepareValue(); }
 
+  uint64_t GetPhysicalId() override { return iter_->GetPhysicalId(); }
+
  private:
   void UpdateValid() {
     valid_ = iter_->Valid() && IsWithinBounds(iter_->key());
@@ -307,15 +333,7 @@ void HotSnapshotIterator::UnrefSegments(const std::vector<DataSegment>& segs) {
   }
 }
 
-void HotSnapshotIterator::LogSegmentExit(const char* reason) {
-  if (current_segment_index_ != -1) {
-    if (read_options_.enable_delta_diag_logging) {
-      fprintf(stderr,
-              "[DIAG_ITER] CUID %lu: Finished Segment %d (%s). File number %lu. Range [%s, %s]. Read %lu records total.\n",
-              cuid_, current_segment_index_, reason, segments_[current_segment_index_].file_number, 
-              FormatKeyDisplay(segments_[current_segment_index_].first_key).c_str(), FormatKeyDisplay(segments_[current_segment_index_].last_key).c_str(), current_segment_read_count_);
-    }
-  }
+void HotSnapshotIterator::LogSegmentExit(const char* /*reason*/) {
   current_segment_read_count_ = 0;
 }
 
@@ -335,26 +353,9 @@ HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
     InternalIterator* mem_iter =
         hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
 
-    // [DIAG_ITER] 诊断 Buffer 段初始化
-    if (read_options_.enable_delta_diag_logging) {
-      fprintf(stderr, "[DIAG_BUF_INIT] CUID %lu index %zu: Buffer Seg [%s - %s]\n",
-              cuid_, index, FormatKeyDisplay(seg.first_key).c_str(), 
-              FormatKeyDisplay(seg.last_key).c_str());
-    }
-
     // 检查 buffer 是否还有数据。如果为空，由于 SAC 机制，很可能是发生了 Flush
     // 导致 segments changed 
     mem_iter->Seek(seg.first_key);
-    
-    if (read_options_.enable_delta_diag_logging) {
-      if (!mem_iter->Valid()) {
-        fprintf(stderr, "[DIAG_BUF_INIT] CUID %lu: mem_iter Seek NOT VALID for %s\n",
-                cuid_, FormatKeyDisplay(seg.first_key).c_str());
-      } else {
-        fprintf(stderr, "[DIAG_BUF_INIT] CUID %lu: mem_iter Seek landed at %s\n",
-                cuid_, FormatKeyDisplay(mem_iter->key()).c_str());
-      }
-    }
 
     if (!mem_iter->Valid() ||
         icmp_.Compare(mem_iter->key(), seg.first_key) > 0) {
@@ -375,9 +376,6 @@ HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
         }
 
         if (snapshot_changed) {
-          if (read_options_.enable_delta_diag_logging) {
-            fprintf(stderr, "[DIAG_BUF_INIT] CUID %lu: Snapshot changed detected, triggering ReSync\n", cuid_);
-          }
           delete mem_iter;
           // 不在这里更新 segments_，交给 Next() 循环处理 ReSync
           return SegmentInitStatus::kSnapshotChanged;
@@ -421,14 +419,6 @@ HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
       current_iter_.reset(nullptr);
       current_segment_index_ = -1;
       return SegmentInitStatus::kSnapshotChanged;
-    }
-
-    // [DIAG] Reset count moved to caller (Next/Seek) for correct logging
-    if (read_options_.enable_delta_diag_logging) {
-      fprintf(stderr, "[DIAG_ITER] CUID %lu: Entering Segment %zu (File %lu). Range: [%s - %s]\n",
-              cuid_, index, seg.file_number,
-              FormatKeyDisplay(segments_[index].first_key).c_str(),
-              FormatKeyDisplay(segments_[index].last_key).c_str());
     }
 
     return SegmentInitStatus::kSuccess;
@@ -494,23 +484,9 @@ void HotSnapshotIterator::Seek(const Slice& target) {
   if (current_iter_) {
     current_iter_->Seek(target);
 
-    // [DIAG] Landed! Start (or reset) the count for this seek position
     current_segment_read_count_ = 0;
     if (current_iter_->Valid()) {
         current_segment_read_count_ = 1;
-    }
-
-    // [DIAG] Log where Seek landed
-    if (read_options_.enable_delta_diag_logging) {
-      std::string landed_key = current_iter_->Valid()
-                                   ? FormatKeyDisplay(current_iter_->key())
-                                   : "N/A";
-      fprintf(stderr,
-              "[DIAG_SEEK] CUID %lu Seek landed at Segment %d (File %lu). "
-              "Valid: %d, Landed: %s\n",
-              cuid_, current_segment_index_,
-              segments_[current_segment_index_].file_number,
-              current_iter_->Valid(), landed_key.c_str());
     }
 
     if (!Valid()) {
@@ -754,20 +730,6 @@ void HotSnapshotIterator::SeekToFirst() {
   if (current_iter_) {
     current_iter_->Seek(segments_[current_segment_index_].first_key);
 
-    // [DIAG] Log SeekToFirst landing
-    if (read_options_.enable_delta_diag_logging) {
-      std::string landed_key = current_iter_->Valid()
-                                   ? FormatKeyDisplay(current_iter_->key())
-                                   : "N/A";
-      fprintf(stderr,
-              "[DIAG_SEEK] CUID %lu SeekToFirst landed at Segment %d (File %lu). "
-              "Valid: %d, Landed: %s\n",
-              cuid_, current_segment_index_, 
-              segments_[current_segment_index_].file_number,
-              current_iter_->Valid(), landed_key.c_str());
-    }
-    
-    // [DIAG] Initialize count for the new start position
     if (current_iter_->Valid()) {
         current_segment_read_count_ = 1;
     }

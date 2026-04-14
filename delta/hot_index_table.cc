@@ -130,7 +130,8 @@ void HotIndexTable::AppendSnapshotSegment(uint64_t cuid,
 bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
                                     const DataSegment& new_segment,
                                     HotDataBuffer* buffer,
-                                    const InternalKeyComparator* icmp) {
+                                    const InternalKeyComparator* icmp,
+                                    bool* out_phys_overlap) {
   Shard& shard = GetShard(cuid);
   std::unique_lock<std::shared_mutex> lock(shard.mutex);
   auto it = shard.table.find(cuid);
@@ -231,9 +232,6 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
     }
   }
 
-  // if (DetectSnapshotGap(cuid, next_segments, "PromoteSnapshot")) {
-  // }
-
   if (found_mem_overlap) {
     std::sort(next_segments.begin(), next_segments.end(),
               [icmp](const DataSegment& a, const DataSegment& b) {
@@ -242,25 +240,19 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
                 return icmp->Compare(a.last_key, b.last_key) < 0;
               });
 
-    // GAP 检测：只在出现间隙时打印上下文
-    // if (DetectSnapshotGap(cuid, next_segments, "PromoteSnapshot")) {
-    //   fprintf(stderr, "[DIAG][PromoteSnapshot] CUID %lu: GAP! newSST file=%lu [%s - %s]. Clipped mem segs=%zu\n",
-    //           cuid, new_segment.file_number,
-    //           FormatKeyDisplay(new_segment.first_key).c_str(),
-    //           FormatKeyDisplay(new_segment.last_key).c_str(),
-    //           clipped_mem_segments.size());
-    //   for (size_t i = 0; i < clipped_mem_segments.size(); ++i) {
-    //     fprintf(stderr, "  clipped_mem[%zu] [%s - %s]\n", i,
-    //             FormatKeyDisplay(clipped_mem_segments[i].first_key).c_str(),
-    //             FormatKeyDisplay(clipped_mem_segments[i].last_key).c_str());
-    //   }
-    //   for (size_t i = 0; i < next_segments.size(); ++i) {
-    //     fprintf(stderr, "  result[%zu] file=%lu [%s - %s]\n", i,
-    //             next_segments[i].file_number,
-    //             FormatKeyDisplay(next_segments[i].first_key).c_str(),
-    //             FormatKeyDisplay(next_segments[i].last_key).c_str());
-    //   }
-    // }
+    // GAP 检测：排序后检测是否有间隙
+    if (DetectSnapshotGap(cuid, next_segments, "PromoteSnapshot")) {
+      fprintf(stderr, "[DIAG][PromoteSnapshot] CUID %lu: GAP! newSST file=%lu [%s - %s]. Clipped mem segs=%zu\n",
+              cuid, new_segment.file_number,
+              FormatKeyDisplay(new_segment.first_key).c_str(),
+              FormatKeyDisplay(new_segment.last_key).c_str(),
+              clipped_mem_segments.size());
+      for (size_t i = 0; i < clipped_mem_segments.size(); ++i) {
+        fprintf(stderr, "  clipped_mem[%zu] [%s - %s]\n", i,
+                FormatKeyDisplay(clipped_mem_segments[i].first_key).c_str(),
+                FormatKeyDisplay(clipped_mem_segments[i].last_key).c_str());
+      }
+    }
 
     entry.snapshot_segments = std::move(next_segments);
 
@@ -279,10 +271,12 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
             FormatKeyDisplay(new_segment.last_key).c_str());
   }
 
-  // 返回 true 的条件：找到了可替换的 -1
-  // 段，或者虽然只有物理段重叠但我们选择保护它们。 两种情况都不应走到
-  // AppendSnapshotSegment 的 fallback 路径。
-  return found_mem_overlap || found_phys_overlap;
+  if (out_phys_overlap) {
+    *out_phys_overlap = found_phys_overlap;
+  }
+  // 只有真正替换了 -1 段才返回 true。
+  // 仅物理段重叠时返回 false，由调用方决定走 pm_pending/pending 拦截。
+  return found_mem_overlap;
 }
 
 void HotIndexTable::AddDelta(uint64_t cuid, const DataSegment& delta) {
@@ -349,6 +343,12 @@ void HotIndexTable::MarkDeltasAsObsolete(
   for (auto d_it = entry.deltas.begin(); d_it != entry.deltas.end();) {
     if (visited_files.count(d_it->file_number)) {
       matched_files.insert(d_it->file_number);
+      fprintf(stderr,
+              "[DIAG_MARK_OBSOLETE] CUID %lu: delta file=%lu [%s - %s]"
+              " moved to obsolete_deltas\n",
+              cuid, d_it->file_number,
+              FormatKeyDisplay(d_it->first_key).c_str(),
+              FormatKeyDisplay(d_it->last_key).c_str());
       entry.obsolete_deltas.push_back(*d_it);
       d_it = entry.deltas.erase(d_it);
     } else {
@@ -363,8 +363,19 @@ void HotIndexTable::MarkDeltasAsObsolete(
     if (matched_files.count(fid)) continue;
     DataSegment dummy;
     dummy.file_number = fid;
+    fprintf(stderr,
+            "[DIAG_MARK_OBSOLETE] CUID %lu: visited file=%lu NOT in deltas"
+            " -> dummy obsolete entry (pre-hotspot SST)\n",
+            cuid, fid);
     entry.obsolete_deltas.push_back(dummy);
   }
+
+  size_t dummy_count = visited_files.size() - matched_files.size();
+  fprintf(stderr,
+          "[DIAG_MARK_OBSOLETE] CUID %lu: summary: visited=%zu"
+          " matched_from_deltas=%zu dummy_added=%zu total_obsolete_now=%zu\n",
+          cuid, visited_files.size(), matched_files.size(), dummy_count,
+          entry.obsolete_deltas.size());
 }
 
 // d)
@@ -700,6 +711,7 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
     const std::string& pm_range_first,
     const std::string& pm_range_last,
     const std::vector<DataSegment>& pm_sst_segs,
+    const std::vector<DataSegment>& pm_promoted_segs,
     bool has_buf_data,
     const std::string& buf_min,
     const std::string& buf_max,
@@ -716,6 +728,24 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
     std::string pm_start_user = ExtractUserKey(pm_range_first).ToString();
     std::string pm_end_user   = ExtractUserKey(pm_range_last).ToString();
 
+    // 构建 pm_promoted 文件号集合：这些 SST 已在 PromoteSnapshot 时正确放入 snapshot，
+    // 步骤① 不应将其移除（它们本身就是此次 PM 产生的正确数据）。
+    std::unordered_set<uint64_t> pm_promoted_file_nums;
+    for (const auto& seg : pm_promoted_segs) {
+      pm_promoted_file_nums.insert(seg.file_number);
+    }
+    if (!pm_promoted_segs.empty()) {
+      fprintf(stderr,
+              "[DIAG][AtomicReplace] CUID %lu: pm_promoted_segs=%zu files to preserve:",
+              cuid, pm_promoted_segs.size());
+      for (const auto& seg : pm_promoted_segs) {
+        fprintf(stderr, " %lu[%s-%s]", seg.file_number,
+                FormatKeyDisplay(seg.first_key).c_str(),
+                FormatKeyDisplay(seg.last_key).c_str());
+      }
+      fprintf(stderr, "\n");
+    }
+
     std::vector<DataSegment> next_segments;
 
     // ① 裁剪与 PM 输出范围重叠的旧 snapshot 段（逻辑与 ReplaceOverlappingSegments 相同）
@@ -727,6 +757,19 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
       bool is_right = (icmp_->user_comparator()->Compare(seg_start, pm_end_user)   > 0);
 
       if (!is_left && !is_right) {
+        // [FIX-v2] pm_promoted SST 被 PromoteSnapshot 以截断范围（old -1 段边界）写入 snapshot，
+        // 但其物理完整范围更宽（存于 pm_promoted_segs）。此处跳过截断的旧条目，
+        // 在步骤 ②-c 中以完整物理范围重新插入，同时切割 buffer 以消除重叠。
+        // 不加入 segments_to_unref：文件保留来自 PromoteSnapshot 的 Ref，在 ②-c 中转移。
+        if (seg.file_number != static_cast<uint64_t>(-1) &&
+            pm_promoted_file_nums.count(seg.file_number)) {
+          fprintf(stderr,
+                  "[DIAG][AtomicReplace] CUID %lu: Seg=[%s - %s] is pm_promoted, DEFERRED to step-2c (full range)\n",
+                  cuid, FormatKeyDisplay(seg.first_key).c_str(),
+                  FormatKeyDisplay(seg.last_key).c_str());
+          continue;
+        }
+
         // 与 PM 范围重叠：保留不重叠的边缘部分
         fprintf(stderr, "[DIAG][AtomicReplace] CUID %lu: Seg Overlap detected. Seg=[%s - %s] PM=[%s - %s]\n",
                 cuid, FormatKeyDisplay(seg.first_key).c_str(), FormatKeyDisplay(seg.last_key).c_str(),
@@ -982,6 +1025,74 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
       next_segments.push_back(clipped_seg);
     }
 
+    // ②-c: 以完整物理范围插入 pm_promoted SSTs，并切割 buffer/-1 段以消除重叠。
+    // PromoteSnapshot 已设置了 Ref；这里将其「转移」给新条目（不额外 Ref/Unref）。
+    for (const auto& sst_seg : pm_promoted_segs) {
+      std::string prom_start = ExtractUserKey(sst_seg.first_key).ToString();
+      std::string prom_end   = ExtractUserKey(sst_seg.last_key).ToString();
+
+      // 将 pm_promoted 完整范围裁剪到 pm_range（防止超出 PM 范围影响外部段）
+      DataSegment clipped_prom = sst_seg;
+      if (icmp_->user_comparator()->Compare(prom_start, pm_start_user) < 0) {
+        clipped_prom.first_key = pm_range_first;
+        prom_start = pm_start_user;
+      }
+      if (icmp_->user_comparator()->Compare(prom_end, pm_end_user) > 0) {
+        clipped_prom.last_key = pm_range_last;
+        prom_end = pm_end_user;
+      }
+
+      std::vector<DataSegment> after_cut;
+      for (const auto& seg : next_segments) {
+        // 原始物理段（非 -1、非 pm_sst、非 pm_promoted）：不可被切割
+        bool is_orig = (seg.file_number != static_cast<uint64_t>(-1) &&
+                        pm_sst_file_numbers.find(seg.file_number) == pm_sst_file_numbers.end() &&
+                        pm_promoted_file_nums.find(seg.file_number) == pm_promoted_file_nums.end());
+        if (is_orig) {
+          after_cut.push_back(seg);
+          continue;
+        }
+        std::string seg_s = ExtractUserKey(seg.first_key).ToString();
+        std::string seg_e = ExtractUserKey(seg.last_key).ToString();
+        bool il = icmp_->user_comparator()->Compare(seg_e, prom_start) < 0;
+        bool ir = icmp_->user_comparator()->Compare(seg_s, prom_end)   > 0;
+        if (il || ir) {
+          after_cut.push_back(seg);
+        } else {
+          // 重叠：保留 pm_promoted 范围之外的残余
+          if (icmp_->user_comparator()->Compare(seg_s, prom_start) < 0) {
+            DataSegment left = seg;
+            left.last_key = clipped_prom.first_key;
+            after_cut.push_back(left);
+            if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+              lifecycle_manager_->Ref(seg.file_number);
+            }
+          }
+          if (icmp_->user_comparator()->Compare(seg_e, prom_end) > 0) {
+            DataSegment right = seg;
+            right.first_key = clipped_prom.last_key;
+            after_cut.push_back(right);
+            if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+              lifecycle_manager_->Ref(seg.file_number);
+            }
+          }
+          // pm_sst 物理段被切走时需 Unref；-1 段不需要
+          if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
+            lifecycle_manager_->Unref(seg.file_number);
+          }
+        }
+      }
+      next_segments = std::move(after_cut);
+      // 以完整（已裁剪到 pm_range 的）范围插入 pm_promoted SST
+      next_segments.push_back(clipped_prom);
+      fprintf(stderr,
+              "[DIAG][AtomicReplace] CUID %lu: step-2c pm_promoted file=%lu [%s - %s] "
+              "inserted with full range (clipped to pm_range)\n",
+              cuid, sst_seg.file_number,
+              FormatKeyDisplay(clipped_prom.first_key).c_str(),
+              FormatKeyDisplay(clipped_prom.last_key).c_str());
+    }
+
     // ④ 排序
     std::sort(next_segments.begin(), next_segments.end(),
               [this](const DataSegment& a, const DataSegment& b) {
@@ -1004,12 +1115,6 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
               FormatKeyDisplay(pm_range_first).c_str(),
               FormatKeyDisplay(pm_range_last).c_str(),
               (int)has_buf_data, pm_sst_segs.size());
-      for (size_t i = 0; i < next_segments.size(); ++i) {
-        fprintf(stderr, "  result[%zu] file=%lu [%s - %s]\n", i,
-                next_segments[i].file_number,
-                FormatKeyDisplay(next_segments[i].first_key).c_str(),
-                FormatKeyDisplay(next_segments[i].last_key).c_str());
-      }
     }
 
     snapshots = std::move(next_segments);

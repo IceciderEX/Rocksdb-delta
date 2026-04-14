@@ -467,6 +467,12 @@ void CompactionIterator::CheckHotspotFilters() {
 
   // 文件编号进行了改变或 CUID 改变，重新评估是否需要跳过
   if (cuid != current_cuid_ || file_id != current_file_number_) {
+    // [FIX] 检测 gap：之前 (current_cuid_, *) 正在被 skip，现在来了同 cuid 的新有效 key。
+    // 说明中间有 obsolete file 被整体跳过，输出数据出现了 gap，需要截断当前 segment。
+    if (skip_current_cuid_ && cuid == current_cuid_) {
+      cuid_gap_after_skip_ = cuid;
+    }
+
     // 记录涉及到的物理输入文件
     if (input_map_ && cuid != 0) {
       if (file_id != 0) {
@@ -485,6 +491,10 @@ void CompactionIterator::CheckHotspotFilters() {
       // update：MVCC 如果该 CUID 的逻辑删除早于系统当前最老的快照再标记删除？
       if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid, earliest_snapshot_)) {
         skip_current_cuid_ = true;
+        fprintf(stderr,
+                "[DIAG_COMPACTION_SKIP] CUID %lu: file=%lu skipped"
+                " (CUID marked deleted)\n",
+                cuid, file_id);
       } 
       // d) 检查热点索引表（仅判断当前文件 id）
       // 若遇到热点CUid，检查其热点索引表，若发现Deltas列表中对应的该段数据已被标记为
@@ -492,6 +502,17 @@ void CompactionIterator::CheckHotspotFilters() {
       else if (hotspot_manager_->IsHot(cuid)) {
         if (hotspot_manager_->ShouldSkipObsoleteDelta(cuid, std::vector<uint64_t>{file_id})) {
           skip_current_cuid_ = true;
+          // 打印首条被跳过 key 的信息，便于与 DIAG_COMPACTION_SPARSE 交叉验证
+          Slice skip_key = input_.key();
+          uint64_t skip_rid = 0;
+          if (skip_key.size() >= 34) {
+            std::string rid_str = skip_key.ToString().substr(24, 10);
+            try { skip_rid = std::stoull(rid_str); } catch (...) {}
+          }
+          fprintf(stderr,
+                  "[DIAG_COMPACTION_SKIP] CUID %lu: file=%lu skipped"
+                  " (obsolete delta), first_skipped_rid=%lu\n",
+                  cuid, file_id, skip_rid);
         }
       }
     }
