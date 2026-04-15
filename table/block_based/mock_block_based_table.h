@@ -21,6 +21,7 @@ class MockBlockBasedTable : public BlockBasedTable {
 
 class MockBlockBasedTableTester {
   static constexpr int kMockLevel = 0;
+  static constexpr uint64_t kMockFileNumber = 12345;
 
  public:
   Options options_;
@@ -45,7 +46,8 @@ class MockBlockBasedTableTester {
     constexpr bool immortal_table = false;
     table_.reset(new MockBlockBasedTable(new BlockBasedTable::Rep(
         ioptions_, env_options_, table_options_, icomp_, skip_filters,
-        12345 /*file_size*/, kMockLevel, immortal_table)));
+      12345 /*file_size*/, kMockLevel, immortal_table,
+      kMockFileNumber)));
   }
 
   FilterBitsBuilder* GetBuilder() const {
