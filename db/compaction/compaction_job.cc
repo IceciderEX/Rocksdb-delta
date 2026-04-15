@@ -1108,7 +1108,6 @@ Status CompactionJob::Install(bool* compaction_released) {
     // fix: 成功之后再修改metadata
     if (status.ok() && hotspot_manager_) {
         if (status.ok() && hotspot_manager_) {
-          fprintf(stderr, "CompactionJob::Install()\n");
           // CUID -> List<Segments>
           std::map<uint64_t, std::vector<DeltaOutputInfo>> output_map;
           for (const auto& out : global_outputs_) {

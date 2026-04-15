@@ -303,15 +303,7 @@ void HotIndexTable::MarkDeltasAsObsolete(
     }
   }
 
-  // 对于 visited_files 中不在 deltas 中找到的文件
-  // 可能是因为第一次 full scan 之前生成的 SST，直接标记为 obsolete
-  // TIPS & TODO：是否存在问题？
-  for (uint64_t fid : visited_files) {
-    if (matched_files.count(fid)) continue;
-    DataSegment dummy;
-    dummy.file_number = fid;
-    entry.obsolete_deltas.push_back(dummy);
-  }
+  (void)matched_files;
 }
 
 // d)
@@ -367,6 +359,67 @@ bool HotIndexTable::IsDeltaObsolete(
     }
   }
   return false;
+}
+
+bool HotIndexTable::IsDeltaObsoleteForKey(uint64_t cuid,
+                                          uint64_t file_number,
+                                          const Slice& internal_key) const {
+  const Shard& shard = GetShard(cuid);
+  std::shared_lock<std::shared_mutex> lock(shard.mutex);
+  auto it = shard.table.find(cuid);
+  if (it == shard.table.end()) {
+    return false;
+  }
+
+  const auto& entry = it->second;
+  if (entry.obsolete_deltas.empty()) {
+    return false;
+  }
+
+  auto key_in_range = [&](const DataSegment& seg) {
+    if (seg.first_key.empty() || seg.last_key.empty()) {
+      return false;
+    }
+    return icmp_->Compare(internal_key, seg.first_key) >= 0 &&
+           icmp_->Compare(internal_key, seg.last_key) <= 0;
+  };
+
+  bool matched_obsolete = false;
+  for (const auto& delta : entry.obsolete_deltas) {
+    if (delta.file_number != file_number) {
+      continue;
+    }
+    if (key_in_range(delta)) {
+      matched_obsolete = true;
+      break;
+    }
+  }
+
+  if (!matched_obsolete) {
+    return false;
+  }
+
+  // Safety guard: only skip if both live snapshot and live delta already
+  // cover this key. This is intentionally conservative for correctness.
+  bool covered_by_snapshot = false;
+  bool covered_by_delta = false;
+
+  for (const auto& seg : entry.snapshot_segments) {
+    if (key_in_range(seg)) {
+      covered_by_snapshot = true;
+      break;
+    }
+  }
+  for (const auto& seg : entry.deltas) {
+    if (seg.file_number == file_number) {
+      continue;
+    }
+    if (key_in_range(seg)) {
+      covered_by_delta = true;
+      break;
+    }
+  }
+  return covered_by_snapshot && covered_by_delta;
 }
 
 void HotIndexTable::RemoveObsoleteDeltasForCUIDs(

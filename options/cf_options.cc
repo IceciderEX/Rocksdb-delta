@@ -223,6 +223,9 @@ const std::string kOptNameBMCompOpts = "bottommost_compression_opts";
 const std::string kOptNameCompOpts = "compression_opts";
 
 static std::unordered_map<std::string, OptionTypeInfo> delta_options_type_info = {
+  {"enable_partition",
+   {offsetof(struct DeltaOptions, enable_partition), OptionType::kBoolean,
+    OptionVerificationType::kDeprecated, OptionTypeFlags::kMutable}},
     {"hotspot_scan_threshold",
      {offsetof(struct DeltaOptions, hotspot_scan_threshold),
       OptionType::kUInt64T, OptionVerificationType::kDeprecated,
@@ -265,6 +268,10 @@ static std::unordered_map<std::string, OptionTypeInfo> delta_options_type_info =
     {"compaction_l0_trigger_count",
      {offsetof(struct DeltaOptions, compaction_l0_trigger_count), OptionType::kInt,
       OptionVerificationType::kDeprecated, OptionTypeFlags::kMutable}},
+    {"compaction_l0_partition_trigger_count",
+     {offsetof(struct DeltaOptions, compaction_l0_partition_trigger_count),
+      OptionType::kInt, OptionVerificationType::kDeprecated,
+      OptionTypeFlags::kMutable}},
     {"compaction_l0_trigger_age_sec",
      {offsetof(struct DeltaOptions, compaction_l0_trigger_age_sec), OptionType::kUInt64T,
       OptionVerificationType::kDeprecated, OptionTypeFlags::kMutable}},

@@ -183,6 +183,8 @@ class DeltaSwitchingIterator : public InternalIterator {
   InternalIterator* cold_iter_;
   // hot_iter_ 切换 CUID 时需要重建
   InternalIterator* hot_iter_;
+  // full-scan in hot mode uses a hybrid merge view of hot_iter_ and cold_iter_.
+  InternalIterator* hybrid_iter_;
 
   uint64_t current_hot_cuid_;
   bool is_hot_mode_;

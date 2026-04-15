@@ -9,6 +9,10 @@
 
 #include "db/compaction/compaction_picker_level.h"
 
+#include <array>
+#include <atomic>
+#include <limits>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,6 +21,7 @@
 #include "logging/log_buffer.h"
 #include "test_util/sync_point.h"
 #include "logging/logging.h"
+#include "util/l0_partition.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -336,7 +341,8 @@ void LevelCompactionBuilder::SetupInitialFiles() {
 bool LevelCompactionBuilder::SetupOtherL0FilesIfNeeded() {
   if (start_level_ == 0 && output_level_ != 0 && !is_l0_trivial_move_) {
     return compaction_picker_->GetOverlappingL0Files(
-        vstorage_, &start_level_inputs_, output_level_, &parent_index_);
+      vstorage_, &start_level_inputs_, output_level_, &parent_index_,
+      mutable_cf_options_.delta_options.enable_partition);
   }
   return true;
 }
@@ -527,84 +533,181 @@ void LevelCompactionBuilder::SetupInitialFilesDelta() {
 }
 
 // for delta
-// 目前的策略：选取最老的 N 个文件进行 L0->L0 合并
+// 分区模式下优先做“分区内压缩”，同时在全局压力下做分区轮询，
+// 避免仅盯住最老文件导致长期挑选失败。
 bool LevelCompactionBuilder::PickMixedL0Compaction() {
-  // compaction策略阈值
-  const int kL0TriggerCount =
-      mutable_cf_options_.delta_options.compaction_l0_trigger_count;
+  const bool enable_partition =
+      mutable_cf_options_.delta_options.enable_partition;
+  const size_t kGlobalL0TriggerCount = static_cast<size_t>(std::max(
+      mutable_cf_options_.delta_options.compaction_l0_trigger_count, 2));
+  const size_t kPartitionL0TriggerCount = static_cast<size_t>(std::max(
+      mutable_cf_options_.delta_options.compaction_l0_trigger_count, 2));
   const uint64_t kL0TriggerAge =
       mutable_cf_options_.delta_options.compaction_l0_trigger_age_sec;
-  const size_t kFilesToPick =
-      mutable_cf_options_.delta_options.compaction_l0_files_to_pick;
+  const size_t kFilesToPick = std::max<size_t>(
+      mutable_cf_options_.delta_options.compaction_l0_files_to_pick, 2);
 
-  // 2. 获取 L0 文件列表
-  // TODO: 检查 seqno 排列顺序?
   const std::vector<FileMetaData*>& l0_files = vstorage_->LevelFiles(0);
-  
-  size_t total_files = l0_files.size();
+
+  const size_t total_files = l0_files.size();
   if (total_files < 2) {
     return false;
   }
 
-  bool trigger_by_count = (total_files >= static_cast<size_t>(kL0TriggerCount));
+  const bool trigger_by_global_count = (total_files >= kGlobalL0TriggerCount);
   bool trigger_by_time = false;
 
-  // 检查最老文件的时间 l0_files.back()？
-  FileMetaData* oldest_file = l0_files.back();
-  uint64_t creation_time = oldest_file->file_creation_time;
-  uint64_t now_sec = ioptions_.env->NowMicros() / 1000000;
-
-  if (creation_time > 0 && creation_time != kUnknownFileCreationTime) {
-      if (now_sec > creation_time + kL0TriggerAge) {
-          trigger_by_time = true;
-      }
+  const uint64_t now_sec = ioptions_.env->NowMicros() / 1000000;
+  const FileMetaData* oldest_file = l0_files.back();
+  const uint64_t creation_time = oldest_file->file_creation_time;
+  if (kL0TriggerAge > 0 && creation_time > 0 &&
+      creation_time != kUnknownFileCreationTime &&
+      now_sec > creation_time + kL0TriggerAge) {
+    trigger_by_time = true;
   }
-  if (!trigger_by_count && !trigger_by_time) {
+
+  start_level_inputs_.level = 0;
+  start_level_inputs_.files.clear();
+  start_level_ = 0;
+  output_level_ = 0;  // L0 -> L0
+
+  if (!enable_partition) {
+    if (!trigger_by_global_count && !trigger_by_time) {
+      return false;
+    }
+    for (size_t i = total_files; i > 0 &&
+                       start_level_inputs_.files.size() < kFilesToPick;
+         --i) {
+      FileMetaData* f = l0_files[i - 1];
+      if (f->being_compacted) {
+        continue;
+      }
+      start_level_inputs_.files.push_back(f);
+    }
+
+    if (start_level_inputs_.files.size() < 2) {
+      start_level_inputs_.clear();
+      return false;
+    }
+
+    compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+    ROCKS_LOG_BUFFER(
+        log_buffer_,
+        "[Delta-Opt] Picked Mixed L0 Compaction (non-partitioned). Trigger: "
+        "%s, Files: %zu, OutputLevel: 0",
+      trigger_by_global_count ? "GlobalCount" : "Time",
+      start_level_inputs_.size());
+    return true;
+  }
+
+  // Partition mode: only trigger by per-partition file pressure, and keep
+  // age-trigger as a fallback.
+  std::array<std::vector<FileMetaData*>, kL0PartitionCount>
+      partition_candidates;
+  std::array<size_t, kL0PartitionCount> partition_total_counts{};
+
+  for (FileMetaData* f : l0_files) {
+    if (f == nullptr || f->partition_id >= kL0PartitionCount) {
+      continue;
+    }
+    const uint32_t pid = f->partition_id;
+    ++partition_total_counts[pid];
+    if (!f->being_compacted) {
+      partition_candidates[pid].push_back(f);
+    }
+  }
+
+  auto oldest_candidate = [&](uint32_t pid) -> FileMetaData* {
+    if (pid >= kL0PartitionCount || partition_candidates[pid].empty()) {
+      return nullptr;
+    }
+    // L0 files are ordered newest -> oldest, so back() is oldest.
+    return partition_candidates[pid].back();
+  };
+
+  uint32_t target_partition = std::numeric_limits<uint32_t>::max();
+  uint64_t target_oldest_creation = std::numeric_limits<uint64_t>::max();
+  size_t target_partition_file_count = 0;
+  const char* trigger_mode = "None";
+
+  // 1) Partition pressure trigger.
+  for (uint32_t pid = 0; pid < kL0PartitionCount; ++pid) {
+    const auto& candidates = partition_candidates[pid];
+    if (candidates.size() < 2 ||
+        partition_total_counts[pid] < kPartitionL0TriggerCount) {
+      continue;
+    }
+    FileMetaData* oldest = oldest_candidate(pid);
+    uint64_t oldest_creation =
+        oldest == nullptr ? std::numeric_limits<uint64_t>::max()
+                          : oldest->file_creation_time;
+
+    if (target_partition == std::numeric_limits<uint32_t>::max() ||
+        partition_total_counts[pid] > target_partition_file_count ||
+        (partition_total_counts[pid] == target_partition_file_count &&
+         oldest_creation < target_oldest_creation)) {
+      target_partition = pid;
+      target_partition_file_count = partition_total_counts[pid];
+      target_oldest_creation = oldest_creation;
+      trigger_mode = "PartitionCount";
+    }
+  }
+
+  // 2) Age trigger fallback (still restricted to one partition at a time).
+  if (target_partition == std::numeric_limits<uint32_t>::max() &&
+      kL0TriggerAge > 0) {
+    for (uint32_t pid = 0; pid < kL0PartitionCount; ++pid) {
+      const auto& candidates = partition_candidates[pid];
+      if (candidates.size() < 2) {
+        continue;
+      }
+      FileMetaData* oldest = oldest_candidate(pid);
+      if (oldest == nullptr) {
+        continue;
+      }
+      const uint64_t creation = oldest->file_creation_time;
+      if (creation == 0 || creation == kUnknownFileCreationTime ||
+          now_sec <= creation + kL0TriggerAge) {
+        continue;
+      }
+      if (target_partition == std::numeric_limits<uint32_t>::max() ||
+          creation < target_oldest_creation ||
+          (creation == target_oldest_creation &&
+           partition_total_counts[pid] > target_partition_file_count)) {
+        target_partition = pid;
+        target_oldest_creation = creation;
+        target_partition_file_count = partition_total_counts[pid];
+        trigger_mode = "OldestAge";
+      }
+    }
+  }
+
+  if (target_partition == std::numeric_limits<uint32_t>::max()) {
     return false;
   }
 
-  // 查找一个未被锁定的连续 block
-  // 从后向前寻找最老的可以做 Compaction 的 batch
-  size_t current_pick_count = 0;
-  start_level_inputs_.files.clear();
-  for (int i = static_cast<int>(total_files) - 1; i >= 0; --i) {
-    if (l0_files[i]->being_compacted) {
-      if (current_pick_count > 0) {
-          // 遇到被锁定的且之前已经攒了一部分?
-          current_pick_count = 0;
-          start_level_inputs_.files.clear();
-      }
-      continue;
-    }
-    
-    start_level_inputs_.files.push_back(l0_files[i]);
-    current_pick_count++;
-    if (current_pick_count == kFilesToPick) {
-        break;
-    }
+  const auto& candidates = partition_candidates[target_partition];
+  for (auto it = candidates.rbegin();
+       it != candidates.rend() && start_level_inputs_.files.size() < kFilesToPick;
+       ++it) {
+    start_level_inputs_.files.push_back(*it);
   }
 
-  if (current_pick_count == 0) {
-      return false;
+  if (start_level_inputs_.files.size() < 2) {
+    start_level_inputs_.clear();
+    return false;
   }
 
-  // 如果这波不足 kFilesToPick 且不是触发 time，则放弃这次尝试
-  if (!trigger_by_time && current_pick_count < kFilesToPick) {
-      start_level_inputs_.files.clear();
-      return false;
-  }
+  compaction_reason_ = CompactionReason::kLevelL0FilesNum;
 
-  // reverse list
-  std::reverse(start_level_inputs_.files.begin(), start_level_inputs_.files.end());
-
-  start_level_ = 0;
-  output_level_ = 0; // L0 -> L0
-  start_level_inputs_.level = 0;
-  compaction_reason_ = CompactionReason::kLevelL0FilesNum; // 借用Reason
-
-  // fprintf(stderr, 
-  //     "[Delta-Opt] Picked Mixed L0 Compaction. Trigger: %s, Files: %zu, OutputLevel: 0", 
-  //     trigger_by_count ? "Count" : "Time", start_level_inputs_.size());
+  ROCKS_LOG_BUFFER(
+      log_buffer_,
+      "[Delta-Opt] Picked Mixed L0 Compaction. Trigger: %s, Partition: %u, "
+      "Files: %zu/%zu, L0Total: %zu, PartitionFileCount: %zu, "
+      "PartitionTriggerThreshold: %zu, OutputLevel: 0",
+      trigger_mode, target_partition, start_level_inputs_.size(),
+      candidates.size(), total_files, partition_total_counts[target_partition],
+      kPartitionL0TriggerCount);
 
   return true;
 }
@@ -658,6 +761,19 @@ Compaction* LevelCompactionBuilder::GetCompaction() {
   // compaction_inputs_[0].size() == 1 since SetupOtherL0FilesIfNeeded() did not
   // pull in more L0s.
   assert(!compaction_inputs_.empty());
+  if (mutable_cf_options_.delta_options.enable_partition) {
+    uint32_t partition_id = compaction_inputs_[0].files[0]->partition_id;
+    for (const auto& input_level : compaction_inputs_) {
+      for (const auto* f : input_level.files) {
+        if (f->partition_id != partition_id) {
+          ROCKS_LOG_BUFFER(
+              log_buffer_,
+              "[Delta-Opt] Skip compaction with mixed partitions");
+          return nullptr;
+        }
+      }
+    }
+  }
   bool l0_files_might_overlap =
       start_level_ == 0 && !is_l0_trivial_move_ &&
       (compaction_inputs_.size() > 1 || compaction_inputs_[0].size() > 1);

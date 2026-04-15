@@ -304,6 +304,14 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     char p = static_cast<char>(0);
     PutLengthPrefixedSlice(dst, Slice(&p, 1));
   }
+  // for delta
+  // 写入分区信息
+  if (f.partition_id != 0) {
+    PutVarint32(dst, NewFileCustomTag::kPartitionId);
+    std::string varint_partition_id;
+    PutVarint32(&varint_partition_id, f.partition_id);
+    PutLengthPrefixedSlice(dst, Slice(varint_partition_id));
+  }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
 
@@ -443,6 +451,14 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
           }
           f.user_defined_timestamps_persisted = (field[0] == 1);
           break;
+        case kPartitionId: {
+          uint32_t partition_id = 0;
+          if (!GetVarint32(&field, &partition_id)) {
+            return "invalid partition id";
+          }
+          f.partition_id = partition_id;
+          break;
+        }
         default:
           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
             // Should not proceed if cannot understand it

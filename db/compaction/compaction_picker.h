@@ -230,6 +230,7 @@ class CompactionPicker {
   bool GetOverlappingL0Files(VersionStorageInfo* vstorage,
                              CompactionInputFiles* start_level_inputs,
                              int output_level, int* parent_index,
+                             bool enable_partition,
                              const FileMetaData* starting_l0_file = nullptr);
 
   // Register this compaction in the set of running compactions
