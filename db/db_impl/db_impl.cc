@@ -59,6 +59,7 @@
 #include "db/write_batch_internal.h"
 #include "db/write_callback.h"
 #include "delta/hotspot_manager.h"
+#include "delta/diag_log.h"
 #include "env/unique_id_gen.h"
 #include "file/file_util.h"
 #include "file/filename.h"
@@ -7182,8 +7183,7 @@ void DBImpl::ProcessPendingPartialMerge() {
         &overlapping_deltas);
 
     // [DIAG_PM_RANGE] 简化版：仅输出 scan range 和 overlap 计数
-    fprintf(stderr,
-            "[DIAG_PM_RANGE] CUID %lu: scan=[%s - %s] "
+    DiagLogf("[DIAG_PM_RANGE] CUID %lu: scan=[%s - %s] "
             "overlap_snaps=%zu overlap_deltas=%zu scan_data=%zu\n",
             (unsigned long)task.cuid,
             FormatKeyDisplay(task.scan_first_key).c_str(),
@@ -7192,12 +7192,34 @@ void DBImpl::ProcessPendingPartialMerge() {
             overlapping_deltas.size(),
             task.scan_data.size());
 
+    // [DIAG_PM_DELTA_DUMP] 在 PM 开始时记录该 CUID 所有 delta 文件的完整范围，方便查找未被吸收的文件
+    {
+      HotIndexEntry _dump;
+      hotspot_manager_->GetIndexTable().GetEntry(task.cuid, &_dump);
+      DiagLogf("[DIAG_PM_DELTA_DUMP] CUID %lu: ALL deltas at PM start "
+               "(scan=[%s - %s], total_deltas=%zu):\n",
+               (unsigned long)task.cuid,
+               FormatKeyDisplay(task.scan_first_key).c_str(),
+               FormatKeyDisplay(task.scan_last_key).c_str(),
+               _dump.deltas.size());
+      for (size_t _i = 0; _i < _dump.deltas.size(); _i++) {
+        bool _in_overlap = false;
+        for (const auto& _od : overlapping_deltas)
+          if (_od.file_number == _dump.deltas[_i].file_number) { _in_overlap = true; break; }
+        DiagLogf("  delta[%zu] file=%lu [%s - %s] %s\n",
+                 _i, _dump.deltas[_i].file_number,
+                 FormatKeyDisplay(_dump.deltas[_i].first_key).c_str(),
+                 FormatKeyDisplay(_dump.deltas[_i].last_key).c_str(),
+                 _in_overlap ? "[IN_MERGE]" : "[NOT_IN_MERGE - out of scan range]");
+      }
+    }
+
     // 如果没有重叠数据，使用 FullReplace 逻辑
     if (overlapping_snaps.empty() && overlapping_deltas.empty()) {
       // PartialMerge 任务却找不到任何重叠数据，这是可疑状态，记录下来
       HotIndexEntry entry_dbg;
       hotspot_manager_->GetIndexTable().GetEntry(task.cuid, &entry_dbg);
-      fprintf(stderr, "[DIAG][PartialMerge] CUID %lu: NO overlapping data for scan=[%s - %s]. "
+      DiagLogf("[DIAG][PartialMerge] CUID %lu: NO overlapping data for scan=[%s - %s]. "
               "Snapshot segs=%zu deltas=%zu. Falling back to FullReplace.\n",
               (unsigned long)task.cuid,
               FormatKeyDisplay(task.scan_first_key).c_str(),
@@ -7266,7 +7288,28 @@ void DBImpl::ProcessPendingPartialMerge() {
     uint64_t gap_total = 0;
     std::string first_gap_start_key, first_gap_prev_key;
 
-    for (merging_iter->SeekToFirst(); merging_iter->Valid();
+    // [DIAG_PM_MERGE_START] 记录 merge iterator 的第一个 key 及其来源，便于发现
+    // "PM 从非最小 key 开始跑" 的问题（例如某个 delta 文件的 before-scan 部分被跳过）
+    merging_iter->SeekToFirst();
+    if (merging_iter->Valid()) {
+      uint64_t first_phys = merging_iter->GetPhysicalId();
+      const char* first_src = (first_phys == 0) ? "scandata" :
+          [&]() -> const char* {
+            for (const auto& s : overlapping_snaps)
+              if (s.file_number == first_phys) return "snapshot";
+            return "delta";
+          }();
+      DiagLogf("[DIAG_PM_MERGE_START] CUID %lu: merge iterator first key=%s "
+               "phys=%lu(%s)\n",
+               (unsigned long)task.cuid,
+               FormatKeyDisplay(merging_iter->key().ToString()).c_str(),
+               first_phys, first_src);
+    } else {
+      DiagLogf("[DIAG_PM_MERGE_START] CUID %lu: merge iterator EMPTY at SeekToFirst\n",
+               (unsigned long)task.cuid);
+    }
+
+    for (; merging_iter->Valid();
          merging_iter->Next()) {
       Slice key = merging_iter->key();
 
@@ -7334,8 +7377,7 @@ void DBImpl::ProcessPendingPartialMerge() {
                     if (seg.file_number == phys_id) return "snapshot";
                   return "delta";
                 }();
-            fprintf(stderr,
-                    "[DIAG_PM_MERGE_GAP] CUID %lu: FIRST GAP after %zu entries! "
+            DiagLogf("[DIAG_PM_MERGE_GAP] CUID %lu: FIRST GAP after %zu entries! "
                     "prev_rid=%lu(phys=%lu/%s), cur_rid=%lu(phys=%lu/%s), gap=%lu\n",
                     (unsigned long)task.cuid, written_count,
                     prev_row_id, prev_phys_id, prev_src,
@@ -7358,26 +7400,26 @@ void DBImpl::ProcessPendingPartialMerge() {
       written_count++;
       
       if (written_count == 1 || written_count % 300000 == 0) {
-         fprintf(stderr, "[DIAG_PM_MERGE] CUID %lu: Merging... count=%zu current_key=%s\n", 
+         DiagLogf("[DIAG_PM_MERGE] CUID %lu: Merging... count=%zu current_key=%s\n", 
                  (unsigned long)task.cuid, written_count, FormatKeyDisplay(key.ToString()).c_str());
       }
     }
 
     if (written_count > 0) {
-      fprintf(stderr, "[DIAG_PM_MERGE] CUID %lu: scan range=[%s - %s] merged_count=%zu\n",
+      DiagLogf("[DIAG_PM_MERGE] CUID %lu: scan range=[%s - %s] merged_count=%zu\n",
               (unsigned long)task.cuid,
               FormatKeyDisplay(task.scan_first_key).c_str(),
               FormatKeyDisplay(task.scan_last_key).c_str(),
               written_count);
-      fprintf(stderr, "[DIAG_PM_MERGE] CUID %lu: Merge finished. Count=%zu. First=%s, Last=%s\n",
+      DiagLogf("[DIAG_PM_MERGE] CUID %lu: Merge finished. Count=%zu. First=%s, Last=%s\n",
               (unsigned long)task.cuid, written_count, 
               FormatKeyDisplay(segment_first_key).c_str(),
               FormatKeyDisplay(segment_last_key).c_str());
-      fprintf(stderr, "[DIAG_PM_MERGE] CUID %lu: Sources: snapshot=%zu delta=%zu scandata=%zu dedup=%zu",
+      DiagLogf("[DIAG_PM_MERGE] CUID %lu: Sources: snapshot=%zu delta=%zu scandata=%zu dedup=%zu",
               (unsigned long)task.cuid, src_snapshot_count, src_delta_count, src_scandata_count, dedup_count);
       if (gap_total > 0) {
-        fprintf(stderr, "[DIAG_PM_MERGE_GAP] CUID %lu: TOTAL gap=%lu rows. "
-                "First gap after key %s → %s\n",
+        DiagLogf("[DIAG_PM_MERGE_GAP] CUID %lu: TOTAL gap=%lu rows. "
+                "First gap after key %s \u2192 %s\n",
                 (unsigned long)task.cuid, gap_total,
                 first_gap_prev_key.c_str(), first_gap_start_key.c_str());
       }
@@ -7390,8 +7432,7 @@ void DBImpl::ProcessPendingPartialMerge() {
       // [DIAG_PM_RANGE_UNDERCUT] 检测范围收缩情况
       if (icmp.user_comparator()->Compare(ExtractUserKey(segment_first_key), 
                                           ExtractUserKey(task.scan_first_key)) > 0) {
-        fprintf(stderr, 
-                "[DIAG_PM_RANGE_UNDERCUT] CUID %lu: segment_range=[%s - %s] "
+        DiagLogf("[DIAG_PM_RANGE_UNDERCUT] CUID %lu: segment_range=[%s - %s] "
                 "scan_range=[%s - %s] written=%zu\n",
                 (unsigned long)task.cuid,
                 FormatKeyDisplay(segment_first_key).c_str(),
@@ -7399,12 +7440,41 @@ void DBImpl::ProcessPendingPartialMerge() {
                 FormatKeyDisplay(task.scan_first_key).c_str(),
                 FormatKeyDisplay(task.scan_last_key).c_str(),
                 written_count);
-        fprintf(stderr, "  \xe2\x86\x92 PM output starts LATER than scan request! Possible data loss if obsolete deltas contained the prefix.\n");
+        DiagLogf("  \u2192 PM output starts LATER than scan request! Possible data loss if obsolete deltas contained the prefix.\n");
       }
-      // 收集需要清理的旧文件
+      // 收集需要清理的旧文件 + 精确计算每个被废弃文件中未被 PM 输出覆盖的行范围
+      // [DIAG_PM_LOST_ROWS]: PM_output=[segment_first_key, segment_last_key]
+      //   若某个 obsolete 文件的范围超出 PM output，超出部分行将永久丢失。
+      auto check_data_loss = [&](const std::string& file_first, const std::string& file_last,
+                                  uint64_t file_no, const char* file_type) {
+        const Slice pm_first_user = ExtractUserKey(Slice(segment_first_key));
+        const Slice pm_last_user  = ExtractUserKey(Slice(segment_last_key));
+        const Slice f_first_user  = ExtractUserKey(Slice(file_first));
+        const Slice f_last_user   = ExtractUserKey(Slice(file_last));
+        bool prefix_lost = icmp.user_comparator()->Compare(f_first_user, pm_first_user) < 0;
+        bool suffix_lost = icmp.user_comparator()->Compare(f_last_user,  pm_last_user)  > 0;
+        if (prefix_lost) {
+          DiagLogf("[DIAG_PM_LOST_ROWS] CUID %lu: %s file=%lu range=[%s-%s] "
+                   "PM_output=[%s-%s] → PREFIX [%s ~ %s] NOT IN PM OUTPUT → PERMANENT DATA LOSS!\n",
+                   (unsigned long)task.cuid, file_type, file_no,
+                   FormatKeyDisplay(file_first).c_str(), FormatKeyDisplay(file_last).c_str(),
+                   FormatKeyDisplay(segment_first_key).c_str(), FormatKeyDisplay(segment_last_key).c_str(),
+                   FormatKeyDisplay(file_first).c_str(), FormatKeyDisplay(segment_first_key).c_str());
+        }
+        if (suffix_lost) {
+          DiagLogf("[DIAG_PM_LOST_ROWS] CUID %lu: %s file=%lu range=[%s-%s] "
+                   "PM_output=[%s-%s] → SUFFIX [%s ~ %s] NOT IN PM OUTPUT → PERMANENT DATA LOSS!\n",
+                   (unsigned long)task.cuid, file_type, file_no,
+                   FormatKeyDisplay(file_first).c_str(), FormatKeyDisplay(file_last).c_str(),
+                   FormatKeyDisplay(segment_first_key).c_str(), FormatKeyDisplay(segment_last_key).c_str(),
+                   FormatKeyDisplay(segment_last_key).c_str(), FormatKeyDisplay(file_last).c_str());
+        }
+      };
+
       std::vector<uint64_t> obsolete_files;
       for (const auto& seg : overlapping_snaps) {
         if (seg.file_number != static_cast<uint64_t>(-1)) {
+          check_data_loss(seg.first_key, seg.last_key, seg.file_number, "snap");
           obsolete_files.push_back(seg.file_number);
         }
       }
@@ -7418,8 +7488,7 @@ void DBImpl::ProcessPendingPartialMerge() {
         bool extends_before = icmp.user_comparator()->Compare(delta_first_user, scan_first_user) < 0;
         bool extends_after  = icmp.user_comparator()->Compare(delta_last_user, scan_last_user) > 0;
         if (extends_before || extends_after) {
-          fprintf(stderr,
-              "[DIAG_PM_OBSOLETE_OVERFLOW] CUID %lu: delta file=%lu "
+          DiagLogf("[DIAG_PM_OBSOLETE_OVERFLOW] CUID %lu: delta file=%lu "
               "range=[%s - %s] EXTENDS BEYOND scan range=[%s - %s] "
               "(before=%d after=%d). "
               "Marking obsolete will cause L0 Compaction to skip ALL data!\n",
@@ -7430,6 +7499,7 @@ void DBImpl::ProcessPendingPartialMerge() {
               FormatKeyDisplay(task.scan_last_key).c_str(),
               (int)extends_before, (int)extends_after);
         }
+        check_data_loss(seg.first_key, seg.last_key, seg.file_number, "delta");
         obsolete_files.push_back(seg.file_number);
       }
 
@@ -7474,8 +7544,7 @@ void DBImpl::ProcessPendingPartialMerge() {
     } else {
       // written_count==0：归并有overlapping数据却无输出（异常状态）。
       // 无 -1 段建立，FinalizePmPendingSnapshots 会顷 AppendSnapshotSegment 兜底。
-      fprintf(stderr,
-              "[DIAG][PartialMerge] CUID %lu: written_count=0 after merge "
+      DiagLogf("[DIAG][PartialMerge] CUID %lu: written_count=0 after merge "
               "with overlapping data. This is unexpected.\n",
               (unsigned long)task.cuid);
       hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);

@@ -16,6 +16,7 @@
 #include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
 #include "delta/hotspot_manager.h"
+#include "delta/diag_log.h"
 #include "logging/logging.h"
 #include "port/likely.h"
 #include "rocksdb/listener.h"
@@ -491,8 +492,7 @@ void CompactionIterator::CheckHotspotFilters() {
       // update：MVCC 如果该 CUID 的逻辑删除早于系统当前最老的快照再标记删除？
       if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid, earliest_snapshot_)) {
         skip_current_cuid_ = true;
-        fprintf(stderr,
-                "[DIAG_COMPACTION_SKIP] CUID %lu: file=%lu skipped"
+        DiagLogf("[DIAG_COMPACTION_SKIP] CUID %lu: file=%lu skipped"
                 " (CUID marked deleted)\n",
                 cuid, file_id);
       } 
@@ -505,14 +505,22 @@ void CompactionIterator::CheckHotspotFilters() {
           // 打印首条被跳过 key 的信息，便于与 DIAG_COMPACTION_SPARSE 交叉验证
           Slice skip_key = input_.key();
           uint64_t skip_rid = 0;
+          std::string skip_key_hex;
           if (skip_key.size() >= 34) {
             std::string rid_str = skip_key.ToString().substr(24, 10);
             try { skip_rid = std::stoull(rid_str); } catch (...) {}
+            // 输出 bytes 16-34 (CUID + row_id) 的 hex 表示，用于验证 rid 提取是否正确
+            const unsigned char* kd = reinterpret_cast<const unsigned char*>(skip_key.data());
+            char hex_buf[64];
+            snprintf(hex_buf, sizeof(hex_buf),
+                     "%02x%02x%02x%02x%02x%02x%02x%02x|%s",
+                     kd[16], kd[17], kd[18], kd[19], kd[20], kd[21], kd[22], kd[23],
+                     rid_str.c_str());
+            skip_key_hex = hex_buf;
           }
-          fprintf(stderr,
-                  "[DIAG_COMPACTION_SKIP] CUID %lu: file=%lu skipped"
-                  " (obsolete delta), first_skipped_rid=%lu\n",
-                  cuid, file_id, skip_rid);
+          DiagLogf("[DIAG_COMPACTION_SKIP] CUID %lu: file=%lu skipped"
+                  " (obsolete delta), first_skipped_rid=%lu key_hex=[%s]\n",
+                  cuid, file_id, skip_rid, skip_key_hex.c_str());
         }
       }
     }

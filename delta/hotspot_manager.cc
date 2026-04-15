@@ -9,6 +9,8 @@
 #include <cinttypes>
 #include <sstream>
 
+#include "delta/diag_log.h"
+
 #include "db/dbformat.h"
 #include "logging/logging.h"
 #include "port/port.h"
@@ -38,6 +40,8 @@ HotspotManager::HotspotManager(const Options& db_options,
   RecoverGDCT();
   // 初始化持久化日志 AppendableWriter
   InitGDCTLog();
+  // 独立诊断日志文件（关键事件持久化，防止终端滚动丢失）
+  DiagLogOpen((data_dir_ + "/delta_diag.log").c_str());
 }
 
 uint64_t HotspotManager::ExtractCUID(const Slice& key) {
@@ -112,7 +116,7 @@ bool HotspotManager::BufferHotData(uint64_t cuid, const Slice& key,
     auto it = diag_last_appended_row_id.find(cuid);
     if (it != diag_last_appended_row_id.end() && it->second != 0) {
       if (it->second + 1 != curr_id && it->second < curr_id && curr_id - it->second < 50000) {
-        fprintf(stderr, "[DIAG_APPEND_GAP] CUID %lu GAP detected on append! "
+        DiagLogf("[DIAG_APPEND_GAP] CUID %lu GAP detected on append! "
                 "Prev: %lu, Curr: %lu. Missing: %lu\n",
                 cuid, it->second, curr_id, it->second + 1);
       }
@@ -440,7 +444,7 @@ Status HotspotManager::FlushBlockToSharedSST(
     auto it = diag_last_flushed_row_id.find(current_cuid);
     if (it != diag_last_flushed_row_id.end()) {
       if (it->second != 0 && first_id != 0 && it->second + 1 != first_id && it->second < first_id) {
-         fprintf(stderr, "[DIAG_FLUSH_ACROSS_GAP] CUID %lu GAP detected across flushes! "
+         DiagLogf("[DIAG_FLUSH_ACROSS_GAP] CUID %lu GAP detected across flushes! "
                  "Last flushed: %lu, This flush starts at: %lu. Missing: %lu\n",
                  current_cuid, it->second, first_id, it->second + 1);
       }
@@ -493,8 +497,7 @@ Status HotspotManager::FlushBlockToSharedSST(
           segment.first_key = written_entries[seg_start_idx].internal_key;
           segment.last_key = written_entries[i - 1].internal_key;
           cuid_segments.push_back(segment);
-          fprintf(stderr,
-                  "[DIAG_FLUSH_GAP_SPLIT] CUID %lu: Split at gap! "
+          DiagLogf("[DIAG_FLUSH_GAP_SPLIT] CUID %lu: Split at gap! "
                   "prev_rid=%lu curr_rid=%lu gap=%lu. "
                   "Segment [%s - %s] (%zu entries)\n",
                   current_cuid, prev_rid, curr_rid,
@@ -513,16 +516,39 @@ Status HotspotManager::FlushBlockToSharedSST(
       cuid_segments.push_back(last_segment);
 
       if (cuid_segments.size() > 1) {
-        fprintf(stderr,
-                "[DIAG_FLUSH_GAP_SPLIT] CUID %lu: Total %zu segments from %d entries\n",
+        DiagLogf("[DIAG_FLUSH_GAP_SPLIT] CUID %lu: Total %zu segments from %d entries\n",
                 current_cuid, cuid_segments.size(), written_count);
+        // Dump current snapshot & delta state so post-mortem can see what rows
+        // are supposed to exist in SST vs. buffer when this gap formed.
+        HotIndexEntry _snap_entry;
+        if (index_table_.GetEntry(current_cuid, &_snap_entry)) {
+          DiagLogf("[DIAG_FLUSH_GAP_SPLIT_SNAP] CUID %lu: at flush time: "
+                   "%zu snapshot_segs, %zu deltas, %zu obsolete_deltas\n",
+                   current_cuid,
+                   _snap_entry.snapshot_segments.size(),
+                   _snap_entry.deltas.size(),
+                   _snap_entry.obsolete_deltas.size());
+          for (size_t _si = 0; _si < _snap_entry.snapshot_segments.size(); _si++) {
+            const auto& _s = _snap_entry.snapshot_segments[_si];
+            DiagLogf("[DIAG_FLUSH_GAP_SPLIT_SNAP] CUID %lu:   snap[%zu] file=%lu [%s - %s]\n",
+                     current_cuid, _si, _s.file_number,
+                     FormatKeyDisplay(_s.first_key).c_str(),
+                     FormatKeyDisplay(_s.last_key).c_str());
+          }
+          for (size_t _di = 0; _di < _snap_entry.deltas.size(); _di++) {
+            const auto& _d = _snap_entry.deltas[_di];
+            DiagLogf("[DIAG_FLUSH_GAP_SPLIT_SNAP] CUID %lu:   delta[%zu] file=%lu [%s - %s]\n",
+                     current_cuid, _di, _d.file_number,
+                     FormatKeyDisplay(_d.first_key).c_str(),
+                     FormatKeyDisplay(_d.last_key).c_str());
+          }
+        }
       }
 
       // [DIAG] detect dedup loss during flush
       size_t bucket_size = bucket_entries.size();
       if (bucket_size != static_cast<size_t>(written_count)) {
-        fprintf(stderr,
-                "[DIAG_FLUSH_DEDUP] CUID %lu: bucket_entries=%zu "
+        DiagLogf("[DIAG_FLUSH_DEDUP] CUID %lu: bucket_entries=%zu "
                 "written_count=%d dedup_dropped=%zu\n",
                 current_cuid, bucket_size, written_count,
                 bucket_size - written_count);
@@ -608,8 +634,7 @@ void HotspotManager::TriggerBufferFlush(const char* source,
             std::lock_guard<std::mutex> lk(pending_mutex_);
             if (pending_snapshots_.count(cuid)) split_ctx = "InitScan";
           }
-          fprintf(stderr,
-                  "[DIAG_FLUSH_GAP_SPLIT_CTX] CUID %lu: %zu segments from "
+          DiagLogf("[DIAG_FLUSH_GAP_SPLIT_CTX] CUID %lu: %zu segments from "
                   "gap-split (ctx=%s)\n",
                   cuid, kv.second.size(), split_ctx);
         }
@@ -624,8 +649,7 @@ void HotspotManager::TriggerBufferFlush(const char* source,
 
           // [DIAG] log every PromoteSnapshot result for hot CUIDs
           if (frequency_table_.IsHot(cuid)) {
-            fprintf(stderr,
-                    "[DIAG_FLUSH_PROMOTE] CUID %lu: SST file=%lu [%s - %s] "
+            DiagLogf("[DIAG_FLUSH_PROMOTE] CUID %lu: SST file=%lu [%s - %s] "
                     "promoted=%d phys_overlap=%d source=%s\n",
                     cuid, real_segment.file_number,
                     FormatKeyDisplay(real_segment.first_key).c_str(),
@@ -642,8 +666,7 @@ void HotspotManager::TriggerBufferFlush(const char* source,
             std::lock_guard<std::mutex> pm_lock(pm_pending_mutex_);
             if (pm_pending_snapshots_.count(cuid)) {
               pm_promoted_snapshots_[cuid].push_back(real_segment);
-              fprintf(stderr,
-                      "[DIAG_FLUSH_PROMOTE_TRACKED] CUID %lu: SST file=%lu [%s - %s]"
+              DiagLogf("[DIAG_FLUSH_PROMOTE_TRACKED] CUID %lu: SST file=%lu [%s - %s]"
                       " → pm_promoted_snapshots (preserved by AtomicReplace)\n",
                       cuid, real_segment.file_number,
                       FormatKeyDisplay(real_segment.first_key).c_str(),
@@ -663,8 +686,7 @@ void HotspotManager::TriggerBufferFlush(const char* source,
                 pm_it->second.push_back(real_segment);
                 lifecycle_manager_->Ref(real_segment.file_number);
                 intercepted = true;
-                fprintf(stderr,
-                        "[DIAG_FLUSH_INTERCEPT] CUID %lu: SST file=%lu → pm_pending "
+                DiagLogf("[DIAG_FLUSH_INTERCEPT] CUID %lu: SST file=%lu → pm_pending "
                         "(pm_pending_count=%zu)\n",
                         cuid, real_segment.file_number, pm_it->second.size());
               }
@@ -682,8 +704,7 @@ void HotspotManager::TriggerBufferFlush(const char* source,
                 it->second.push_back(real_segment);
                 lifecycle_manager_->Ref(real_segment.file_number);
                 intercepted = true;
-                fprintf(stderr,
-                        "[DIAG_FLUSH_INTERCEPT] CUID %lu: SST file=%lu → init_pending "
+                DiagLogf("[DIAG_FLUSH_INTERCEPT] CUID %lu: SST file=%lu → init_pending "
                         "(pending_count=%zu)\n",
                         cuid, real_segment.file_number, it->second.size());
               }
@@ -694,8 +715,7 @@ void HotspotManager::TriggerBufferFlush(const char* source,
                 // 仅物理段重叠，无活跃 PM/InitScan：SST 与已有物理段冗余，
                 // 安全跳过（数据已在物理段中），不执行 AppendSnapshotSegment
                 // 以免产生重叠段
-                fprintf(stderr,
-                        "[DIAG][TriggerBufferFlush] CUID %lu: SST file=%lu "
+                DiagLogf("[DIAG][TriggerBufferFlush] CUID %lu: SST file=%lu "
                         "[%s - %s] has PHYS_OVERLAP only, no active PM/InitScan. "
                         "Skipping (data already in physical segment).\n",
                         cuid, real_segment.file_number,
@@ -743,8 +763,7 @@ void HotspotManager::TriggerBufferFlush(const char* source,
                   ExtractUserKey(chk_buf_min),
                   ExtractUserKey(seg.last_key)) <= 0;
           if (!seg_backed) {
-            fprintf(stderr,
-                    "[DIAG_WARN_ORPHAN_MEM_SEG] CUID %lu: "
+            DiagLogf("[DIAG_WARN_ORPHAN_MEM_SEG] CUID %lu: "
                     "-1 segment [%s - %s] has NO buffer backing after flush! "
                     "(has_buf=%d buf_range=[%s - %s])\n",
                     flushed_cuid,
@@ -835,18 +854,17 @@ void HotspotManager::FinalizeScanAsCompaction(
       uint64_t rid_b = ExtractRowID(fb.first_key);
       if (rid_a != 0 && rid_b != 0 && rid_a + 1 != rid_b) {
         const char* issue = (rid_a >= rid_b) ? "OVERLAP" : "GAP";
-        fprintf(stderr,
-                "[DIAGNOSE_FATAL] FinalizeScanAsCompaction_PendingSSTs %s! "
+        DiagLogf("[DIAGNOSE_FATAL] FinalizeScanAsCompaction_PendingSSTs %s! "
                 "CUID %lu Seg[%zu](file=%lu last_id=%lu) -> "
                 "Seg[%zu](file=%lu first_id=%lu) missing=%lu\n",
                 issue, cuid,
                 i,     fa.file_number, rid_a,
                 i + 1, fb.file_number, rid_b,
                 (rid_a < rid_b) ? (rid_b - rid_a - 1) : 0);
-        fprintf(stderr, "  Seg[%zu] [%s - %s]\n", i,
+        DiagLogf("  Seg[%zu] [%s - %s]\n", i,
                 FormatKeyDisplay(fa.first_key).c_str(),
                 FormatKeyDisplay(fa.last_key).c_str());
-        fprintf(stderr, "  Seg[%zu] [%s - %s]\n", i + 1,
+        DiagLogf("  Seg[%zu] [%s - %s]\n", i + 1,
                 FormatKeyDisplay(fb.first_key).c_str(),
                 FormatKeyDisplay(fb.last_key).c_str());
       }
@@ -888,18 +906,17 @@ void HotspotManager::FinalizeScanAsCompaction(
       // 连续性：相邻段的行 ID 应恰好相差 1
       if (last_id != 0 && next_id != 0 && last_id + 1 != next_id) {
         const char* issue = (last_id >= next_id) ? "OVERLAP" : "GAP";
-        fprintf(stderr,
-                "[DIAGNOSE_FATAL] FinalizeScanAsCompaction %s detected! "
+        DiagLogf("[DIAGNOSE_FATAL] FinalizeScanAsCompaction %s detected! "
                 "CUID %lu Seg[%zu](file=%lu last_id=%lu) -> "
                 "Seg[%zu](file=%lu first_id=%lu) missing=%lu\n",
                 issue, cuid,
                 i,   s1.file_number, last_id,
                 i+1, s2.file_number, next_id,
                 (last_id < next_id) ? (next_id - last_id - 1) : 0);
-        fprintf(stderr, "  Seg[%zu] [%s - %s]\n",
+        DiagLogf("  Seg[%zu] [%s - %s]\n",
                 i,   FormatKeyDisplay(s1.first_key).c_str(),
                      FormatKeyDisplay(s1.last_key).c_str());
-        fprintf(stderr, "  Seg[%zu] [%s - %s]\n",
+        DiagLogf("  Seg[%zu] [%s - %s]\n",
                 i+1, FormatKeyDisplay(s2.first_key).c_str(),
                      FormatKeyDisplay(s2.last_key).c_str());
       }
@@ -1180,8 +1197,7 @@ void HotspotManager::FinalizePmPendingSnapshots(uint64_t cuid) {
     bool promoted = index_table_.PromoteSnapshot(
         cuid, seg, &buffer_, internal_comparator_);
     if (!promoted) {
-      fprintf(stderr,
-              "[DIAG][FinalizePmPending] CUID %lu: PromoteSnapshot failed for "
+      DiagLogf("[DIAG][FinalizePmPending] CUID %lu: PromoteSnapshot failed for "
               "pm_pending SST file=%lu [%s - %s], falling back to Append.\n",
               cuid, seg.file_number,
               FormatKeyDisplay(seg.first_key).c_str(),

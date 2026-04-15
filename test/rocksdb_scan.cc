@@ -294,6 +294,86 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
   }
 }
 
+// 每隔 60 秒对每个 CUID 执行全量 scan，验证所有行均可见。
+// 使用 is_metadata_scan=true：走热点路径（读 delta/buffer）但不触发 ScanAsCompaction。
+void VerifyThread(DB* db, const std::vector<uint64_t>& cuids) {
+  while (!stop_test) {
+    // 等待 60 秒，每秒检查一次 stop_test
+    for (int i = 0; i < 60 && !stop_test; i++) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    if (stop_test) break;
+
+    std::cout << "[VERIFY] Starting full-range integrity check for all CUIDs..."
+              << std::endl;
+
+    for (uint64_t cuid : cuids) {
+      // 获取当前期望行的快照（取有序 vector 以便确定扫描范围）
+      std::vector<uint64_t> expected_vec;
+      {
+        std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
+        expected_vec.assign(ground_truths[cuid]->row_ids.begin(),
+                            ground_truths[cuid]->row_ids.end());
+      }
+      if (expected_vec.empty()) continue;
+
+      uint64_t start_row = expected_vec.front();
+      uint64_t end_row   = expected_vec.back() + 1;  // upper_bound exclusive
+
+      std::string start_key   = GenerateKey(cuid, start_row);
+      std::string upper_bound = GenerateKey(cuid, end_row);
+      Slice ub_slice(upper_bound);
+
+      ReadOptions ro;
+      ro.is_metadata_scan = true;  // 走热点路径但不触发 ScanAsCompaction
+      ro.delta_full_scan        = false;
+      ro.enable_delta_diag_logging = false;
+      ro.iterate_upper_bound    = &ub_slice;
+
+      std::set<uint64_t> found;
+      std::unique_ptr<Iterator> it(db->NewIterator(ro));
+      for (it->Seek(start_key); it->Valid(); it->Next()) {
+        if (ExtractCUID(it->key()) != cuid) break;
+        found.insert(ExtractRowID(it->key()));
+      }
+
+      if (!it->status().ok()) {
+        std::cerr << "[VERIFY] CUID " << cuid
+                  << " scan error: " << it->status().ToString() << std::endl;
+        global_stats.errors++;
+        continue;
+      }
+
+      // 比对：找出所有期望存在但实际未读到的行
+      std::vector<uint64_t> missing;
+      for (uint64_t rid : expected_vec) {
+        if (found.find(rid) == found.end()) {
+          missing.push_back(rid);
+        }
+      }
+
+      if (!missing.empty()) {
+        std::cerr << "[VERIFY] *** CUID " << cuid << ": " << missing.size()
+                  << " MISSING rows! range=[" << start_row << "," << end_row
+                  << ") expected=" << expected_vec.size()
+                  << " found=" << found.size() << std::endl;
+        size_t report_n = std::min(missing.size(), (size_t)5);
+        for (size_t i = 0; i < report_n; i++) {
+          std::cerr << "[VERIFY]   missing rid=" << missing[i] << std::endl;
+        }
+        if (missing.size() > 5) {
+          std::cerr << "[VERIFY]   ... and " << (missing.size() - 5)
+                    << " more missing rows" << std::endl;
+        }
+        global_stats.errors += missing.size();
+      } else {
+        std::cout << "[VERIFY] CUID " << cuid << ": OK  "
+                  << found.size() << " rows verified." << std::endl;
+      }
+    }
+  }
+}
+
 void ManagerThread(DBImpl* db_impl) {
   auto hotspot_mgr = db_impl->GetHotspotManager();
   while (!stop_test) {
@@ -373,6 +453,7 @@ int main() {
   std::thread reader2(ReaderThread, db, cuids, 2);
   std::thread reader3(ReaderThread, db, cuids, 3);
   std::thread reader4(ReaderThread, db, cuids, 4);
+  std::thread verifier(VerifyThread, db, cuids);
   std::thread manager(ManagerThread, db_impl);
 
   auto start_time = std::chrono::steady_clock::now();
@@ -393,6 +474,7 @@ int main() {
   reader2.join();
   reader3.join();
   reader4.join();
+  verifier.join();
   manager.join();
 
   std::cout << "Stress Test Completed." << std::endl;

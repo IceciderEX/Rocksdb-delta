@@ -26,6 +26,8 @@
 #include "db/version_edit.h"
 #include "db/version_set.h"
 #include "delta/hotspot_manager.h"
+#include "delta/diag_log.h"
+#include "util/extract_cuid.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "logging/event_logger.h"
@@ -1098,6 +1100,12 @@ Status FlushJob::WriteLevel0Table() {
             if (seg.Valid() && db_options_.hotspot_manager->IsHot(cuid)) {
                 db_options_.hotspot_manager->GetIndexTable().AddDelta(cuid, seg);
                 registered_count++;
+                // 记录到诊断日志：此迹是追查》郣失数据属于哪个文件、什么范围的最关键一条日志
+                DiagLogf("[DIAG_DELTA_REGISTERED] CUID %lu: file=%lu registered"
+                         " first_key=[%s] last_key=[%s]\n",
+                         cuid, file_number,
+                         FormatKeyDisplay(seg.first_key).c_str(),
+                         FormatKeyDisplay(seg.last_key).c_str());
             }
         }
         

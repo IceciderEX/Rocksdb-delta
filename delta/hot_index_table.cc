@@ -1,5 +1,6 @@
 #include "delta/hot_index_table.h"
 
+#include "delta/diag_log.h"
 #include "util/extract_cuid.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -29,12 +30,12 @@ static bool DetectSnapshotGap(uint64_t cuid, const std::vector<DataSegment>& seg
     uint64_t last_id = ExtractRowID(segments[i].last_key);
     uint64_t next_id = ExtractRowID(segments[i+1].first_key);
     if (last_id != 0 && next_id != 0 && last_id + 1 != next_id && last_id < next_id) {
-      fprintf(stderr, "[DIAG_GAP_DETECTED] CUID %lu [%s] GAP between Seg%zu and Seg%zu! "
+      DiagLogf("[DIAG_GAP_DETECTED] CUID %lu [%s] GAP between Seg%zu and Seg%zu! "
               "Last (File %lu): %lu, Next (File %lu): %lu. Missing: %lu\n",
-              cuid, context, i, i+1, segments[i].file_number, last_id, 
+              cuid, context, i, i+1, segments[i].file_number, last_id,
               segments[i+1].file_number, next_id, last_id + 1);
       for (size_t j = 0; j < segments.size(); ++j) {
-        fprintf(stderr, "  Seg%zu: File %lu, Range [%s, %s]\n", j, segments[j].file_number,
+        DiagLogf("  Seg%zu: File %lu, Range [%s, %s]\n", j, segments[j].file_number,
                 FormatKeyDisplay(segments[j].first_key).c_str(),
                 FormatKeyDisplay(segments[j].last_key).c_str());
       }
@@ -52,6 +53,13 @@ static bool HasActualDataInBuffer(uint64_t cuid, const std::string& start,
   std::unique_ptr<InternalIterator> iter(buffer->NewIterator(cuid, icmp));
   iter->Seek(start);
 
+  // 跳过边界行本身：start 通常是相邻 segment 的 last_key，已由该 segment 的 SST 覆盖。
+  // 若 Seek 落在 start 本身，需前进一步，否则 HasActualDataInBuffer 会因边界行
+  // 而对 gap 区间 (start, end) 产生假阳性，导致空洞 remnant -1 segment 被错误保留。
+  if (iter->Valid() && icmp->Compare(iter->key(), start) == 0) {
+    iter->Next();
+  }
+
   // 如果找到的第一个 Key 已经超过了范围终点，则说明区间内无数据
   return iter->Valid() && icmp->Compare(iter->key(), end) < 0;
 }
@@ -67,16 +75,16 @@ void HotIndexTable::UpdateSnapshot(
     if (entry.HasSnapshot()) {
       // 检测新 snapshot 是否有 GAP，有则打印完整上下文
       if (DetectSnapshotGap(cuid, new_segments, "UpdateSnapshot")) {
-        fprintf(stderr, "[DIAG][UpdateSnapshot] CUID %lu: %zu old segs -> %zu new segs (GAP above)\n",
+        DiagLogf("[DIAG][UpdateSnapshot] CUID %lu: %zu old segs -> %zu new segs (GAP above)\n",
                 cuid, entry.snapshot_segments.size(), new_segments.size());
         for (size_t i = 0; i < entry.snapshot_segments.size(); ++i) {
-          fprintf(stderr, "  old[%zu] file=%lu [%s - %s]\n", i,
+          DiagLogf("  old[%zu] file=%lu [%s - %s]\n", i,
                   entry.snapshot_segments[i].file_number,
                   FormatKeyDisplay(entry.snapshot_segments[i].first_key).c_str(),
                   FormatKeyDisplay(entry.snapshot_segments[i].last_key).c_str());
         }
         for (size_t i = 0; i < new_segments.size(); ++i) {
-          fprintf(stderr, "  new[%zu] file=%lu [%s - %s]\n", i,
+          DiagLogf("  new[%zu] file=%lu [%s - %s]\n", i,
                   new_segments[i].file_number,
                   FormatKeyDisplay(new_segments[i].first_key).c_str(),
                   FormatKeyDisplay(new_segments[i].last_key).c_str());
@@ -101,7 +109,7 @@ void HotIndexTable::UpdateSnapshot(
 
 void HotIndexTable::AppendSnapshotSegment(uint64_t cuid,
                                           const DataSegment& segment) {
-  fprintf(stderr, "[DIAG][AppendSnapshotSegment] CUID %lu: file=%lu [%s - %s]\n",
+  DiagLogf("[DIAG][AppendSnapshotSegment] CUID %lu: file=%lu [%s - %s]\n",
           cuid, segment.file_number,
           FormatKeyDisplay(segment.first_key).c_str(),
           FormatKeyDisplay(segment.last_key).c_str());
@@ -185,7 +193,7 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
           left.last_key = new_segment.first_key;
           next_segments.push_back(left);
         } else {
-          fprintf(stderr, "[DIAG_CLIP_LEFT] CUID %lu: Mem Seg left remnant discarded! Range: [%s - %s). Keep = false\n",
+          DiagLogf("[DIAG_CLIP_LEFT] CUID %lu: Mem Seg left remnant discarded! Range: [%s - %s). Keep = false\n",
                   cuid, FormatKeyDisplay(seg.first_key).c_str(), FormatKeyDisplay(new_segment.first_key).c_str());
         }
       }
@@ -197,11 +205,11 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
           DataSegment right = seg;
           right.first_key = new_segment.last_key;
           next_segments.push_back(right);
-          fprintf(stderr, "[DIAG][PromoteSnapshot] CUID %lu: RIGHT remnant KEPT [%s - %s)\n",
+          DiagLogf("[DIAG][PromoteSnapshot] CUID %lu: RIGHT remnant KEPT [%s - %s)\n",
                   cuid, FormatKeyDisplay(new_segment.last_key).c_str(),
                   FormatKeyDisplay(seg.last_key).c_str());
         } else {
-          fprintf(stderr, "[DIAG_CLIP_RIGHT] CUID %lu: Mem Seg right remnant discarded! Range: [%s - %s). Keep = false\n",
+          DiagLogf("[DIAG_CLIP_RIGHT] CUID %lu: Mem Seg right remnant discarded! Range: [%s - %s). Keep = false\n",
                   cuid, FormatKeyDisplay(new_segment.last_key).c_str(), FormatKeyDisplay(seg.last_key).c_str());
         }
       }
@@ -242,13 +250,13 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
 
     // GAP 检测：排序后检测是否有间隙
     if (DetectSnapshotGap(cuid, next_segments, "PromoteSnapshot")) {
-      fprintf(stderr, "[DIAG][PromoteSnapshot] CUID %lu: GAP! newSST file=%lu [%s - %s]. Clipped mem segs=%zu\n",
+      DiagLogf("[DIAG][PromoteSnapshot] CUID %lu: GAP! newSST file=%lu [%s - %s]. Clipped mem segs=%zu\n",
               cuid, new_segment.file_number,
               FormatKeyDisplay(new_segment.first_key).c_str(),
               FormatKeyDisplay(new_segment.last_key).c_str(),
               clipped_mem_segments.size());
       for (size_t i = 0; i < clipped_mem_segments.size(); ++i) {
-        fprintf(stderr, "  clipped_mem[%zu] [%s - %s]\n", i,
+        DiagLogf("  clipped_mem[%zu] [%s - %s]\n", i,
                 FormatKeyDisplay(clipped_mem_segments[i].first_key).c_str(),
                 FormatKeyDisplay(clipped_mem_segments[i].last_key).c_str());
       }
@@ -265,7 +273,7 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
     }
   } else if (found_phys_overlap) {
     // 新 SST 与物理段重叠但未被加入 snapshot：记录以便排查数据丢失
-    fprintf(stderr, "[DIAG][PromoteSnapshot] CUID %lu: PHYS_OVERLAP_ONLY newSST file=%lu [%s - %s] skipped (no -1 seg matched)\n",
+    DiagLogf("[DIAG][PromoteSnapshot] CUID %lu: PHYS_OVERLAP_ONLY newSST file=%lu [%s - %s] skipped (no -1 seg matched)\n",
             cuid, new_segment.file_number,
             FormatKeyDisplay(new_segment.first_key).c_str(),
             FormatKeyDisplay(new_segment.last_key).c_str());
@@ -343,8 +351,7 @@ void HotIndexTable::MarkDeltasAsObsolete(
   for (auto d_it = entry.deltas.begin(); d_it != entry.deltas.end();) {
     if (visited_files.count(d_it->file_number)) {
       matched_files.insert(d_it->file_number);
-      fprintf(stderr,
-              "[DIAG_MARK_OBSOLETE] CUID %lu: delta file=%lu [%s - %s]"
+      DiagLogf("[DIAG_MARK_OBSOLETE] CUID %lu: delta file=%lu [%s - %s]"
               " moved to obsolete_deltas\n",
               cuid, d_it->file_number,
               FormatKeyDisplay(d_it->first_key).c_str(),
@@ -363,16 +370,14 @@ void HotIndexTable::MarkDeltasAsObsolete(
     if (matched_files.count(fid)) continue;
     DataSegment dummy;
     dummy.file_number = fid;
-    fprintf(stderr,
-            "[DIAG_MARK_OBSOLETE] CUID %lu: visited file=%lu NOT in deltas"
+    DiagLogf("[DIAG_MARK_OBSOLETE] CUID %lu: visited file=%lu NOT in deltas"
             " -> dummy obsolete entry (pre-hotspot SST)\n",
             cuid, fid);
     entry.obsolete_deltas.push_back(dummy);
   }
 
   size_t dummy_count = visited_files.size() - matched_files.size();
-  fprintf(stderr,
-          "[DIAG_MARK_OBSOLETE] CUID %lu: summary: visited=%zu"
+  DiagLogf("[DIAG_MARK_OBSOLETE] CUID %lu: summary: visited=%zu"
           " matched_from_deltas=%zu dummy_added=%zu total_obsolete_now=%zu\n",
           cuid, visited_files.size(), matched_files.size(), dummy_count,
           entry.obsolete_deltas.size());
@@ -607,8 +612,7 @@ void HotIndexTable::ReplaceOverlappingSegments(
     if (icmp_->user_comparator()->Compare(
             ExtractUserKey(new_segment.first_key),
             ExtractUserKey(new_segment.last_key)) == 0) {
-      fprintf(stderr,
-              "[DIAG_SINGLE_KEY_SEG] CUID %lu: New single-key segment [%s] "
+      DiagLogf("[DIAG_SINGLE_KEY_SEG] CUID %lu: New single-key segment [%s] "
               "added.\n",
               cuid, FormatKeyDisplay(new_segment.first_key).c_str());
     }
@@ -624,18 +628,18 @@ void HotIndexTable::ReplaceOverlappingSegments(
               });
     
     if (DetectSnapshotGap(cuid, next_segments, "ReplaceOverlappingSegments")) {
-      fprintf(stderr, "[DIAG][ReplaceOverlapping] CUID %lu: GAP! new={file=%lu [%s - %s]}\n",
+      DiagLogf("[DIAG][ReplaceOverlapping] CUID %lu: GAP! new={file=%lu [%s - %s]}\n",
               cuid, new_segment.file_number,
               FormatKeyDisplay(new_segment.first_key).c_str(),
               FormatKeyDisplay(new_segment.last_key).c_str());
       for (size_t i = 0; i < next_segments.size(); ++i) {
-        fprintf(stderr, "  result[%zu] file=%lu [%s - %s]\n", i,
+        DiagLogf("  result[%zu] file=%lu [%s - %s]\n", i,
                 next_segments[i].file_number,
                 FormatKeyDisplay(next_segments[i].first_key).c_str(),
                 FormatKeyDisplay(next_segments[i].last_key).c_str());
       }
       for (size_t j = 0; j < entry.deltas.size(); ++j) {
-        fprintf(stderr, "  delta[%zu] file=%lu [%s - %s]\n", j,
+        DiagLogf("  delta[%zu] file=%lu [%s - %s]\n", j,
                 entry.deltas[j].file_number,
                 FormatKeyDisplay(entry.deltas[j].first_key).c_str(),
                 FormatKeyDisplay(entry.deltas[j].last_key).c_str());
@@ -735,15 +739,14 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
       pm_promoted_file_nums.insert(seg.file_number);
     }
     if (!pm_promoted_segs.empty()) {
-      fprintf(stderr,
-              "[DIAG][AtomicReplace] CUID %lu: pm_promoted_segs=%zu files to preserve:",
+      DiagLogf("[DIAG][AtomicReplace] CUID %lu: pm_promoted_segs=%zu files to preserve:",
               cuid, pm_promoted_segs.size());
       for (const auto& seg : pm_promoted_segs) {
-        fprintf(stderr, " %lu[%s-%s]", seg.file_number,
+        DiagLogf(" %lu[%s-%s]", seg.file_number,
                 FormatKeyDisplay(seg.first_key).c_str(),
                 FormatKeyDisplay(seg.last_key).c_str());
       }
-      fprintf(stderr, "\n");
+      DiagLogf("\n");
     }
 
     std::vector<DataSegment> next_segments;
@@ -763,15 +766,14 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
         // 不加入 segments_to_unref：文件保留来自 PromoteSnapshot 的 Ref，在 ②-c 中转移。
         if (seg.file_number != static_cast<uint64_t>(-1) &&
             pm_promoted_file_nums.count(seg.file_number)) {
-          fprintf(stderr,
-                  "[DIAG][AtomicReplace] CUID %lu: Seg=[%s - %s] is pm_promoted, DEFERRED to step-2c (full range)\n",
+          DiagLogf("[DIAG][AtomicReplace] CUID %lu: Seg=[%s - %s] is pm_promoted, DEFERRED to step-2c (full range)\n",
                   cuid, FormatKeyDisplay(seg.first_key).c_str(),
                   FormatKeyDisplay(seg.last_key).c_str());
           continue;
         }
 
         // 与 PM 范围重叠：保留不重叠的边缘部分
-        fprintf(stderr, "[DIAG][AtomicReplace] CUID %lu: Seg Overlap detected. Seg=[%s - %s] PM=[%s - %s]\n",
+        DiagLogf("[DIAG][AtomicReplace] CUID %lu: Seg Overlap detected. Seg=[%s - %s] PM=[%s - %s]\n",
                 cuid, FormatKeyDisplay(seg.first_key).c_str(), FormatKeyDisplay(seg.last_key).c_str(),
                 FormatKeyDisplay(pm_range_first).c_str(), FormatKeyDisplay(pm_range_last).c_str());
         // 1. 左侧剩余
@@ -779,7 +781,7 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
           DataSegment left = seg;
           left.last_key = pm_range_first;
           next_segments.push_back(left);
-          fprintf(stderr, "  → Created LEFT remnant: [%s - %s]\n",
+          DiagLogf("  \u2192 Created LEFT remnant: [%s - %s]\n",
                   FormatKeyDisplay(left.first_key).c_str(), FormatKeyDisplay(left.last_key).c_str());
           // 左残余与原始段共享文件，额外 Ref
           if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
@@ -791,7 +793,7 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
           DataSegment right = seg;
           right.first_key = pm_range_last;
           next_segments.push_back(right);
-          fprintf(stderr, "  → Created RIGHT remnant: [%s - %s]\n",
+          DiagLogf("  \u2192 Created RIGHT remnant: [%s - %s]\n",
                   FormatKeyDisplay(right.first_key).c_str(), FormatKeyDisplay(right.last_key).c_str());
           if (seg.file_number != static_cast<uint64_t>(-1) && lifecycle_manager_) {
             lifecycle_manager_->Ref(seg.file_number);
@@ -827,7 +829,7 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
 
       if (icmp_->user_comparator()->Compare(ExtractUserKey(buf_seg.first_key), 
                                             ExtractUserKey(buf_seg.last_key)) <= 0) {
-        fprintf(stderr, "[DIAG][AtomicReplace] CUID %lu: Pre-inserting Buffer Segment (File -1) [%s - %s] (will be split by pm_sst_segs)\n",
+        DiagLogf("[DIAG][AtomicReplace] CUID %lu: Pre-inserting Buffer Segment (File -1) [%s - %s] (will be split by pm_sst_segs)\n",
                 cuid, FormatKeyDisplay(buf_seg.first_key).c_str(), FormatKeyDisplay(buf_seg.last_key).c_str());
         next_segments.push_back(buf_seg);
       }
@@ -916,7 +918,7 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
             if (lifecycle_manager_) {
               lifecycle_manager_->Ref(sst_seg.file_number);
             }
-            fprintf(stderr, "[DIAG][AtomicReplace] CUID %lu: ②-a Out-of-range SST file=%lu "
+            DiagLogf("[DIAG][AtomicReplace] CUID %lu: ②-a Out-of-range SST file=%lu "
                     "replaced seg [%s - %s] → SST clipped [%s - %s]\n",
                     cuid, sst_seg.file_number,
                     FormatKeyDisplay(seg.first_key).c_str(),
@@ -971,7 +973,7 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
         continue;
       }
 
-      fprintf(stderr, "[DIAG][AtomicReplace] CUID %lu: ②-b In-range pm_sst_seg file=%lu [%s - %s]\n",
+      DiagLogf("[DIAG][AtomicReplace] CUID %lu: ②-b In-range pm_sst_seg file=%lu [%s - %s]\n",
               cuid, clipped_seg.file_number,
               FormatKeyDisplay(clipped_seg.first_key).c_str(),
               FormatKeyDisplay(clipped_seg.last_key).c_str());
@@ -1085,12 +1087,25 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
       next_segments = std::move(after_cut);
       // 以完整（已裁剪到 pm_range 的）范围插入 pm_promoted SST
       next_segments.push_back(clipped_prom);
-      fprintf(stderr,
-              "[DIAG][AtomicReplace] CUID %lu: step-2c pm_promoted file=%lu [%s - %s] "
+      DiagLogf("[DIAG][AtomicReplace] CUID %lu: step-2c pm_promoted file=%lu [%s - %s] "
               "inserted with full range (clipped to pm_range)\n",
               cuid, sst_seg.file_number,
               FormatKeyDisplay(clipped_prom.first_key).c_str(),
               FormatKeyDisplay(clipped_prom.last_key).c_str());
+      // Degenerate segment check: first_key should be <= last_key
+      if (icmp_->Compare(clipped_prom.first_key, clipped_prom.last_key) > 0) {
+        DiagLogf("[DIAG_DEGENERATE_SEG] *** CRITICAL *** CUID %lu: step-2c produced "
+                "degenerate segment file=%lu first_key=[%s] > last_key=[%s]. "
+                "pm_range=[%s - %s] sst_seg=[%s - %s]. "
+                "This segment is invalid and will cause scan errors!\n",
+                cuid, sst_seg.file_number,
+                FormatKeyDisplay(clipped_prom.first_key).c_str(),
+                FormatKeyDisplay(clipped_prom.last_key).c_str(),
+                FormatKeyDisplay(pm_range_first).c_str(),
+                FormatKeyDisplay(pm_range_last).c_str(),
+                FormatKeyDisplay(sst_seg.first_key).c_str(),
+                FormatKeyDisplay(sst_seg.last_key).c_str());
+      }
     }
 
     // ④ 排序
@@ -1108,8 +1123,7 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
 
     // GAP 诊断
     if (DetectSnapshotGap(cuid, next_segments, "AtomicReplaceForPartialMerge")) {
-      fprintf(stderr,
-              "[DIAG][AtomicReplace] CUID %lu: GAP! pm_range=[%s - %s] "
+      DiagLogf("[DIAG][AtomicReplace] CUID %lu: GAP! pm_range=[%s - %s] "
               "has_buf=%d pm_ssts=%zu\n",
               cuid,
               FormatKeyDisplay(pm_range_first).c_str(),
