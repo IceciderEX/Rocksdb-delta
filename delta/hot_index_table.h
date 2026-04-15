@@ -10,6 +10,7 @@
 
 #include "delta/hot_data_buffer.h"
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/slice.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -75,6 +76,10 @@ class HotIndexTable {
   // 用于 CompactionIterator 决定是否 Skip
   bool IsDeltaObsolete(uint64_t cuid,
                        const std::vector<uint64_t>& input_files) const;
+
+  // Key-aware obsolete check used by compaction hot filtering.
+  bool IsDeltaObsoleteForKey(uint64_t cuid, uint64_t file_number,
+                             const Slice& internal_key) const;
 
   // 用于清理cuid的 Obsolete Deltas
   void RemoveObsoleteDeltasForCUIDs(const std::unordered_set<uint64_t>& cuids,

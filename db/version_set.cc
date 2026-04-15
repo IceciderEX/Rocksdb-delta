@@ -36,6 +36,7 @@
 #include "db/memtable.h"
 #include "db/merge_context.h"
 #include "db/merge_helper.h"
+#include "db/partition_filter_iterator.h"
 #include "db/pinned_iterators_manager.h"
 #include "db/table_cache.h"
 #include "db/version_builder.h"
@@ -75,6 +76,7 @@
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/coro_utils.h"
+#include "util/l0_partition.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 #include "util/user_comparator_wrapper.h"
@@ -97,6 +99,87 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 
 using ScanOptionsMap = std::unordered_map<size_t, MultiScanArgs>;
+
+inline bool PartitionMatchesReadFilter(
+    const MutableCFOptions& mutable_cf_options,
+    const ReadOptions& read_options, const FileMetaData* file_meta) {
+  if (!mutable_cf_options.delta_options.enable_partition ||
+      read_options.read_partition_id < 0) {
+    return true;
+  }
+  const uint32_t file_partition = file_meta->partition_id;
+  if (file_partition >= kL0PartitionCount) {
+    return true;
+  }
+  return static_cast<int32_t>(file_partition) ==
+         read_options.read_partition_id;
+}
+
+inline bool KeyMatchesReadPartition(const MutableCFOptions& mutable_cf_options,
+                                    const ReadOptions& read_options,
+                                    const Slice& user_key) {
+  if (!mutable_cf_options.delta_options.enable_partition ||
+      read_options.read_partition_id < 0) {
+    return true;
+  }
+  return static_cast<int32_t>(ExtractL0PartitionFromUserKey(user_key)) ==
+         read_options.read_partition_id;
+}
+
+inline InternalIterator* WrapUnpartitionedFileIteratorIfNeeded(
+    InternalIterator* iter, const MutableCFOptions& mutable_cf_options,
+    const ReadOptions& read_options, const FileMetaData* file_meta) {
+  if (iter == nullptr || !mutable_cf_options.delta_options.enable_partition ||
+      read_options.read_partition_id < 0 || file_meta == nullptr) {
+    return iter;
+  }
+  if (file_meta->partition_id < kL0PartitionCount) {
+    return iter;
+  }
+  return new PartitionFilterIterator(
+      iter, static_cast<uint32_t>(read_options.read_partition_id));
+}
+
+inline bool FileMayMatchIteratorBounds(const UserComparatorWrapper& ucmp,
+                                       const ReadOptions& read_options,
+                                       const FileMetaData* file_meta) {
+  if (file_meta == nullptr) {
+    return false;
+  }
+  if (read_options.iterate_upper_bound != nullptr &&
+      ucmp.CompareWithoutTimestamp(file_meta->smallest.user_key(),
+                                   /*a_has_ts=*/true,
+                                   *read_options.iterate_upper_bound,
+                                   /*b_has_ts=*/false) >= 0) {
+    return false;
+  }
+  if (read_options.iterate_lower_bound != nullptr &&
+      ucmp.CompareWithoutTimestamp(file_meta->largest.user_key(),
+                                   /*a_has_ts=*/true,
+                                   *read_options.iterate_lower_bound,
+                                   /*b_has_ts=*/false) < 0) {
+    return false;
+  }
+  return true;
+}
+
+inline bool FileMayMatchReadTableId(const FileMetaData* file_meta,
+                                    bool has_target_table_id,
+                                    uint64_t target_table_id) {
+  if (!has_target_table_id || file_meta == nullptr) {
+    return true;
+  }
+  uint64_t smallest_table_id = 0;
+  uint64_t largest_table_id = 0;
+  if (!ExtractTableIdFromUserKey(file_meta->smallest.user_key(),
+                                 &smallest_table_id) ||
+      !ExtractTableIdFromUserKey(file_meta->largest.user_key(),
+                                 &largest_table_id)) {
+    return true;
+  }
+  return smallest_table_id <= target_table_id &&
+         target_table_id <= largest_table_id;
+}
 
 // Find File in LevelFilesBrief data structure
 // Within an index range defined by left and right
@@ -1286,11 +1369,21 @@ class LevelIterator final : public InternalIterator {
     }
   }
 
+  // 对比文件所处分区是否等于指定分区
+  bool FileMatchesReadPartition(size_t file_index) const {
+    return PartitionMatchesReadFilter(mutable_cf_options_, read_options_,
+        flevel_->files[file_index].file_metadata);
+  }
+
   // Move file_iter_ to the file at file_index_.
   // range_tombstone_iter_ is updated with a range tombstone iterator
   // into the new file. Old range tombstone iterator is cleared.
   InternalIterator* NewFileIterator() {
     assert(file_index_ < flevel_->num_files);
+    // 跳过非本分区的文件
+    if (!FileMatchesReadPartition(file_index_)) {
+      return nullptr;
+    }
     auto file_meta = flevel_->files[file_index_];
     if (should_sample_) {
       sample_file_read_inc(file_meta.file_metadata);
@@ -1304,7 +1397,7 @@ class LevelIterator final : public InternalIterator {
     }
     CheckMayBeOutOfLowerBound();
     ClearRangeTombstoneIter();
-    return table_cache_->NewIterator(
+    InternalIterator* iter = table_cache_->NewIterator(
         read_options_, file_options_, icomparator_, *file_meta.file_metadata,
         range_del_agg_, mutable_cf_options_,
         nullptr /* don't need reference to table */, file_read_hist_, caller_,
@@ -1312,6 +1405,8 @@ class LevelIterator final : public InternalIterator {
         /*max_file_size_for_l0_meta_pin=*/0, smallest_compaction_key,
         largest_compaction_key, allow_unprepared_value_, &read_seq_,
         range_tombstone_iter_);
+    return WrapUnpartitionedFileIteratorIfNeeded(
+      iter, mutable_cf_options_, read_options_, file_meta.file_metadata);
   }
 
   // Check if current file being fully within iterate_lower_bound.
@@ -1419,7 +1514,8 @@ void LevelIterator::Seek(const Slice& target) {
   bool need_to_reseek = true;
   if (file_iter_.iter() != nullptr && file_index_ < flevel_->num_files) {
     const FdWithKeyRange& cur_file = flevel_->files[file_index_];
-    if (icomparator_.InternalKeyComparator::Compare(
+    if (FileMatchesReadPartition(file_index_) &&
+      icomparator_.InternalKeyComparator::Compare(
             target, cur_file.largest_key) <= 0 &&
         icomparator_.InternalKeyComparator::Compare(
             target, cur_file.smallest_key) >= 0) {
@@ -2353,27 +2449,79 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
   }
 
   bool should_sample = should_sample_file_read();
+  const UserComparatorWrapper user_cmp(
+      cfd_->internal_comparator().user_comparator());
 
   auto* arena = merge_iter_builder->GetArena();
   if (level == 0) {
     // Merge all level zero files together since they may overlap
     std::unique_ptr<TruncatedRangeDelIterator> tombstone_iter = nullptr;
-    for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
-      const auto& file = storage_info_.LevelFilesBrief(0).files[i];
-      auto table_iter = cfd_->table_cache()->NewIterator(
-          read_options, soptions, cfd_->internal_comparator(),
-          *file.file_metadata, /*range_del_agg=*/nullptr, mutable_cf_options_,
-          nullptr, cfd_->internal_stats()->GetFileReadHist(0),
-          TableReaderCaller::kUserIterator, arena,
-          /*skip_filters=*/false, /*level=*/0, max_file_size_for_l0_meta_pin_,
-          /*smallest_compaction_key=*/nullptr,
-          /*largest_compaction_key=*/nullptr, allow_unprepared_value,
-          /*range_del_read_seqno=*/nullptr, &tombstone_iter);
-      if (read_options.ignore_range_deletions) {
-        merge_iter_builder->AddIterator(table_iter);
-      } else {
-        merge_iter_builder->AddPointAndTombstoneIterator(
-            table_iter, std::move(tombstone_iter));
+    const bool use_partition_index =
+        mutable_cf_options_.delta_options.enable_partition &&
+        read_options.read_partition_id >= 0;
+    uint64_t target_table_id = 0;
+    const bool has_target_table_id =
+        use_partition_index && read_options.iterate_lower_bound != nullptr &&
+        ExtractTableIdFromUserKey(*read_options.iterate_lower_bound,
+                                  &target_table_id);
+
+    if (use_partition_index) {
+      const auto& partition_files =
+          storage_info_.Level0FilesForPartition(read_options.read_partition_id);
+      for (const auto* file_meta : partition_files) {
+        if (!FileMayMatchIteratorBounds(user_cmp, read_options, file_meta)) {
+          continue;
+        }
+        if (!FileMayMatchReadTableId(file_meta, has_target_table_id,
+                                     target_table_id)) {
+          continue;
+        }
+        Arena* table_iter_arena =
+            file_meta->partition_id < kL0PartitionCount ? arena : nullptr;
+        auto table_iter = cfd_->table_cache()->NewIterator(
+            read_options, soptions, cfd_->internal_comparator(), *file_meta,
+            /*range_del_agg=*/nullptr, mutable_cf_options_, nullptr,
+            cfd_->internal_stats()->GetFileReadHist(0),
+            TableReaderCaller::kUserIterator, table_iter_arena,
+            /*skip_filters=*/false, /*level=*/0, max_file_size_for_l0_meta_pin_,
+            /*smallest_compaction_key=*/nullptr,
+            /*largest_compaction_key=*/nullptr, allow_unprepared_value,
+            /*range_del_read_seqno=*/nullptr, &tombstone_iter);
+        table_iter = WrapUnpartitionedFileIteratorIfNeeded(
+            table_iter, mutable_cf_options_, read_options, file_meta);
+        if (read_options.ignore_range_deletions) {
+          merge_iter_builder->AddIterator(table_iter);
+        } else {
+          merge_iter_builder->AddPointAndTombstoneIterator(
+              table_iter, std::move(tombstone_iter));
+        }
+      }
+    } else {
+      for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
+        const auto& file = storage_info_.LevelFilesBrief(0).files[i];
+        if (!FileMayMatchIteratorBounds(user_cmp, read_options,
+                                        file.file_metadata)) {
+          continue;
+        }
+        if (!FileMayMatchReadTableId(file.file_metadata, has_target_table_id,
+                                     target_table_id)) {
+          continue;
+        }
+        auto table_iter = cfd_->table_cache()->NewIterator(
+            read_options, soptions, cfd_->internal_comparator(),
+            *file.file_metadata, /*range_del_agg=*/nullptr, mutable_cf_options_,
+            nullptr, cfd_->internal_stats()->GetFileReadHist(0),
+            TableReaderCaller::kUserIterator, arena,
+            /*skip_filters=*/false, /*level=*/0, max_file_size_for_l0_meta_pin_,
+            /*smallest_compaction_key=*/nullptr,
+            /*largest_compaction_key=*/nullptr, allow_unprepared_value,
+            /*range_del_read_seqno=*/nullptr, &tombstone_iter);
+        if (read_options.ignore_range_deletions) {
+          merge_iter_builder->AddIterator(table_iter);
+        } else {
+          merge_iter_builder->AddPointAndTombstoneIterator(
+              table_iter, std::move(tombstone_iter));
+        }
       }
     }
     if (should_sample) {
@@ -2381,8 +2529,30 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
       // rather than Seek(), while files in other levels are recored per seek.
       // If users execute one range query per iterator, there may be some
       // discrepancy here.
-      for (FileMetaData* meta : storage_info_.LevelFiles(0)) {
-        sample_file_read_inc(meta);
+      if (use_partition_index) {
+        const auto& partition_files =
+            storage_info_.Level0FilesForPartition(read_options.read_partition_id);
+        for (FileMetaData* meta : partition_files) {
+          if (!FileMayMatchIteratorBounds(user_cmp, read_options, meta)) {
+            continue;
+          }
+          if (!FileMayMatchReadTableId(meta, has_target_table_id,
+                                       target_table_id)) {
+            continue;
+          }
+          sample_file_read_inc(meta);
+        }
+      } else {
+        for (FileMetaData* meta : storage_info_.LevelFiles(0)) {
+          if (!FileMayMatchIteratorBounds(user_cmp, read_options, meta)) {
+            continue;
+          }
+          if (!FileMayMatchReadTableId(meta, has_target_table_id,
+                                       target_table_id)) {
+            continue;
+          }
+          sample_file_read_inc(meta);
+        }
       }
     }
   } else if (storage_info_.LevelFilesBrief(level).num_files > 0) {
@@ -2747,6 +2917,17 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     pinned_iters_mgr->StartPinning();
   }
 
+  if (!KeyMatchesReadPartition(mutable_cf_options_, read_options, user_key)) {
+    if (db_statistics_ != nullptr) {
+      get_context.ReportCounters();
+    }
+    if (key_exists != nullptr) {
+      *key_exists = false;
+    }
+    *status = Status::NotFound();
+    return;
+  }
+
   FilePicker fp(user_key, ikey, &storage_info_.level_files_brief_,
                 storage_info_.num_non_empty_levels_,
                 &storage_info_.file_indexer_, user_comparator(),
@@ -2754,6 +2935,12 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   FdWithKeyRange* f = fp.GetNextFile();
 
   while (f != nullptr) {
+    // 跳过分区不匹配的文件
+    if (!PartitionMatchesReadFilter(mutable_cf_options_, read_options,
+                    f->file_metadata)) {
+      f = fp.GetNextFile();
+      continue;
+    }
     if (*max_covering_tombstone_seq > 0) {
       // The remaining files we look at will only contain covered keys, so we
       // stop here.
@@ -2919,6 +3106,12 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
   autovector<GetContext, 16> get_ctx;
   BlobFetcher blob_fetcher(this, read_options);
   for (auto iter = range->begin(); iter != range->end(); ++iter) {
+    if (!KeyMatchesReadPartition(mutable_cf_options_, read_options,
+                                 iter->ukey_without_ts)) {
+      *(iter->s) = Status::NotFound();
+      range->MarkKeyDone(iter);
+      continue;
+    }
     assert(iter->s->ok() || iter->s->IsMergeInProgress());
     get_ctx.emplace_back(
         user_comparator(), merge_operator_, info_log_, db_statistics_,
@@ -2957,6 +3150,14 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
                           &storage_info_.file_indexer_, user_comparator(),
                           internal_comparator());
     FdWithKeyRange* f = fp.GetNextFileInLevel();
+    auto advance_to_matching_file = [&]() {
+      while (f != nullptr &&
+             !PartitionMatchesReadFilter(mutable_cf_options_, read_options,
+                                         f->file_metadata)) {
+        f = fp.GetNextFileInLevel();
+      }
+    };
+    advance_to_matching_file();
     uint64_t num_index_read = 0;
     uint64_t num_filter_read = 0;
     uint64_t num_sst_read = 0;
@@ -2990,6 +3191,7 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
         }
         if (s.ok()) {
           f = fp.GetNextFileInLevel();
+          advance_to_matching_file();
         }
 #if USE_COROUTINES
       } else {
@@ -3029,6 +3231,7 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
             break;
           }
           f = fp.GetNextFileInLevel();
+          advance_to_matching_file();
         }
         if (mget_tasks.size() > 0) {
           RecordTick(db_statistics_, MULTIGET_COROUTINE_COUNT,
@@ -3049,6 +3252,7 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
 
           if (s.ok() && fp.KeyMaySpanNextFile()) {
             f = fp.GetNextFileInLevel();
+            advance_to_matching_file();
           }
         }
 #endif  // USE_COROUTINES
@@ -3063,6 +3267,7 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
         if (!fp.IsSearchEnded()) {
           // Its possible there is no overlap on this level and f is nullptr
           f = fp.GetNextFileInLevel();
+          advance_to_matching_file();
         }
         if (dump_stats_for_l0_file ||
             (prev_level != 0 && prev_level != (int)fp.GetHitFileLevel())) {
@@ -3173,11 +3378,21 @@ Status Version::ProcessBatch(
   FdWithKeyRange* f = nullptr;
   Status s;
 
+  auto advance_to_matching_file = [&]() {
+    while (f != nullptr &&
+           !PartitionMatchesReadFilter(mutable_cf_options_, read_options,
+                                       f->file_metadata)) {
+      f = fp.GetNextFileInLevel();
+    }
+  };
+
   f = fp.GetNextFileInLevel();
+  advance_to_matching_file();
   while (!f) {
     fp.PrepareNextLevelForSearch();
     if (!fp.IsSearchEnded()) {
       f = fp.GetNextFileInLevel();
+      advance_to_matching_file();
     } else {
       break;
     }
@@ -3244,6 +3459,7 @@ Status Version::ProcessBatch(
       break;
     }
     f = fp.GetNextFileInLevel();
+    advance_to_matching_file();
   }
   // Split the current batch only if some keys are likely in this level and
   // some are not. Only split if we're done with this level, i.e f is null.
@@ -3404,6 +3620,31 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
   }
 }
 
+void VersionStorageInfo::GenerateLevel0PartitionFiles() {
+  for (auto& files_in_partition : l0_partition_files_) {
+    files_in_partition.clear();
+  }
+
+  if (num_levels_ <= 0) {
+    return;
+  }
+
+  for (FileMetaData* f : files_[0]) {
+    if (f == nullptr) {
+      continue;
+    }
+    const uint32_t partition_id = f->partition_id;
+    if (partition_id < kL0PartitionIndexCount) {
+      l0_partition_files_[partition_id].push_back(f);
+    } else {
+      // Unpartitioned L0 files must be visible to every partitioned read.
+      for (auto& files_in_partition : l0_partition_files_) {
+        files_in_partition.push_back(f);
+      }
+    }
+  }
+}
+
 void VersionStorageInfo::PrepareForVersionAppend(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options) {
@@ -3413,6 +3654,7 @@ void VersionStorageInfo::PrepareForVersionAppend(
   UpdateFilesByCompactionPri(immutable_options, mutable_cf_options);
   GenerateFileIndexer();
   GenerateLevelFilesBrief();
+  GenerateLevel0PartitionFiles();
   GenerateLevel0NonOverlapping();
   GenerateBottommostFiles();
   GenerateFileLocationIndex();

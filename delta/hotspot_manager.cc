@@ -790,6 +790,13 @@ void HotspotManager::FinalizeScanAsCompaction(
     nullptr, [this, cuid](void*) { this->UnlockCuid(cuid); });
 
   std::vector<DataSegment> final_segments;
+  auto release_pending_refs = [this](const std::vector<DataSegment>& segs) {
+    for (const auto& seg : segs) {
+      if (seg.file_number != static_cast<uint64_t>(-1)) {
+        lifecycle_manager_->Unref(seg.file_number);
+      }
+    }
+  };
 
   // Scan 过程中产生的 Pending SSTs【在 scan 的过程中flush的】
   {
@@ -898,6 +905,63 @@ void HotspotManager::FinalizeScanAsCompaction(
   // else: 全部数据已精确 flush 到 SST，最后 flush 点恰好等于 scan_last_key，
   // 无需额外 -1 尾段，直接使用 final_segments。
 
+  if (db_options_.delta_options.enable_partition) {
+    // Coverage guard: only for partition mode where hot full-scan can be
+    // incomplete. Keep non-partition finalize flow unchanged.
+    HotIndexEntry old_entry;
+    if (index_table_.GetEntry(cuid, &old_entry) && old_entry.HasSnapshot()) {
+      bool has_old_bounds = false;
+      std::string old_min_key;
+      std::string old_max_key;
+      auto update_old_bounds = [&](const DataSegment& seg) {
+        if (seg.first_key.empty() || seg.last_key.empty()) {
+          return;
+        }
+        if (!has_old_bounds) {
+          old_min_key = seg.first_key;
+          old_max_key = seg.last_key;
+          has_old_bounds = true;
+          return;
+        }
+        if (internal_comparator_->Compare(seg.first_key, old_min_key) < 0) {
+          old_min_key = seg.first_key;
+        }
+        if (internal_comparator_->Compare(seg.last_key, old_max_key) > 0) {
+          old_max_key = seg.last_key;
+        }
+      };
+
+      for (const auto& seg : old_entry.snapshot_segments) {
+        update_old_bounds(seg);
+      }
+      for (const auto& seg : old_entry.deltas) {
+        update_old_bounds(seg);
+      }
+
+      const bool scan_range_valid =
+          !scan_first_key.empty() && !scan_last_key.empty() &&
+          internal_comparator_->Compare(scan_first_key, scan_last_key) <= 0;
+      const bool covers_old_range =
+          !has_old_bounds ||
+          (scan_range_valid &&
+           internal_comparator_->Compare(scan_first_key, old_min_key) <= 0 &&
+           internal_comparator_->Compare(scan_last_key, old_max_key) >= 0);
+
+      if (!covers_old_range) {
+        ROCKS_LOG_WARN(
+            db_options_.info_log,
+            "[HotspotManager] Skip unsafe full-replace for CUID %" PRIu64
+            ": scan range [%s, %s] does not cover old index range [%s, %s]",
+            cuid, FormatKeyDisplay(scan_first_key).c_str(),
+            FormatKeyDisplay(scan_last_key).c_str(),
+            has_old_bounds ? FormatKeyDisplay(old_min_key).c_str() : "N/A",
+            has_old_bounds ? FormatKeyDisplay(old_max_key).c_str() : "N/A");
+        release_pending_refs(final_segments);
+        return;
+      }
+    }
+  }
+
   // 【debug】验证 final_segments 数据连续性（含重叠和 GAP）
   if (final_segments.size() > 1) {
     for (size_t i = 0; i < final_segments.size() - 1; ++i) {
@@ -935,13 +999,9 @@ void HotspotManager::FinalizeScanAsCompaction(
 
   // 释放 pending 路径的 Ref。
   // UpdateSnapshot 内部已经为 final_segments 中的每个 segment 做了 Ref(+1)，
-  // 此处释放 pending 添加时的 Ref，使 ref_count 最终为 1
-  for (const auto& seg : final_segments) {
-    if (seg.file_number != static_cast<uint64_t>(-1)) {
-      lifecycle_manager_->Unref(seg.file_number);
-    }
-  }
-  // 在 snapshot 中已有数据，将这次 initialscan 经历的 rocksdb 文件标记为 obsolete
+  // 此处释放 pending 添加时的 Ref，使 ref_count 最终为 1（仅 snapshot 持有）。
+  // 对于同时被 Promote 过的 SST：UpdateSnapshot 的 Unref(old) 已经抵消了 Promote 的 Ref。
+  release_pending_refs(final_segments);
   index_table_.MarkDeltasAsObsolete(cuid, visited_files);
 }
 
@@ -1025,6 +1085,12 @@ void HotspotManager::UpdateCompactionDelta(
 bool HotspotManager::ShouldSkipObsoleteDelta(
     uint64_t cuid, const std::vector<uint64_t>& input_files) {
   return index_table_.IsDeltaObsolete(cuid, input_files);
+}
+
+bool HotspotManager::ShouldSkipObsoleteDeltaKey(uint64_t cuid,
+                                                uint64_t file_number,
+                                                const Slice& internal_key) {
+  return index_table_.IsDeltaObsoleteForKey(cuid, file_number, internal_key);
 }
 
 void HotspotManager::CleanUpMetadataAfterCompaction(

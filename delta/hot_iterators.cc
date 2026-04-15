@@ -8,6 +8,7 @@
 #include "rocksdb/env.h"
 #include "logging/logging.h"
 
+#include "db/partition_filter_iterator.h"
 #include "table/merging_iterator.h"
 #include "util/cast_util.h"
 #include "util/extract_cuid.h"
@@ -68,6 +69,162 @@ class LowerBoundedSSTIterator : public InternalIterator {
  private:
   InternalIterator* inner_;
   std::string lower_bound_ikey_;
+};
+
+// A lightweight non-owning merge view of hot and cold iterators.
+class HotColdHybridIterator : public InternalIterator {
+ public:
+  HotColdHybridIterator(InternalIterator* hot, InternalIterator* cold,
+                        const InternalKeyComparator& icmp)
+      : hot_(hot), cold_(cold), icmp_(icmp), current_(nullptr) {}
+
+  bool Valid() const override { return current_ != nullptr && current_->Valid(); }
+
+  void SeekToFirst() override {
+    if (hot_ != nullptr) hot_->SeekToFirst();
+    if (cold_ != nullptr) cold_->SeekToFirst();
+    SelectCurrentForward();
+  }
+
+  void SeekToLast() override {
+    if (hot_ != nullptr) hot_->SeekToLast();
+    if (cold_ != nullptr) cold_->SeekToLast();
+    SelectCurrentBackward();
+  }
+
+  void Seek(const Slice& target) override {
+    if (hot_ != nullptr) hot_->Seek(target);
+    if (cold_ != nullptr) cold_->Seek(target);
+    SelectCurrentForward();
+  }
+
+  void SeekForPrev(const Slice& target) override {
+    if (hot_ != nullptr) hot_->SeekForPrev(target);
+    if (cold_ != nullptr) cold_->SeekForPrev(target);
+    SelectCurrentBackward();
+  }
+
+  void Next() override {
+    if (!Valid()) {
+      return;
+    }
+    if (current_ == hot_) {
+      hot_->Next();
+    } else {
+      cold_->Next();
+    }
+    SelectCurrentForward();
+  }
+
+  void Prev() override {
+    if (!Valid()) {
+      return;
+    }
+    if (current_ == hot_) {
+      hot_->Prev();
+    } else {
+      cold_->Prev();
+    }
+    SelectCurrentBackward();
+  }
+
+  Slice key() const override {
+    assert(Valid());
+    return current_->key();
+  }
+
+  Slice value() const override {
+    assert(Valid());
+    return current_->value();
+  }
+
+  Status status() const override {
+    if (hot_ != nullptr && !hot_->status().ok()) {
+      return hot_->status();
+    }
+    if (cold_ != nullptr && !cold_->status().ok()) {
+      return cold_->status();
+    }
+    return Status::OK();
+  }
+
+  bool PrepareValue() override {
+    return Valid() ? current_->PrepareValue() : false;
+  }
+
+  uint64_t GetPhysicalId() override {
+    return Valid() ? current_->GetPhysicalId() : 0;
+  }
+
+ private:
+  void SelectCurrentForward() {
+    const bool hot_valid = (hot_ != nullptr && hot_->Valid());
+    const bool cold_valid = (cold_ != nullptr && cold_->Valid());
+    if (!hot_valid && !cold_valid) {
+      current_ = nullptr;
+      return;
+    }
+    if (!hot_valid) {
+      current_ = cold_;
+      return;
+    }
+    if (!cold_valid) {
+      current_ = hot_;
+      return;
+    }
+
+    while (hot_->Valid() && cold_->Valid()) {
+      int cmp = icmp_.Compare(hot_->key(), cold_->key());
+      if (cmp < 0) {
+        current_ = hot_;
+        return;
+      }
+      if (cmp > 0) {
+        current_ = cold_;
+        return;
+      }
+      // Drop exact duplicate key from cold side.
+      cold_->Next();
+    }
+    current_ = hot_->Valid() ? hot_ : (cold_->Valid() ? cold_ : nullptr);
+  }
+
+  void SelectCurrentBackward() {
+    const bool hot_valid = (hot_ != nullptr && hot_->Valid());
+    const bool cold_valid = (cold_ != nullptr && cold_->Valid());
+    if (!hot_valid && !cold_valid) {
+      current_ = nullptr;
+      return;
+    }
+    if (!hot_valid) {
+      current_ = cold_;
+      return;
+    }
+    if (!cold_valid) {
+      current_ = hot_;
+      return;
+    }
+
+    while (hot_->Valid() && cold_->Valid()) {
+      int cmp = icmp_.Compare(hot_->key(), cold_->key());
+      if (cmp > 0) {
+        current_ = hot_;
+        return;
+      }
+      if (cmp < 0) {
+        current_ = cold_;
+        return;
+      }
+      // Drop exact duplicate key from cold side.
+      cold_->Prev();
+    }
+    current_ = hot_->Valid() ? hot_ : (cold_->Valid() ? cold_ : nullptr);
+  }
+
+  InternalIterator* hot_;
+  InternalIterator* cold_;
+  const InternalKeyComparator& icmp_;
+  InternalIterator* current_;
 };
 
 // ======================= HotDeltaIterator ==========================
@@ -857,10 +1014,14 @@ DeltaSwitchingIterator::DeltaSwitchingIterator(
       current_iter_(nullptr),
       cold_iter_(nullptr),
       hot_iter_(nullptr),
+      hybrid_iter_(nullptr),
       current_hot_cuid_(0),
       is_hot_mode_(false) {}
 
 DeltaSwitchingIterator::~DeltaSwitchingIterator() {
+  if (hybrid_iter_) {
+    delete hybrid_iter_;
+  }
   if (hot_iter_) {
     delete hot_iter_;
   }
@@ -892,6 +1053,11 @@ void DeltaSwitchingIterator::InitColdIter() {
 
 bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
   if (hot_iter_ && current_hot_cuid_ == cuid) return true;
+
+  if (hybrid_iter_) {
+    delete hybrid_iter_;
+    hybrid_iter_ = nullptr;
+  }
 
   if (hot_iter_) {
     delete hot_iter_;
@@ -929,7 +1095,19 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
       file_options_, icmp_, mutable_cf_options_, false);
 
   std::vector<InternalIterator*> children = {delta_iter, snapshot_iter};
-  hot_iter_ = NewMergingIterator(&icmp_, children.data(), 2);
+  hot_iter_ = NewMergingIterator(&icmp_, children.data(),
+                                 static_cast<int>(children.size()));
+
+  const bool partitioned_read =
+      mutable_cf_options_.delta_options.enable_partition &&
+      read_options_.read_partition_id >= 0 &&
+      read_options_.read_partition_id <
+          static_cast<int32_t>(kL0PartitionCount);
+  if (partitioned_read) {
+    hot_iter_ = new PartitionFilterIterator(
+        hot_iter_, static_cast<uint32_t>(read_options_.read_partition_id));
+  }
+
   current_hot_cuid_ = cuid;
   return true;
 }
@@ -944,7 +1122,14 @@ void DeltaSwitchingIterator::Seek(const Slice& target) {
   // 否则，不论是点查还是全扫描(delta_full_scan)，只要是热点，全部走热点路径
   else if (cuid != 0 && hotspot_manager_->IsHot(cuid)) {
     if (InitHotIter(cuid)) {
-      current_iter_ = hot_iter_;
+      if (read_options_.delta_full_scan &&
+          mutable_cf_options_.delta_options.enable_partition) {
+        InitColdIter();
+        hybrid_iter_ = new HotColdHybridIterator(hot_iter_, cold_iter_, icmp_);
+        current_iter_ = hybrid_iter_;
+      } else {
+        current_iter_ = hot_iter_;
+      }
       is_hot_mode_ = true;
     } else {
       // 热点索引尚未建立（如 Init Scan 还在进行中），回退到 Cold Path

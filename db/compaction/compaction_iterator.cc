@@ -462,6 +462,14 @@ bool CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
 void CompactionIterator::CheckHotspotFilters() {
   if (!hotspot_manager_) return;
 
+  skip_current_file_obsolete_ = false;
+
+  const Compaction* real_compaction =
+      compaction_ != nullptr ? compaction_->real_compaction() : nullptr;
+  const bool enable_partition =
+      real_compaction != nullptr &&
+      real_compaction->mutable_cf_options().delta_options.enable_partition;
+
   // 1. 提取当前 Key 的 CUID
   uint64_t cuid = hotspot_manager_->ExtractCUID(input_.key());
   uint64_t file_id = input_file_number();
@@ -504,12 +512,12 @@ void CompactionIterator::CheckHotspotFilters() {
         DiagLogf("[DIAG_COMPACTION_SKIP] CUID %lu: file=%lu skipped"
                 " (CUID marked deleted)\n",
                 cuid, file_id);
-      } 
-      // d) 检查热点索引表（仅判断当前文件 id）
-      // 若遇到热点CUid，检查其热点索引表，若发现Deltas列表中对应的该段数据已被标记为
-      // Obsolete， 则直接跳过该段数据，并删除对应的Deltas记录。
-      else if (hotspot_manager_->IsHot(cuid)) {
-        if (hotspot_manager_->ShouldSkipObsoleteDelta(cuid, std::vector<uint64_t>{file_id})) {
+      } else if (!enable_partition && hotspot_manager_->IsHot(cuid) &&
+                 file_id != 0) {
+        obsolete_probe_file_.clear();
+        obsolete_probe_file_.push_back(file_id);
+        if (hotspot_manager_->ShouldSkipObsoleteDelta(cuid,
+                                                      obsolete_probe_file_)) {
           skip_current_cuid_ = true;
           // 打印首条被跳过 key 的信息，便于与 DIAG_COMPACTION_SPARSE 交叉验证
           Slice skip_key = input_.key();
@@ -534,6 +542,13 @@ void CompactionIterator::CheckHotspotFilters() {
       }
     }
   }
+
+  // Partition mode: use key-aware obsolete filtering.
+  if (enable_partition && !skip_current_cuid_ && cuid != 0 && file_id != 0 &&
+      hotspot_manager_->IsHot(cuid)) {
+    skip_current_file_obsolete_ = hotspot_manager_->ShouldSkipObsoleteDeltaKey(
+        cuid, file_id, input_.key());
+  }
 }
 
 void CompactionIterator::NextFromInput() {
@@ -547,7 +562,7 @@ void CompactionIterator::NextFromInput() {
     if (hotspot_manager_) { // 防止 flush 调用这个函数导致问题
         CheckHotspotFilters();
         // 当前 cuid 是否跳过
-        if (skip_current_cuid_) {
+      if (skip_current_cuid_ || skip_current_file_obsolete_) {
             iter_stats_.num_record_drop_obsolete++;    
             // 直接跳过当前 Key
             input_.Next();

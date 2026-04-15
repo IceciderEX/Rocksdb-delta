@@ -120,6 +120,9 @@ class HotspotManager {
   bool ShouldSkipObsoleteDelta(uint64_t cuid,
                                const std::vector<uint64_t>& input_files);
 
+  bool ShouldSkipObsoleteDeltaKey(uint64_t cuid, uint64_t file_number,
+                                  const Slice& internal_key);
+
   // CompactionJob cleanup：obsolete
   void CleanUpMetadataAfterCompaction(
       const std::unordered_set<uint64_t>& involved_cuids,

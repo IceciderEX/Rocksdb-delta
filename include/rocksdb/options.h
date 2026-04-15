@@ -60,6 +60,9 @@ class FileSystem;
 class UserDefinedIndexFactory;
 // for delta
 struct DeltaOptions {
+  // Enable partition-aware flush/read/compaction for L0.
+  bool enable_partition = false;
+
   // Hotness Detection
   uint64_t hotspot_scan_threshold = 200;
   uint64_t hotspot_scan_window_sec = 600;
@@ -80,17 +83,21 @@ struct DeltaOptions {
 
   // Compaction Picker (Mixed L0)
   int compaction_l0_trigger_count = 10;
+  // Per-partition trigger threshold: when a partition accumulates this many
+  // L0 files, prioritize compaction within that partition.
+  int compaction_l0_partition_trigger_count = 10;
   uint64_t compaction_l0_trigger_age_sec = 3600;
   size_t compaction_l0_files_to_pick = 5;
 
   // Global Concurrency/Sharding (Default for GDCT/HotIndex/ScanFreq)
   uint32_t sharding_count = 128;
-  
+
   // Background threads for Delta workloads
   int max_delta_threads = 1;
 
   bool operator==(const DeltaOptions& other) const {
-    return hotspot_scan_threshold == other.hotspot_scan_threshold &&
+      return enable_partition == other.enable_partition &&
+        hotspot_scan_threshold == other.hotspot_scan_threshold &&
            hotspot_scan_window_sec == other.hotspot_scan_window_sec &&
            delta_merge_threshold == other.delta_merge_threshold &&
            sac_delta_count_threshold == other.sac_delta_count_threshold &&
@@ -102,6 +109,7 @@ struct DeltaOptions {
            gdct_flush_interval_us == other.gdct_flush_interval_us &&
            gdct_compact_interval_us == other.gdct_compact_interval_us &&
            compaction_l0_trigger_count == other.compaction_l0_trigger_count &&
+          compaction_l0_partition_trigger_count == other.compaction_l0_partition_trigger_count &&
            compaction_l0_trigger_age_sec == other.compaction_l0_trigger_age_sec &&
            compaction_l0_files_to_pick == other.compaction_l0_files_to_pick &&
            max_delta_threads == other.max_delta_threads &&
@@ -2335,6 +2343,10 @@ struct ReadOptions {
   bool skip_hot_path = false;
   // 用于标记是否为系统后台触发的 Metadata Scan，如果是，则不执行缓冲和替换
   bool is_metadata_scan = false;
+  // for delta
+  // 将读取/扫描操作限制在特定分区上。-1 表示所有分区。
+  // 仅在 delta_options.enable_partition=true 时生效。
+  int32_t read_partition_id = -1;
   // 启用热数据路径的诊断日志（如段切换、计数等），仅用于调试
   bool enable_delta_diag_logging = false;
 

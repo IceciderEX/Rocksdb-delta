@@ -14,6 +14,7 @@
 #include "db/db_iter.h"
 #include "db/dbformat.h"
 #include "db/job_context.h"
+#include "db/partition_filter_iterator.h"
 #include "db/range_del_aggregator.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "rocksdb/env.h"
@@ -24,6 +25,24 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+inline InternalIterator* WrapUnpartitionedL0IterIfNeeded(
+    InternalIterator* iter, const MutableCFOptions& mutable_cf_options,
+    const ReadOptions& read_options, const FileMetaData* file_meta) {
+  if (iter == nullptr || !mutable_cf_options.delta_options.enable_partition ||
+      read_options.read_partition_id < 0 || file_meta == nullptr) {
+    return iter;
+  }
+  if (file_meta->partition_id < kL0PartitionCount) {
+    return iter;
+  }
+  return new PartitionFilterIterator(
+      iter, static_cast<uint32_t>(read_options.read_partition_id));
+}
+
+}  // namespace
 
 // Usage:
 //     ForwardLevelIterator iter;
@@ -734,27 +753,61 @@ void ForwardIterator::RebuildIterators(bool refresh_sv) {
 
   const auto* vstorage = sv_->current->storage_info();
   const auto& l0_files = vstorage->LevelFiles(0);
-  l0_iters_.reserve(l0_files.size());
-  for (const auto* l0 : l0_files) {
-    if ((read_options_.iterate_upper_bound != nullptr) &&
-        cfd_->internal_comparator().user_comparator()->Compare(
-            l0->smallest.user_key(), *read_options_.iterate_upper_bound) > 0) {
-      // No need to set has_iter_trimmed_for_upper_bound_: this ForwardIterator
-      // will never be interested in files with smallest key above
-      // iterate_upper_bound, since iterate_upper_bound can't be changed.
-      l0_iters_.push_back(nullptr);
-      continue;
+  const bool enable_partition =
+      sv_->mutable_cf_options.delta_options.enable_partition;
+  const bool use_partition_index =
+      enable_partition && read_options_.read_partition_id >= 0;
+  l0_iters_.assign(l0_files.size(), nullptr);
+
+  if (use_partition_index) {
+    const auto& partition_files =
+        vstorage->Level0FilesForPartition(read_options_.read_partition_id);
+    for (const auto* l0 : partition_files) {
+      auto loc = vstorage->GetFileLocation(l0->fd.GetNumber());
+      if (!loc.IsValid() || loc.GetLevel() != 0 ||
+          loc.GetPosition() >= l0_iters_.size()) {
+        continue;
+      }
+      if ((read_options_.iterate_upper_bound != nullptr) &&
+          cfd_->internal_comparator().user_comparator()->Compare(
+              l0->smallest.user_key(), *read_options_.iterate_upper_bound) >
+              0) {
+        continue;
+      }
+      l0_iters_[loc.GetPosition()] = cfd_->table_cache()->NewIterator(
+          read_options_, *cfd_->soptions(), cfd_->internal_comparator(), *l0,
+          read_options_.ignore_range_deletions ? nullptr : &range_del_agg,
+          sv_->mutable_cf_options,
+          /*table_reader_ptr=*/nullptr, /*file_read_hist=*/nullptr,
+          TableReaderCaller::kUserIterator, /*arena=*/nullptr,
+          /*skip_filters=*/false, /*level=*/-1,
+          MaxFileSizeForL0MetaPin(sv_->mutable_cf_options),
+          /*smallest_compaction_key=*/nullptr,
+          /*largest_compaction_key=*/nullptr, allow_unprepared_value_);
+          l0_iters_[loc.GetPosition()] = WrapUnpartitionedL0IterIfNeeded(
+              l0_iters_[loc.GetPosition()], sv_->mutable_cf_options,
+              read_options_, l0);
     }
-    l0_iters_.push_back(cfd_->table_cache()->NewIterator(
-        read_options_, *cfd_->soptions(), cfd_->internal_comparator(), *l0,
-        read_options_.ignore_range_deletions ? nullptr : &range_del_agg,
-        sv_->mutable_cf_options,
-        /*table_reader_ptr=*/nullptr, /*file_read_hist=*/nullptr,
-        TableReaderCaller::kUserIterator, /*arena=*/nullptr,
-        /*skip_filters=*/false, /*level=*/-1,
-        MaxFileSizeForL0MetaPin(sv_->mutable_cf_options),
-        /*smallest_compaction_key=*/nullptr,
-        /*largest_compaction_key=*/nullptr, allow_unprepared_value_));
+  } else {
+    for (size_t i = 0; i < l0_files.size(); ++i) {
+      const auto* l0 = l0_files[i];
+      if ((read_options_.iterate_upper_bound != nullptr) &&
+          cfd_->internal_comparator().user_comparator()->Compare(
+              l0->smallest.user_key(), *read_options_.iterate_upper_bound) >
+              0) {
+        continue;
+      }
+      l0_iters_[i] = cfd_->table_cache()->NewIterator(
+          read_options_, *cfd_->soptions(), cfd_->internal_comparator(), *l0,
+          read_options_.ignore_range_deletions ? nullptr : &range_del_agg,
+          sv_->mutable_cf_options,
+          /*table_reader_ptr=*/nullptr, /*file_read_hist=*/nullptr,
+          TableReaderCaller::kUserIterator, /*arena=*/nullptr,
+          /*skip_filters=*/false, /*level=*/-1,
+          MaxFileSizeForL0MetaPin(sv_->mutable_cf_options),
+          /*smallest_compaction_key=*/nullptr,
+          /*largest_compaction_key=*/nullptr, allow_unprepared_value_);
+    }
   }
   BuildLevelIterators(vstorage, sv_);
   current_ = nullptr;
@@ -808,41 +861,88 @@ void ForwardIterator::RenewIterators() {
   const auto& l0_files = vstorage->LevelFiles(0);
   const auto* vstorage_new = svnew->current->storage_info();
   const auto& l0_files_new = vstorage_new->LevelFiles(0);
+  const bool enable_partition =
+      svnew->mutable_cf_options.delta_options.enable_partition;
+  const bool use_partition_index =
+      enable_partition && read_options_.read_partition_id >= 0;
   size_t iold, inew;
   bool found;
   std::vector<InternalIterator*> l0_iters_new;
-  l0_iters_new.reserve(l0_files_new.size());
+  l0_iters_new.assign(l0_files_new.size(), nullptr);
 
-  for (inew = 0; inew < l0_files_new.size(); inew++) {
-    found = false;
-    for (iold = 0; iold < l0_files.size(); iold++) {
-      if (l0_files[iold] == l0_files_new[inew]) {
-        found = true;
-        break;
+  if (use_partition_index) {
+    const auto& partition_files_new =
+        vstorage_new->Level0FilesForPartition(read_options_.read_partition_id);
+    for (const auto* l0_new : partition_files_new) {
+      const auto new_loc = vstorage_new->GetFileLocation(l0_new->fd.GetNumber());
+      if (!new_loc.IsValid() || new_loc.GetLevel() != 0 ||
+          new_loc.GetPosition() >= l0_iters_new.size()) {
+        continue;
+      }
+
+      bool reused = false;
+      const auto old_loc = vstorage->GetFileLocation(l0_new->fd.GetNumber());
+      if (old_loc.IsValid() && old_loc.GetLevel() == 0 &&
+          old_loc.GetPosition() < l0_files.size() &&
+          l0_files[old_loc.GetPosition()] == l0_new &&
+          old_loc.GetPosition() < l0_iters_.size()) {
+        if (l0_iters_[old_loc.GetPosition()] != nullptr) {
+          l0_iters_new[new_loc.GetPosition()] = l0_iters_[old_loc.GetPosition()];
+          l0_iters_[old_loc.GetPosition()] = nullptr;
+          TEST_SYNC_POINT_CALLBACK("ForwardIterator::RenewIterators:Copy", this);
+        } else {
+          TEST_SYNC_POINT_CALLBACK("ForwardIterator::RenewIterators:Null", this);
+        }
+        reused = true;
+      }
+
+      if (!reused) {
+        l0_iters_new[new_loc.GetPosition()] = cfd_->table_cache()->NewIterator(
+            read_options_, *cfd_->soptions(), cfd_->internal_comparator(),
+            *l0_new, read_options_.ignore_range_deletions ? nullptr : &range_del_agg,
+            svnew->mutable_cf_options,
+            /*table_reader_ptr=*/nullptr, /*file_read_hist=*/nullptr,
+            TableReaderCaller::kUserIterator, /*arena=*/nullptr,
+            /*skip_filters=*/false, /*level=*/-1,
+            MaxFileSizeForL0MetaPin(svnew->mutable_cf_options),
+            /*smallest_compaction_key=*/nullptr,
+            /*largest_compaction_key=*/nullptr, allow_unprepared_value_);
+        l0_iters_new[new_loc.GetPosition()] = WrapUnpartitionedL0IterIfNeeded(
+            l0_iters_new[new_loc.GetPosition()], svnew->mutable_cf_options,
+            read_options_, l0_new);
       }
     }
-    if (found) {
-      if (l0_iters_[iold] == nullptr) {
-        l0_iters_new.push_back(nullptr);
-        TEST_SYNC_POINT_CALLBACK("ForwardIterator::RenewIterators:Null", this);
-      } else {
-        l0_iters_new.push_back(l0_iters_[iold]);
-        l0_iters_[iold] = nullptr;
-        TEST_SYNC_POINT_CALLBACK("ForwardIterator::RenewIterators:Copy", this);
+  } else {
+    for (inew = 0; inew < l0_files_new.size(); inew++) {
+      found = false;
+      for (iold = 0; iold < l0_files.size(); iold++) {
+        if (l0_files[iold] == l0_files_new[inew]) {
+          found = true;
+          break;
+        }
       }
-      continue;
+      if (found) {
+        if (l0_iters_[iold] == nullptr) {
+          TEST_SYNC_POINT_CALLBACK("ForwardIterator::RenewIterators:Null", this);
+        } else {
+          l0_iters_new[inew] = l0_iters_[iold];
+          l0_iters_[iold] = nullptr;
+          TEST_SYNC_POINT_CALLBACK("ForwardIterator::RenewIterators:Copy", this);
+        }
+        continue;
+      }
+      l0_iters_new[inew] = cfd_->table_cache()->NewIterator(
+          read_options_, *cfd_->soptions(), cfd_->internal_comparator(),
+          *l0_files_new[inew],
+          read_options_.ignore_range_deletions ? nullptr : &range_del_agg,
+          svnew->mutable_cf_options,
+          /*table_reader_ptr=*/nullptr, /*file_read_hist=*/nullptr,
+          TableReaderCaller::kUserIterator, /*arena=*/nullptr,
+          /*skip_filters=*/false, /*level=*/-1,
+          MaxFileSizeForL0MetaPin(svnew->mutable_cf_options),
+          /*smallest_compaction_key=*/nullptr,
+          /*largest_compaction_key=*/nullptr, allow_unprepared_value_);
     }
-    l0_iters_new.push_back(cfd_->table_cache()->NewIterator(
-        read_options_, *cfd_->soptions(), cfd_->internal_comparator(),
-        *l0_files_new[inew],
-        read_options_.ignore_range_deletions ? nullptr : &range_del_agg,
-        svnew->mutable_cf_options,
-        /*table_reader_ptr=*/nullptr, /*file_read_hist=*/nullptr,
-        TableReaderCaller::kUserIterator, /*arena=*/nullptr,
-        /*skip_filters=*/false, /*level=*/-1,
-        MaxFileSizeForL0MetaPin(svnew->mutable_cf_options),
-        /*smallest_compaction_key=*/nullptr,
-        /*largest_compaction_key=*/nullptr, allow_unprepared_value_));
   }
 
   for (auto* f : l0_iters_) {
@@ -892,11 +992,19 @@ void ForwardIterator::BuildLevelIterators(const VersionStorageInfo* vstorage,
 }
 
 void ForwardIterator::ResetIncompleteIterators() {
-  const auto& l0_files = sv_->current->storage_info()->LevelFiles(0);
-  for (size_t i = 0; i < l0_iters_.size(); ++i) {
-    assert(i < l0_files.size());
+  const auto* vstorage = sv_->current->storage_info();
+  const auto& l0_files = vstorage->LevelFiles(0);
+  const bool enable_partition =
+      sv_->mutable_cf_options.delta_options.enable_partition;
+  const bool use_partition_index =
+      enable_partition && read_options_.read_partition_id >= 0;
+
+  auto reset_one_l0_iter = [&](size_t i) {
+    if (i >= l0_iters_.size() || i >= l0_files.size()) {
+      return;
+    }
     if (!l0_iters_[i] || !l0_iters_[i]->status().IsIncomplete()) {
-      continue;
+      return;
     }
     DeleteIterator(l0_iters_[i]);
     l0_iters_[i] = cfd_->table_cache()->NewIterator(
@@ -908,7 +1016,24 @@ void ForwardIterator::ResetIncompleteIterators() {
         MaxFileSizeForL0MetaPin(sv_->mutable_cf_options),
         /*smallest_compaction_key=*/nullptr,
         /*largest_compaction_key=*/nullptr, allow_unprepared_value_);
+      l0_iters_[i] = WrapUnpartitionedL0IterIfNeeded(
+        l0_iters_[i], sv_->mutable_cf_options, read_options_, l0_files[i]);
     l0_iters_[i]->SetPinnedItersMgr(pinned_iters_mgr_);
+  };
+
+  if (use_partition_index) {
+    const auto& partition_files =
+        vstorage->Level0FilesForPartition(read_options_.read_partition_id);
+    for (const auto* f : partition_files) {
+      auto loc = vstorage->GetFileLocation(f->fd.GetNumber());
+      if (loc.IsValid() && loc.GetLevel() == 0) {
+        reset_one_l0_iter(loc.GetPosition());
+      }
+    }
+  } else {
+    for (size_t i = 0; i < l0_iters_.size(); ++i) {
+      reset_one_l0_iter(i);
+    }
   }
 
   for (auto* level_iter : level_iters_) {
@@ -991,15 +1116,42 @@ bool ForwardIterator::NeedToSeekImmutable(const Slice& target) {
 void ForwardIterator::DeleteCurrentIter() {
   const VersionStorageInfo* vstorage = sv_->current->storage_info();
   const std::vector<FileMetaData*>& l0 = vstorage->LevelFiles(0);
-  for (size_t i = 0; i < l0.size(); ++i) {
+  const bool enable_partition =
+      sv_->mutable_cf_options.delta_options.enable_partition;
+  const bool use_partition_index =
+      enable_partition && read_options_.read_partition_id >= 0;
+
+  auto delete_if_current = [&](size_t i) -> bool {
+    if (i >= l0.size() || i >= l0_iters_.size()) {
+      return false;
+    }
     if (!l0_iters_[i]) {
-      continue;
+      return false;
     }
     if (l0_iters_[i] == current_) {
       has_iter_trimmed_for_upper_bound_ = true;
       DeleteIterator(l0_iters_[i]);
       l0_iters_[i] = nullptr;
-      return;
+      return true;
+    }
+    return false;
+  };
+
+  if (use_partition_index) {
+    const auto& partition_files =
+        vstorage->Level0FilesForPartition(read_options_.read_partition_id);
+    for (const auto* f : partition_files) {
+      auto loc = vstorage->GetFileLocation(f->fd.GetNumber());
+      if (loc.IsValid() && loc.GetLevel() == 0 &&
+          delete_if_current(loc.GetPosition())) {
+        return;
+      }
+    }
+  } else {
+    for (size_t i = 0; i < l0.size(); ++i) {
+      if (delete_if_current(i)) {
+        return;
+      }
     }
   }
 

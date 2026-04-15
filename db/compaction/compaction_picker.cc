@@ -9,6 +9,7 @@
 
 #include "db/compaction/compaction_picker.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <limits>
 #include <queue>
@@ -1232,7 +1233,8 @@ void CompactionPicker::PickFilesMarkedForCompaction(
 
 bool CompactionPicker::GetOverlappingL0Files(
     VersionStorageInfo* vstorage, CompactionInputFiles* start_level_inputs,
-    int output_level, int* parent_index, const FileMetaData* starting_l0_file) {
+  int output_level, int* parent_index, bool enable_partition,
+  const FileMetaData* starting_l0_file) {
   // Two level 0 compaction won't run at the same time, so don't need to worry
   // about files on level 0 being compacted.
   assert(level0_compactions_in_progress()->empty());
@@ -1241,6 +1243,7 @@ bool CompactionPicker::GetOverlappingL0Files(
   // Note that the next call will discard the file we placed in
   // c->inputs_[0] earlier and replace it with an overlapping set
   // which will include the picked file.
+  const uint32_t target_partition = start_level_inputs->files[0]->partition_id;
   start_level_inputs->files.clear();
   vstorage->GetOverlappingInputs(0, &smallest, &largest,
                                  &(start_level_inputs->files),
@@ -1248,6 +1251,19 @@ bool CompactionPicker::GetOverlappingL0Files(
                                  /*file_index=*/nullptr,
                                  /*expand_range=*/true,
                                  /*starting_l0_file=*/starting_l0_file);
+
+  if (enable_partition) {
+    start_level_inputs->files.erase(
+        std::remove_if(start_level_inputs->files.begin(),
+                       start_level_inputs->files.end(),
+                       [target_partition](const FileMetaData* f) {
+                         return f->partition_id != target_partition;
+                       }),
+        start_level_inputs->files.end());
+  }
+  if (start_level_inputs->files.empty()) {
+    return false;
+  }
 
   // If we include more L0 files in the same compaction run it can
   // cause the 'smallest' and 'largest' key to get extended to a

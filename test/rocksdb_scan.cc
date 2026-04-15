@@ -29,13 +29,16 @@
 // ==========================================
 // 配置常量
 // ==========================================
-const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_native";
-const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_delta";
+const std::string kNativeDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_native";
+const std::string kDeltaDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_delta";
+const std::string kDeltaPartitionDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_delta_partition";
 const int kNumThreads = 16;
-const int kTestDurationSec = 2500;       // s
+const int kTestDurationSec = 300;       // s
 const int kNumCuids = 1000000;           // 100W CUID 总库
-const int kBatchSize = 512;             // 每次 Put 128 行
-const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
+const uint64_t kNumTableIds = 4;
+const uint64_t kDbId = 1;
+const int kBatchSize = 512;             // 每次 Put 512 行
+const int kTargetPutBatches = 120;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
 const double kHotRatio = 0.15;          // 15% 的热点
 const int kHotScanTarget = 50;        // 热点访问目标
 const int kColdScanTarget = 20;        // 普通访问目标
@@ -46,7 +49,8 @@ const int kColdScanTarget = 20;        // 普通访问目标
 
 bool CleanupDBPath(const std::string& path) {
   std::error_code ec;
-  if (path != kNativeDBPath && path != kDeltaDBPath) {
+  if (path != kNativeDBPath && path != kDeltaDBPath &&
+      path != kDeltaPartitionDBPath) {
     std::cerr << "Refusing to delete non-test path: " << path << std::endl;
     return false;
   }
@@ -54,14 +58,28 @@ bool CleanupDBPath(const std::string& path) {
   return true;
 }
 
-std::string GenerateKey(uint64_t cuid, int row_id) {
+void EncodeUint64BE(uint64_t value, char* out) {
+  for (int i = 0; i < 8; ++i) {
+    out[i] = static_cast<char>((value >> (56 - 8 * i)) & 0xFF);
+  }
+}
+
+uint64_t TableIdFromCUID(uint64_t cuid) {
+  // Keep CUID evenly distributed over 4 table IDs.
+  return (cuid - 1) % kNumTableIds + 1;
+}
+
+int32_t PartitionIdFromTableId(uint64_t table_id) {
+  return static_cast<int32_t>(table_id % 16);
+}
+
+std::string GenerateKey(uint64_t table_id, uint64_t cuid, int row_id) {
   std::string key;
   key.resize(40);
   std::memset(&key[0], 0, 40);
-  unsigned char* p = reinterpret_cast<unsigned char*>(&key[0]) + 16;
-  for (int i = 0; i < 8; ++i) {
-    p[i] = (cuid >> (56 - 8 * i)) & 0xFF; // Big Endian
-  }
+  EncodeUint64BE(kDbId, &key[0]);
+  EncodeUint64BE(table_id, &key[8]);
+  EncodeUint64BE(cuid, &key[16]);
   char row_buf[16];
   snprintf(row_buf, sizeof(row_buf), "%010d", row_id);
   std::memcpy(&key[24], row_buf, 10);
@@ -104,8 +122,9 @@ struct ThreadStats {
 
 class PerfRunner {
  public:
-  PerfRunner(rocksdb::DB* db, std::atomic<uint64_t>* next_cuid) 
-      : db_(db), next_cuid_(next_cuid) {}
+  PerfRunner(rocksdb::DB* db, std::atomic<uint64_t>* next_cuid,
+             bool partition_enabled)
+      : db_(db), next_cuid_(next_cuid), partition_enabled_(partition_enabled) {}
 
     struct CuidState {
       uint64_t cuid;
@@ -172,8 +191,9 @@ class PerfRunner {
 
       // 3. 执行动作
       if (do_put) {
-        DoPut(state.cuid, state.puts_done * kBatchSize, stats);
-        state.puts_done++;
+        if (DoPut(state.cuid, state.puts_done * kBatchSize, stats)) {
+          state.puts_done++;
+        }
       } else {
         bool full_scan = (dist(gen) < 0.2); // 20% Full Scan (SAC) / 80% Partial Scan
         DoScan(state.cuid, state.puts_done * kBatchSize, full_scan, read_opts, stats, gen);
@@ -187,7 +207,8 @@ class PerfRunner {
       // 4. 判断该 CUID 是否终于走完了完整的轮回
       if (state.puts_done >= kTargetPutBatches && state.scans_done >= state.target_scans) {
         int final_rows = state.puts_done * kBatchSize;
-        int final_scan_count = DoScan(state.cuid, final_rows, true, read_opts, stats, gen);
+        int final_scan_count =
+          DoScan(state.cuid, final_rows, true, read_opts, stats, gen);
         if (final_scan_count != final_rows) {
           std::cerr << "[ERROR] Thread " << thread_id << " - CUID " << state.cuid 
                     << " final full scan mismatch! Expected: " << final_rows 
@@ -223,27 +244,34 @@ class PerfRunner {
   }
 
  private:
-  void DoPut(uint64_t cuid, int start_row, ThreadStats* stats) {
+  bool DoPut(uint64_t cuid, int start_row, ThreadStats* stats) {
+    const uint64_t table_id = TableIdFromCUID(cuid);
     rocksdb::WriteBatch batch;
     for (int i = 0; i < kBatchSize; ++i) {
-      batch.Put(GenerateKey(cuid, start_row + i), "value_data_payload_xxxxxxxxxxxxxxxxxxxx");
+      batch.Put(GenerateKey(table_id, cuid, start_row + i),
+                "value_data_payload_xxxxxxxxxxxxxxxxxxxx");
     }
     auto start = std::chrono::high_resolution_clock::now();
     rocksdb::Status s = db_->Write(rocksdb::WriteOptions(), &batch);
     auto end = std::chrono::high_resolution_clock::now();
+    if (!s.ok()) {
+      return false;
+    }
     stats->AddPut(std::chrono::duration<double, std::milli>(end - start).count());
+    return true;
   }
 
   int DoScan(uint64_t cuid, int cur_rows, bool full_scan, const rocksdb::ReadOptions& ro, ThreadStats* stats, std::default_random_engine& gen) {
+    const uint64_t table_id = TableIdFromCUID(cuid);
     std::string start_key, end_key;
     if (full_scan) {
-      start_key = GenerateKey(cuid, 0);
-      end_key = GenerateKey(cuid + 1, 0);
+      start_key = GenerateKey(table_id, cuid, 0);
+      end_key = GenerateKey(table_id, cuid, cur_rows);
     } else {
       // 随机扫描 10%-75% 的数据范围
       if (cur_rows < 10) {
-          start_key = GenerateKey(cuid, 0);
-          end_key = GenerateKey(cuid, cur_rows);
+          start_key = GenerateKey(table_id, cuid, 0);
+          end_key = GenerateKey(table_id, cuid, cur_rows);
       } else {
           int min_len = static_cast<int>(cur_rows * 0.1);
           int max_len = static_cast<int>(cur_rows * 0.75);
@@ -252,8 +280,8 @@ class PerfRunner {
           
           std::uniform_int_distribution<int> start_dist(0, std::max(0, cur_rows - scan_len));
           int start_row = start_dist(gen);
-          start_key = GenerateKey(cuid, start_row);
-          end_key = GenerateKey(cuid, start_row + scan_len);
+          start_key = GenerateKey(table_id, cuid, start_row);
+          end_key = GenerateKey(table_id, cuid, start_row + scan_len);
       }
     }
 
@@ -261,6 +289,9 @@ class PerfRunner {
     rocksdb::ReadOptions ro_copy = ro;
     ro_copy.iterate_upper_bound = &upper_bound;
     ro_copy.delta_full_scan = full_scan;
+    if (partition_enabled_) {
+      ro_copy.read_partition_id = PartitionIdFromTableId(table_id);
+    }
 
     auto t_start = std::chrono::high_resolution_clock::now();
     rocksdb::Iterator* it = db_->NewIterator(ro_copy);
@@ -280,10 +311,11 @@ class PerfRunner {
   }
 
   void DoDelete(uint64_t cuid, int total_rows, ThreadStats* stats) {
+    const uint64_t table_id = TableIdFromCUID(cuid);
     rocksdb::WriteOptions wo;
     for (int i = 0; i < total_rows; ++i) {
       auto start = std::chrono::high_resolution_clock::now();
-      db_->Delete(wo, GenerateKey(cuid, i));
+      db_->Delete(wo, GenerateKey(table_id, cuid, i));
       auto end = std::chrono::high_resolution_clock::now();
       stats->AddDelete(std::chrono::duration<double, std::milli>(end - start).count());
     }
@@ -291,6 +323,7 @@ class PerfRunner {
 
   rocksdb::DB* db_;
   std::atomic<uint64_t>* next_cuid_;
+  bool partition_enabled_;
 };
 
 void ReportStats(const std::string& label, const std::vector<ThreadStats>& all_stats) {
@@ -330,16 +363,19 @@ void ReportStats(const std::string& label, const std::vector<ThreadStats>& all_s
 int main() {
   CleanupDBPath(kNativeDBPath);
   CleanupDBPath(kDeltaDBPath);
+  CleanupDBPath(kDeltaPartitionDBPath);
 
   std::atomic<uint64_t> next_cuid_counter{1};
 
-  auto run_benchmark = [&](const std::string& path, bool delta_enabled, const std::string& label) {
+  auto run_benchmark = [&](const std::string& path, bool delta_enabled,
+                           bool partition_enabled, const std::string& label) {
     rocksdb::Options options;
     options.create_if_missing = true;
     options.statistics = rocksdb::CreateDBStatistics();
     
     if (delta_enabled) {
       options.enable_delta = true;
+      options.delta_options.enable_partition = partition_enabled;
 
       // --- Example 1: Programmatic Configuration of DeltaOptions ---
       // These can be set directly on the options object before opening the DB.
@@ -351,6 +387,7 @@ int main() {
       options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
       options.delta_options.hot_data_buffer_shards = 128;
       options.delta_options.compaction_l0_trigger_count = 30;
+      options.delta_options.compaction_l0_partition_trigger_count = 30;
       options.delta_options.compaction_l0_trigger_age_sec = 3600;
       options.delta_options.compaction_l0_files_to_pick = 10;
       // -------------------------------------------------------------
@@ -363,6 +400,9 @@ int main() {
       options.max_background_jobs = 16; // 与写入线程相同？
       options.num_levels = 1;
       options.level_compaction_dynamic_level_bytes = false;
+      if(partition_enabled){
+        options.write_buffer_size = 256 * 1024 * 1024;
+      }
     } else {
       options.enable_delta = false;
       options.max_background_jobs = 16;
@@ -383,7 +423,8 @@ int main() {
     std::atomic<bool> stop{false};
     std::vector<ThreadStats> all_thread_stats(kNumThreads);
     std::vector<std::thread> workers;
-    PerfRunner runner(db, &next_cuid_counter);
+    PerfRunner runner(db, &next_cuid_counter,
+              delta_enabled && partition_enabled);
 
     for (int i = 0; i < kNumThreads; i++) {
       workers.emplace_back(&PerfRunner::Run, &runner, i, &stop, &all_thread_stats[i]);
@@ -413,9 +454,8 @@ int main() {
 
     delete db;
   };
-
-  run_benchmark(kDeltaDBPath, true, "DELTA MODE");
-  run_benchmark(kNativeDBPath, false, "NATIVE MODE");
-
+  run_benchmark(kNativeDBPath, false, false, "NATIVE MODE");
+  run_benchmark(kDeltaDBPath, true, false, "DELTA MODE");
+  run_benchmark(kDeltaPartitionDBPath, true, true, "Partition MODE");
   return 0;
 }
