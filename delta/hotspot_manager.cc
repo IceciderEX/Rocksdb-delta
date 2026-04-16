@@ -556,13 +556,13 @@ static bool DetectSnapshotGap(uint64_t cuid, const std::vector<DataSegment>& seg
   for (size_t i = 0; i + 1 < segments.size(); ++i) {
     uint64_t last_id = ExtractRowID(segments[i].last_key);
     uint64_t next_id = ExtractRowID(segments[i+1].first_key);
-    if (last_id != 0 && next_id != 0 && last_id + 1 != next_id && last_id < next_id) {
-      fprintf(stderr, "[DIAG_GAP_DETECTED] CUID %lu [%s] GAP between Seg%zu and Seg%zu! "
-              "Last (File %lu): %lu, Next (File %lu): %lu. Missing: %lu\n",
-              cuid, context, i, i+1, segments[i].file_number, last_id, 
-              segments[i+1].file_number, next_id, last_id + 1);
-      return true;
-    }
+    // if (last_id != 0 && next_id != 0 && last_id + 1 != next_id && last_id < next_id) {
+    //   fprintf(stderr, "[DIAG_GAP_DETECTED] CUID %lu [%s] GAP between Seg%zu and Seg%zu! "
+    //           "Last (File %lu): %lu, Next (File %lu): %lu. Missing: %lu\n",
+    //           cuid, context, i, i+1, segments[i].file_number, last_id, 
+    //           segments[i+1].file_number, next_id, last_id + 1);
+    //   return true;
+    // }
   }
   return false;
 
@@ -710,60 +710,58 @@ void HotspotManager::FinalizeScanAsCompaction(
     return;
   }
 
-  if (db_options_.delta_options.enable_partition) {
-    // Coverage guard: only for partition mode where hot full-scan can be
-    // incomplete. Keep non-partition finalize flow unchanged.
-    HotIndexEntry old_entry;
-    if (index_table_.GetEntry(cuid, &old_entry) && old_entry.HasSnapshot()) {
-      bool has_old_bounds = false;
-      std::string old_min_key;
-      std::string old_max_key;
-      auto update_old_bounds = [&](const DataSegment& seg) {
-        if (seg.first_key.empty() || seg.last_key.empty()) {
-          return;
-        }
-        if (!has_old_bounds) {
-          old_min_key = seg.first_key;
-          old_max_key = seg.last_key;
-          has_old_bounds = true;
-          return;
-        }
-        if (internal_comparator_->Compare(seg.first_key, old_min_key) < 0) {
-          old_min_key = seg.first_key;
-        }
-        if (internal_comparator_->Compare(seg.last_key, old_max_key) > 0) {
-          old_max_key = seg.last_key;
-        }
-      };
-
-      for (const auto& seg : old_entry.snapshot_segments) {
-        update_old_bounds(seg);
-      }
-      for (const auto& seg : old_entry.deltas) {
-        update_old_bounds(seg);
-      }
-
-      const bool scan_range_valid =
-          !scan_first_key.empty() && !scan_last_key.empty() &&
-          internal_comparator_->Compare(scan_first_key, scan_last_key) <= 0;
-      const bool covers_old_range =
-          !has_old_bounds ||
-          (scan_range_valid &&
-           internal_comparator_->Compare(scan_first_key, old_min_key) <= 0 &&
-           internal_comparator_->Compare(scan_last_key, old_max_key) >= 0);
-
-      if (!covers_old_range) {
-        ROCKS_LOG_WARN(
-            db_options_.info_log,
-            "[HotspotManager] Skip unsafe full-replace for CUID %" PRIu64
-            ": scan range [%s, %s] does not cover old index range [%s, %s]",
-            cuid, FormatKeyDisplay(scan_first_key).c_str(),
-            FormatKeyDisplay(scan_last_key).c_str(),
-            has_old_bounds ? FormatKeyDisplay(old_min_key).c_str() : "N/A",
-            has_old_bounds ? FormatKeyDisplay(old_max_key).c_str() : "N/A");
-        release_pending_refs(final_segments);
+  // Coverage guard: never replace an existing snapshot with a scan result that
+  // does not cover the old indexed range.
+  HotIndexEntry old_entry;
+  if (index_table_.GetEntry(cuid, &old_entry) && old_entry.HasSnapshot()) {
+    bool has_old_bounds = false;
+    std::string old_min_key;
+    std::string old_max_key;
+    auto update_old_bounds = [&](const DataSegment& seg) {
+      if (seg.first_key.empty() || seg.last_key.empty()) {
         return;
       }
+      if (!has_old_bounds) {
+        old_min_key = seg.first_key;
+        old_max_key = seg.last_key;
+        has_old_bounds = true;
+        return;
+      }
+      if (internal_comparator_->Compare(seg.first_key, old_min_key) < 0) {
+        old_min_key = seg.first_key;
+      }
+      if (internal_comparator_->Compare(seg.last_key, old_max_key) > 0) {
+        old_max_key = seg.last_key;
+      }
+    };
+
+    for (const auto& seg : old_entry.snapshot_segments) {
+      update_old_bounds(seg);
+    }
+    for (const auto& seg : old_entry.deltas) {
+      update_old_bounds(seg);
+    }
+
+    const bool scan_range_valid =
+        !scan_first_key.empty() && !scan_last_key.empty() &&
+        internal_comparator_->Compare(scan_first_key, scan_last_key) <= 0;
+    const bool covers_old_range =
+        !has_old_bounds ||
+        (scan_range_valid &&
+         internal_comparator_->Compare(scan_first_key, old_min_key) <= 0 &&
+         internal_comparator_->Compare(scan_last_key, old_max_key) >= 0);
+
+    if (!covers_old_range) {
+      ROCKS_LOG_WARN(
+          db_options_.info_log,
+          "[HotspotManager] Skip unsafe full-replace for CUID %" PRIu64
+          ": scan range [%s, %s] does not cover old index range [%s, %s]",
+          cuid, FormatKeyDisplay(scan_first_key).c_str(),
+          FormatKeyDisplay(scan_last_key).c_str(),
+          has_old_bounds ? FormatKeyDisplay(old_min_key).c_str() : "N/A",
+          has_old_bounds ? FormatKeyDisplay(old_max_key).c_str() : "N/A");
+      release_pending_refs(final_segments);
+      return;
     }
   }
 

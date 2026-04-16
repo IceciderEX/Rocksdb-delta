@@ -1115,8 +1115,7 @@ void DeltaSwitchingIterator::Seek(const Slice& target) {
   // 否则，不论是点查还是全扫描(delta_full_scan)，只要是热点，全部走热点路径
   else if (cuid != 0 && hotspot_manager_->IsHot(cuid)) {
     if (InitHotIter(cuid)) {
-      if (read_options_.delta_full_scan &&
-          mutable_cf_options_.delta_options.enable_partition) {
+      if (read_options_.delta_full_scan) {
         InitColdIter();
         hybrid_iter_ = new HotColdHybridIterator(hot_iter_, cold_iter_, icmp_);
         current_iter_ = hybrid_iter_;

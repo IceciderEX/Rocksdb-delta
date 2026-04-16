@@ -463,12 +463,6 @@ void CompactionIterator::CheckHotspotFilters() {
 
   skip_current_file_obsolete_ = false;
 
-  const Compaction* real_compaction =
-      compaction_ != nullptr ? compaction_->real_compaction() : nullptr;
-  const bool enable_partition =
-      real_compaction != nullptr &&
-      real_compaction->mutable_cf_options().delta_options.enable_partition;
-
   // 1. 提取当前 Key 的 CUID
   uint64_t cuid = hotspot_manager_->ExtractCUID(input_.key());
   uint64_t file_id = input_file_number();
@@ -493,20 +487,14 @@ void CompactionIterator::CheckHotspotFilters() {
       // update：MVCC 如果该 CUID 的逻辑删除早于系统当前最老的快照再标记删除？
       if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid, earliest_snapshot_)) {
         skip_current_cuid_ = true;
-      } else if (!enable_partition && hotspot_manager_->IsHot(cuid) &&
-                 file_id != 0) {
-        obsolete_probe_file_.clear();
-        obsolete_probe_file_.push_back(file_id);
-        if (hotspot_manager_->ShouldSkipObsoleteDelta(cuid,
-                                                      obsolete_probe_file_)) {
-          skip_current_cuid_ = true;
-        }
       }
     }
   }
 
-  // Partition mode: use key-aware obsolete filtering.
-  if (enable_partition && !skip_current_cuid_ && cuid != 0 && file_id != 0 &&
+  // Use key-aware obsolete filtering for every delta mode. The file-level skip
+  // is too coarse once a file can contain both obsolete and live ranges for
+  // the same hot CUID.
+  if (!skip_current_cuid_ && cuid != 0 && file_id != 0 &&
       hotspot_manager_->IsHot(cuid)) {
     skip_current_file_obsolete_ = hotspot_manager_->ShouldSkipObsoleteDeltaKey(
         cuid, file_id, input_.key());

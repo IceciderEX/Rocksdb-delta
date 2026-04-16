@@ -28,18 +28,18 @@ static bool DetectSnapshotGap(uint64_t cuid, const std::vector<DataSegment>& seg
   for (size_t i = 0; i + 1 < segments.size(); ++i) {
     uint64_t last_id = ExtractRowID(segments[i].last_key);
     uint64_t next_id = ExtractRowID(segments[i+1].first_key);
-    if (last_id != 0 && next_id != 0 && last_id + 1 != next_id && last_id < next_id) {
-      fprintf(stderr, "[DIAG_GAP_DETECTED] CUID %lu [%s] GAP between Seg%zu and Seg%zu! "
-              "Last (File %lu): %lu, Next (File %lu): %lu. Missing: %lu\n",
-              cuid, context, i, i+1, segments[i].file_number, last_id, 
-              segments[i+1].file_number, next_id, last_id + 1);
-      for (size_t j = 0; j < segments.size(); ++j) {
-        fprintf(stderr, "  Seg%zu: File %lu, Range [%s, %s]\n", j, segments[j].file_number,
-                FormatKeyDisplay(segments[j].first_key).c_str(),
-                FormatKeyDisplay(segments[j].last_key).c_str());
-      }
-      return true;
-    }
+    // if (last_id != 0 && next_id != 0 && last_id + 1 != next_id && last_id < next_id) {
+    //   fprintf(stderr, "[DIAG_GAP_DETECTED] CUID %lu [%s] GAP between Seg%zu and Seg%zu! "
+    //           "Last (File %lu): %lu, Next (File %lu): %lu. Missing: %lu\n",
+    //           cuid, context, i, i+1, segments[i].file_number, last_id, 
+    //           segments[i+1].file_number, next_id, last_id + 1);
+    //   for (size_t j = 0; j < segments.size(); ++j) {
+    //     fprintf(stderr, "  Seg%zu: File %lu, Range [%s, %s]\n", j, segments[j].file_number,
+    //             FormatKeyDisplay(segments[j].first_key).c_str(),
+    //             FormatKeyDisplay(segments[j].last_key).c_str());
+    //   }
+    //   return true;
+    // }
   }
   return false;
 }
@@ -173,14 +173,14 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
       next_segments.push_back(replacement);
 
       if (false) {
-        fprintf(
-            stderr,
-            "[DIAG_PROMOTE] CUID %lu: Mem Segment [%s - %s] replaced by SST "
-            "%lu clipped to [%s - %s]\n",
-            cuid, FormatKeyDisplay(seg.first_key).c_str(),
-            FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
-            FormatKeyDisplay(replacement.first_key).c_str(),
-            FormatKeyDisplay(replacement.last_key).c_str());
+        // fprintf(
+        //     stderr,
+        //     "[DIAG_PROMOTE] CUID %lu: Mem Segment [%s - %s] replaced by SST "
+        //     "%lu clipped to [%s - %s]\n",
+        //     cuid, FormatKeyDisplay(seg.first_key).c_str(),
+        //     FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
+        //     FormatKeyDisplay(replacement.first_key).c_str(),
+        //     FormatKeyDisplay(replacement.last_key).c_str());
       }
     } else {
       next_segments.push_back(seg);
@@ -188,21 +188,21 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
   }
 
   if (DetectSnapshotGap(cuid, next_segments, "PromoteSnapshot")) {
-    for (size_t j = 0; j < entry.deltas.size(); ++j) {
-      fprintf(stderr, " Delta%zu:, Range [%s, %s]\n", j,
-              FormatKeyDisplay(entry.deltas[j].first_key).c_str(),
-              FormatKeyDisplay(entry.deltas[j].last_key).c_str());
-    }
+    // for (size_t j = 0; j < entry.deltas.size(); ++j) {
+    //   fprintf(stderr, " Delta%zu:, Range [%s, %s]\n", j,
+    //           FormatKeyDisplay(entry.deltas[j].first_key).c_str(),
+    //           FormatKeyDisplay(entry.deltas[j].last_key).c_str());
+    // }
 
-    fprintf(stderr, "[DIAG_POST_PROMOTE] new segment [%s - %s]\n",
-            FormatKeyDisplay(new_segment.first_key).c_str(),
-            FormatKeyDisplay(new_segment.last_key).c_str());
-    for (size_t i = 0; i < clipped_mem_segments.size(); ++i) {
-      fprintf(stderr, "[DIAG_POST_PROMOTE] Clipped Mem Segment %zu: [%s - %s]\n",
-              i, FormatKeyDisplay(clipped_mem_segments[i].first_key).c_str(),
-              FormatKeyDisplay(clipped_mem_segments[i].last_key).c_str());
-    }
-    int idx = 0;
+    // fprintf(stderr, "[DIAG_POST_PROMOTE] new segment [%s - %s]\n",
+    //         FormatKeyDisplay(new_segment.first_key).c_str(),
+    //         FormatKeyDisplay(new_segment.last_key).c_str());
+    // for (size_t i = 0; i < clipped_mem_segments.size(); ++i) {
+    //   fprintf(stderr, "[DIAG_POST_PROMOTE] Clipped Mem Segment %zu: [%s - %s]\n",
+    //           i, FormatKeyDisplay(clipped_mem_segments[i].first_key).c_str(),
+    //           FormatKeyDisplay(clipped_mem_segments[i].last_key).c_str());
+    // }
+    // int idx = 0;
   }
 
   if (found_mem_overlap) {
@@ -613,21 +613,21 @@ void HotIndexTable::ReplaceOverlappingSegments(
               });
     
     if (DetectSnapshotGap(cuid, next_segments, "ReplaceOverlappingSegments")) {
-      for (size_t j = 0; j < entry.deltas.size(); ++j) {
-        fprintf(stderr, " Delta%zu:, Range [%s, %s]\n", j,
-                FormatKeyDisplay(entry.deltas[j].first_key).c_str(),
-                FormatKeyDisplay(entry.deltas[j].last_key).c_str());
-      }
+      // for (size_t j = 0; j < entry.deltas.size(); ++j) {
+      //   fprintf(stderr, " Delta%zu:, Range [%s, %s]\n", j,
+      //           FormatKeyDisplay(entry.deltas[j].first_key).c_str(),
+      //           FormatKeyDisplay(entry.deltas[j].last_key).c_str());
+      // }
 
-      fprintf(stderr, "[DIAG_POST_REPLACE] new segment [%s - %s]\n",
-              FormatKeyDisplay(new_segment.first_key).c_str(),
-              FormatKeyDisplay(new_segment.last_key).c_str());
-      for (size_t i = 0; i < next_segments.size(); ++i) {
-        fprintf(stderr, "[DIAG_POST_REPLACE] SNAPSHOTS %zu: [%s - %s]\n",
-                i, FormatKeyDisplay(next_segments[i].first_key).c_str(),
-                FormatKeyDisplay(next_segments[i].last_key).c_str());
-      }
-      int idx = 0;
+      // fprintf(stderr, "[DIAG_POST_REPLACE] new segment [%s - %s]\n",
+      //         FormatKeyDisplay(new_segment.first_key).c_str(),
+      //         FormatKeyDisplay(new_segment.last_key).c_str());
+      // for (size_t i = 0; i < next_segments.size(); ++i) {
+      //   fprintf(stderr, "[DIAG_POST_REPLACE] SNAPSHOTS %zu: [%s - %s]\n",
+      //           i, FormatKeyDisplay(next_segments[i].first_key).c_str(),
+      //           FormatKeyDisplay(next_segments[i].last_key).c_str());
+      // }
+      // int idx = 0;
     }
     // DetectSnapshotGap(cuid, snapshots, "ReplaceOverlappingSegments");
 
