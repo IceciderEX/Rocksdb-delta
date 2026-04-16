@@ -474,6 +474,15 @@ void CompactionIterator::CheckHotspotFilters() {
       cuid_gap_after_skip_ = cuid;
     }
 
+    // [DIAG] 同一 CUID 切换文件时，若上一个文件是 valid（未 skip），
+    // ConsumeSkipGap 不会产生 gap 信号。若两个 valid 文件之间存在数据空隙
+    // （前序 compaction 已清除中间数据），该 gap 将无法被检测到。
+    if (cuid == current_cuid_ && !skip_current_cuid_ && current_file_number_ != 0) {
+      DiagLogf("[DIAG_COMPACTION_FILE_SWITCH] CUID %lu: valid file %lu -> file %lu "
+              "(no skip signal, potential undetectable gap)\n",
+              cuid, current_file_number_, file_id);
+    }
+
     // 记录涉及到的物理输入文件
     if (input_map_ && cuid != 0) {
       if (file_id != 0) {

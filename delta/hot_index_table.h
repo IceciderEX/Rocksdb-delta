@@ -83,7 +83,7 @@ class HotIndexTable {
   // replace涉及的 Snapshot 或 Delta 段
   void ReplaceOverlappingSegments(
       uint64_t cuid, const DataSegment& new_segment,
-      const std::vector<uint64_t>& obsolete_delta_files);
+      const std::vector<DataSegment>& obsolete_delta_segments);
 
   // PartialMerge 专用的无窗口原子替换方法。
   // 在单次 shard.mutex unique_lock
@@ -96,7 +96,7 @@ class HotIndexTable {
       bool has_buf_data,
       const std::string& buf_min,
       const std::string& buf_max,
-      const std::vector<uint64_t>& obsolete_delta_files);
+      const std::vector<DataSegment>& obsolete_delta_segments);
 
   // 统计与给定 key 范围重叠的 delta 数量
   size_t CountOverlappingDeltas(uint64_t cuid, const std::string& first_key,

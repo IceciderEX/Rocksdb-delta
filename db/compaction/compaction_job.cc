@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include "delta/diag_log.h"
 #include "util/extract_cuid.h"
 #include <memory>
 #include <optional>
@@ -142,7 +143,12 @@ struct DeltaCompactionContext {
     std::string current_last_key;
     uint64_t current_entry_count = 0;
     // 记录输入文件id
-    std::unordered_set<uint64_t> current_input_files; 
+    std::unordered_set<uint64_t> current_input_files;
+
+    // [PATH C] 多段输入文件的段边界缓存：key=file_number，value=该文件在 delta index
+    // 中为 current_cuid 注册的各段 last_rid（升序）。仅当段数 > 1 时非空。
+    // 在 CUID 切换时清空；FlushSegment 时保留（同一 CUID 内可复用）。
+    std::unordered_map<uint64_t, std::vector<uint64_t>> input_file_seg_ends;
 
     // segment 是否已经初始化 sk
     bool has_started_segment = false;
@@ -161,8 +167,7 @@ struct DeltaCompactionContext {
             if (first_rid > 0 && last_rid > 0 && last_rid >= first_rid) {
               uint64_t expected_dense = last_rid - first_rid + 1;
               if (current_entry_count < expected_dense) {
-                fprintf(stderr,
-                    "[DIAG_COMPACTION_SPARSE] CUID %lu: output file=%lu "
+                DiagLogf("[DIAG_COMPACTION_SPARSE] CUID %lu: output file=%lu "
                     "range=[rid %lu - %lu] expected_dense=%lu actual=%lu "
                     "MISSING=%lu rows. input_files=[%s]\n",
                     current_cuid, actual_file_number,
@@ -1125,7 +1130,8 @@ Status CompactionJob::Install(bool* compaction_released) {
     // fix: 成功之后再修改metadata
     if (status.ok() && hotspot_manager_) {
         if (status.ok() && hotspot_manager_) {
-          fprintf(stderr, "CompactionJob::Install()\n");
+          // fprintf(stderr, "CompactionJob::Install()\n");
+          DiagLogf("CompactionJob::Install()\n");
           // CUID -> List<Segments>
           std::map<uint64_t, std::vector<DeltaOutputInfo>> output_map;
           for (const auto& out : global_outputs_) {
@@ -1739,20 +1745,110 @@ Status CompactionJob::ProcessKeyValue(
         if (cuid != delta_ctx->current_cuid) {
              delta_ctx->FlushSegment(delta_ctx->current_file_number);
              // newcuid
-             delta_ctx->current_cuid = cuid; 
+             delta_ctx->current_cuid = cuid;
+             // CUID 切换时清空段边界缓存（不同 CUID 对同一文件的段注册不同）
+             delta_ctx->input_file_seg_ends.clear();
+             // [BUG FIX] 丢弃 stale gap 信号：
+             // cuid_gap_after_skip_ 可能在当前 CUID 的起始跳过文件（begin-of-CUID skips）
+             // 时被设置，代表 "从跳过文件切换到第一个合法文件"。但此时 ProcessKeyValue
+             // 刚开始追踪该 CUID，has_started_segment=false，没有"之前的数据"，
+             // 不应触发 gap-split。若不在此消费，该信号会被下一个 key 的 ELSE 分支
+             // 作为 false positive 消费，导致真正的 mid-CUID gap 无法检测。
+             c_iter->ConsumeSkipGap();  // 丢弃（不检查返回值）
+             DiagLogf("[DIAG_COMPACTION_CUID_CHANGE] CUID changed -> %lu at key=%s\n",
+                     cuid, c_iter->key().ToString().substr(0, 40).c_str());
         } else {
           // [FIX] 同一 CUID 内，若 CompactionIterator 刚完成了一次 obsolete delta skip，
           // 说明输出数据中有 gap，需截断当前 segment，新起一段（避免注册稀疏 delta range）。
           uint64_t gap_cuid = c_iter->ConsumeSkipGap();
           if (gap_cuid == cuid && delta_ctx->has_started_segment) {
-            fprintf(stderr,
-                    "[DIAG_COMPACTION_GAP_SPLIT] CUID %lu: obsolete-file gap detected, "
+            DiagLogf("[DIAG_COMPACTION_GAP_SPLIT] CUID %lu: obsolete-file gap detected, "
                     "splitting segment at last_key=%s, next_key=%s\n",
                     cuid,
                     delta_ctx->current_last_key.substr(0, 40).c_str(),
                     c_iter->key().ToString().substr(0, 40).c_str());
             delta_ctx->FlushSegment(delta_ctx->current_file_number);
             // 重置，但保持 current_cuid 不变（同一 CUID 继续追踪，新段开始）
+          }
+
+          // [FIX-B] 检测 valid→valid 文件切换时的数据 gap：
+          // ConsumeSkipGap 只能捕捉 "obsolete-skip 事件" 触发的 gap（路径 A），
+          // 但当前序 compaction 已跳过中间数据并将其清理出输入集合时，后续 compaction
+          // 的两个相邻 valid 文件之间可能存在大范围 row_id 空洞（中间数据在 snapshot）。
+          // 此路径在文件切换边界（input_file_id 首次出现于当前 segment）检测 row_id gap，
+          // 避免对文件内部正常连续数据产生误触发。
+          else if (delta_ctx->has_started_segment
+                   && input_file_id != 0
+                   && delta_ctx->current_input_files.find(input_file_id)
+                          == delta_ctx->current_input_files.end()
+                   && !delta_ctx->current_last_key.empty()) {
+            uint64_t prev_rid = ExtractRowID(Slice(delta_ctx->current_last_key));
+            uint64_t cur_rid = ExtractRowID(c_iter->key());
+            if (prev_rid > 0 && cur_rid > 0 && cur_rid > prev_rid + 1) {
+              DiagLogf("[DIAG_COMPACTION_GAP_SPLIT] CUID %lu: valid-file gap detected "
+                      "at file switch, prev_rid=%lu -> cur_rid=%lu(file=%lu) "
+                      "gap=%lu rows, splitting segment\n",
+                      cuid, prev_rid, cur_rid, input_file_id,
+                      cur_rid - prev_rid - 1);
+              delta_ctx->FlushSegment(delta_ctx->current_file_number);
+            }
+          }
+
+          // [PATH C] 多段输入文件边界缓存填充：
+          // 当某个输入文件不在缓存中时，查询 delta index 获取该文件为 current_cuid
+          // 注册的所有段 last_rid
+          if (input_file_id != 0
+              && !delta_ctx->input_file_seg_ends.count(input_file_id)) {
+            HotIndexEntry _idx_entry;
+            if (delta_ctx->manager->GetIndexTable().GetEntry(
+                    delta_ctx->current_cuid, &_idx_entry)) {
+              std::vector<uint64_t> seg_ends;
+              for (const auto& _seg : _idx_entry.deltas) {
+                if (_seg.file_number == input_file_id) {
+                  uint64_t _lr = ExtractRowID(Slice(_seg.last_key));
+                  if (_lr > 0) seg_ends.push_back(_lr);
+                }
+              }
+              std::sort(seg_ends.begin(), seg_ends.end());
+              if (seg_ends.size() > 1) {
+                DiagLogf("[DIAG_COMPACTION_MULTISEG] CUID %lu: input file=%lu has %zu registered segments\n",
+                        delta_ctx->current_cuid, input_file_id, seg_ends.size());
+              }
+              // 无论单段还是多段都写入缓存，避免重复查询
+              delta_ctx->input_file_seg_ends[input_file_id] = std::move(seg_ends);
+            } else {
+              // 文件不在 index（新写入尚未注册），视为单段
+              delta_ctx->input_file_seg_ends[input_file_id] = {};
+            }
+          }
+
+          // [PATH C] 同一文件内跨段边界检测：
+          // 当前文件已在 current_input_files 中（非首次），若 row_id 跨越了某个
+          // 注册段的 last_rid，说明数据跳入了下一个不连续段——分割输出段注册。
+          if (input_file_id != 0
+              && delta_ctx->has_started_segment
+              && !delta_ctx->current_last_key.empty()
+              && delta_ctx->current_input_files.count(input_file_id)) {
+            auto _it = delta_ctx->input_file_seg_ends.find(input_file_id);
+            if (_it != delta_ctx->input_file_seg_ends.end()
+                && !_it->second.empty()) {
+              uint64_t _prev_rid = ExtractRowID(Slice(delta_ctx->current_last_key));
+              uint64_t _cur_rid  = ExtractRowID(c_iter->key());
+              if (_prev_rid > 0 && _cur_rid > 0) {
+                for (uint64_t _seg_end_rid : _it->second) {
+                  if (_prev_rid <= _seg_end_rid && _cur_rid > _seg_end_rid) {
+                    DiagLogf("[DIAG_COMPACTION_GAP_SPLIT] CUID %lu: "
+                             "multi-segment file=%lu boundary crossed, "
+                             "prev_rid=%lu -> cur_rid=%lu (seg_end=%lu), "
+                             "splitting segment\n",
+                             cuid, input_file_id,
+                             _prev_rid, _cur_rid, _seg_end_rid);
+                    delta_ctx->FlushSegment(delta_ctx->current_file_number);
+                    break;
+                  }
+                }
+              }
+            }
           }
         }
 

@@ -428,12 +428,32 @@ bool HotIndexTable::IsDeltaObsolete(
   const auto& entry = it->second;
   if (entry.obsolete_deltas.empty()) return false;
 
-  for (const auto& delta : entry.obsolete_deltas) {
-    for (uint64_t fid : input_files) {
-      if (delta.file_number == fid) {
-        return true;
+  for (uint64_t fid : input_files) {
+    bool found_in_obsolete = false;
+    for (const auto& obs : entry.obsolete_deltas) {
+      if (obs.file_number == fid) {
+        found_in_obsolete = true;
+        break;
       }
     }
+    if (!found_in_obsolete) continue;
+
+    // 保守检查：如果同一 file_number 在 active deltas 中仍有段，
+    // 说明该文件包含多个段且只有部分被 PM 覆盖，不能跳过。
+    bool still_active = false;
+    for (const auto& d : entry.deltas) {
+      if (d.file_number == fid) {
+        still_active = true;
+        break;
+      }
+    }
+    if (still_active) {
+      DiagLogf("[DIAG_OBSOLETE_GUARD] cuid=%lu file=%lu: in obsolete_deltas BUT still has active segment(s) in deltas "
+               "(Plan C multi-segment guard). L0 Compaction will NOT skip this file.\n",
+               cuid, fid);
+      return false;
+    }
+    return true;
   }
   return false;
 }
@@ -547,7 +567,7 @@ void HotIndexTable::RemoveCUID(uint64_t cuid) {
 
 void HotIndexTable::ReplaceOverlappingSegments(
     uint64_t cuid, const DataSegment& new_segment,
-    const std::vector<uint64_t>& obsolete_delta_files) {
+    const std::vector<DataSegment>& obsolete_delta_segments) {
   std::vector<DataSegment> segments_to_unref;
 
   {
@@ -680,18 +700,17 @@ void HotIndexTable::ReplaceOverlappingSegments(
       }
     }
 
-    if (!obsolete_delta_files.empty()) {
+    if (!obsolete_delta_segments.empty()) {
       auto& deltas = entry.deltas;
 
-      // 遍历 obsolete_delta_files
-      for (uint64_t file_num : obsolete_delta_files) {
-        // 在 entry.deltas 中找到并移除，同时移入 obsolete_deltas
+      // 段级精确匹配：只移入与 overlapping_deltas 精确匹配的段
+      for (const auto& obs_seg : obsolete_delta_segments) {
         for (auto it = deltas.begin(); it != deltas.end();) {
-          if (it->file_number == file_num) {
-            // 记录到 Obsolete (L0 Compaction再清除)
+          if (it->file_number == obs_seg.file_number &&
+              it->first_key == obs_seg.first_key &&
+              it->last_key == obs_seg.last_key) {
             entry.obsolete_deltas.push_back(*it);
             it = deltas.erase(it);
-            // 注意：一个 file_number 在 deltas 中可能出现多次吗？
           } else {
             ++it;
           }
@@ -719,7 +738,7 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
     bool has_buf_data,
     const std::string& buf_min,
     const std::string& buf_max,
-    const std::vector<uint64_t>& obsolete_delta_files) {
+    const std::vector<DataSegment>& obsolete_delta_segments) {
   // 在 shard lock 外收集待 Unref 的旧段（避免锁内调用 lifecycle_manager_→死锁风险）
   std::vector<DataSegment> segments_to_unref;
 
@@ -1133,12 +1152,15 @@ void HotIndexTable::AtomicReplaceForPartialMerge(
 
     snapshots = std::move(next_segments);
 
-    // ⑤ 处理 obsolete_delta_files
-    if (!obsolete_delta_files.empty()) {
+    // ⑤ 处理 obsolete_delta_segments（段级精确匹配）
+    // 只移入与 overlapping_deltas 精确匹配的段，同 file_number 的其他段保留在 active deltas
+    if (!obsolete_delta_segments.empty()) {
       auto& deltas = entry.deltas;
-      for (uint64_t file_num : obsolete_delta_files) {
+      for (const auto& obs_seg : obsolete_delta_segments) {
         for (auto it = deltas.begin(); it != deltas.end();) {
-          if (it->file_number == file_num) {
+          if (it->file_number == obs_seg.file_number &&
+              it->first_key == obs_seg.first_key &&
+              it->last_key == obs_seg.last_key) {
             entry.obsolete_deltas.push_back(*it);
             it = deltas.erase(it);
           } else {

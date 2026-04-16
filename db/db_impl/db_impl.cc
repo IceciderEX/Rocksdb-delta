@@ -7231,7 +7231,7 @@ void DBImpl::ProcessPendingPartialMerge() {
       new_segment.first_key = task.scan_first_key;
       new_segment.last_key = task.scan_last_key;
       hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
-          task.cuid, new_segment, std::vector<uint64_t>{});
+          task.cuid, new_segment, std::vector<DataSegment>{});
       // -1 段已建立，处理 pm_pending 中可能积累的跨线程 flush SST
       hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
       hotspot_manager_->UnlockCuid(task.cuid);
@@ -7471,11 +7471,12 @@ void DBImpl::ProcessPendingPartialMerge() {
         }
       };
 
-      std::vector<uint64_t> obsolete_files;
+      std::vector<DataSegment> obsolete_segments;
       for (const auto& seg : overlapping_snaps) {
         if (seg.file_number != static_cast<uint64_t>(-1)) {
           check_data_loss(seg.first_key, seg.last_key, seg.file_number, "snap");
-          obsolete_files.push_back(seg.file_number);
+          // snap segment 的 file_number 也加入，但 step⑤ 匹配的是 entry.deltas，
+          // snapshot segments 在步骤③中已被替换，这里加入不会匹配到任何 delta（无害）。
         }
       }
       for (const auto& seg : overlapping_deltas) {
@@ -7487,20 +7488,74 @@ void DBImpl::ProcessPendingPartialMerge() {
         Slice scan_last_user   = ExtractUserKey(Slice(task.scan_last_key));
         bool extends_before = icmp.user_comparator()->Compare(delta_first_user, scan_first_user) < 0;
         bool extends_after  = icmp.user_comparator()->Compare(delta_last_user, scan_last_user) > 0;
-        if (extends_before || extends_after) {
-          DiagLogf("[DIAG_PM_OBSOLETE_OVERFLOW] CUID %lu: delta file=%lu "
-              "range=[%s - %s] EXTENDS BEYOND scan range=[%s - %s] "
-              "(before=%d after=%d). "
-              "Marking obsolete will cause L0 Compaction to skip ALL data!\n",
-              (unsigned long)task.cuid, (unsigned long)seg.file_number,
-              FormatKeyDisplay(seg.first_key).c_str(),
-              FormatKeyDisplay(seg.last_key).c_str(),
-              FormatKeyDisplay(task.scan_first_key).c_str(),
-              FormatKeyDisplay(task.scan_last_key).c_str(),
-              (int)extends_before, (int)extends_after);
+        // 检查该 file 在 overlapping_deltas 中是否只有一个段（单段文件）。
+        // 若是多段文件（同 file_number 在 entry.deltas 中还有其他段未被 PM 吸收），
+        // Plan C 的 IsDeltaObsolete 保守检查会阻止 L0 Compaction 跳过，不会发生数据丢失。
+        bool is_multipart_file = false;
+        for (const auto& other : overlapping_deltas) {
+          // 同 file_number 不同段 → 多段（不可能出现在 overlapping_deltas 因为段不同）
+          (void)other; // overlapping_deltas 每个段唯一
         }
-        check_data_loss(seg.first_key, seg.last_key, seg.file_number, "delta");
-        obsolete_files.push_back(seg.file_number);
+        // 真正区分：检查 _dump.deltas 中该 file_number 出现次数 > 1 则为多段
+        {
+          HotIndexEntry _chk;
+          hotspot_manager_->GetIndexTable().GetEntry(task.cuid, &_chk);
+          int active_count = 0;
+          for (const auto& d : _chk.deltas) {
+            if (d.file_number == seg.file_number) active_count++;
+          }
+          // overlapping_deltas 中本次传入一段，若 active_count > 1 则还有其他活跃段
+          is_multipart_file = (active_count > 1);
+        }
+        if (extends_before || extends_after) {
+          if (is_multipart_file) {
+            DiagLogf("[DIAG_PM_OBSOLETE_OVERFLOW] CUID %lu: delta file=%lu "
+                "range=[%s - %s] EXTENDS BEYOND scan range=[%s - %s] "
+                "(before=%d after=%d). "
+                "[Plan C: file has other active segments → IsDeltaObsolete will return false → L0 will NOT skip]\n",
+                (unsigned long)task.cuid, (unsigned long)seg.file_number,
+                FormatKeyDisplay(seg.first_key).c_str(),
+                FormatKeyDisplay(seg.last_key).c_str(),
+                FormatKeyDisplay(task.scan_first_key).c_str(),
+                FormatKeyDisplay(task.scan_last_key).c_str(),
+                (int)extends_before, (int)extends_after);
+          } else {
+            DiagLogf("[DIAG_PM_OBSOLETE_OVERFLOW] CUID %lu: delta file=%lu "
+                "range=[%s - %s] EXTENDS BEYOND scan range=[%s - %s] "
+                "(before=%d after=%d). "
+                "[SINGLE-SEGMENT FILE: marking obsolete WILL cause L0 to skip extension rows → DATA LOSS RISK!]\n",
+                (unsigned long)task.cuid, (unsigned long)seg.file_number,
+                FormatKeyDisplay(seg.first_key).c_str(),
+                FormatKeyDisplay(seg.last_key).c_str(),
+                FormatKeyDisplay(task.scan_first_key).c_str(),
+                FormatKeyDisplay(task.scan_last_key).c_str(),
+                (int)extends_before, (int)extends_after);
+          }
+        }
+        // check_data_loss 对单段文件仍然有效（超出部分将因 L0 skip 而永久丢失）。
+        // 对多段文件（is_multipart_file=true），Plan C 阻止 L0 skip，不会真正丢失，但也记录以便追踪。
+        if (is_multipart_file) {
+          // 多段文件：Plan C 保护，不会 skip，DIAG_PM_LOST_ROWS 标注说明
+          Slice dlf = ExtractUserKey(Slice(seg.first_key));
+          Slice dll = ExtractUserKey(Slice(seg.last_key));
+          Slice pmf = ExtractUserKey(Slice(segment_first_key));
+          Slice pml = ExtractUserKey(Slice(segment_last_key));
+          bool pf = icmp.user_comparator()->Compare(dlf, pmf) < 0;
+          bool sf = icmp.user_comparator()->Compare(dll, pml) > 0;
+          if (pf || sf) {
+            DiagLogf("[DIAG_PM_LOST_ROWS] CUID %lu: delta file=%lu range=[%s-%s] "
+                     "PM_output=[%s-%s] → extension outside PM output "
+                     "[Plan C PROTECTED: file has active segments → L0 will NOT skip → NOT actually lost]\n",
+                     (unsigned long)task.cuid, (unsigned long)seg.file_number,
+                     FormatKeyDisplay(seg.first_key).c_str(),
+                     FormatKeyDisplay(seg.last_key).c_str(),
+                     FormatKeyDisplay(segment_first_key).c_str(),
+                     FormatKeyDisplay(segment_last_key).c_str());
+          }
+        } else {
+          check_data_loss(seg.first_key, seg.last_key, seg.file_number, "delta");
+        }
+        obsolete_segments.push_back(seg);
       }
 
       // ① 取出当前 pm_pending SSTs【过程中 flush 但未被 PromoteSnapshot 消费的 SST】
@@ -7522,7 +7577,7 @@ void DBImpl::ProcessPendingPartialMerge() {
           pm_sst_segs,
           pm_promoted_segs,
           has_buf_data, buf_min, buf_max,
-          obsolete_files);
+          obsolete_segments);
 
       // ④ -1 段已建立（若 has_buf_data），处理步骤 ①~③ 期间
       //    积累在 pm_pending[cuid] 的新跨线程 flush SST。

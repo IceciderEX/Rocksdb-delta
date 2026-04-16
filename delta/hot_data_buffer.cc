@@ -1,4 +1,5 @@
 #include "delta/hot_data_buffer.h"
+#include "delta/diag_log.h"
 #include <algorithm>
 #include "logging/logging.h"
 
@@ -292,20 +293,40 @@ InternalIterator* HotDataBuffer::NewIterator(
 void HotSstLifecycleManager::RegisterFile(uint64_t file_number, const std::string& file_path, const std::string& link_path) {
   std::lock_guard<std::mutex> lock(mutex_);
   files_[file_number] = {file_path, link_path, 0};
+  LifecycleLogf("[LC_REGISTER] file=%lu path=%s link=%s ref=0\n",
+               (unsigned long)file_number, file_path.c_str(), link_path.c_str());
 }
 void HotSstLifecycleManager::Ref(uint64_t file_number) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = files_.find(file_number);
-  if (it != files_.end()) it->second.ref_count++;
+  if (it != files_.end()) {
+    int old_ref = it->second.ref_count++;
+    LifecycleLogf("[LC_REF] file=%lu ref: %d -> %d\n",
+                 (unsigned long)file_number, old_ref, it->second.ref_count);
+  } else {
+    LifecycleLogf("[LC_WARN] Ref on unregistered file=%lu\n",
+                 (unsigned long)file_number);
+  }
 }
 void HotSstLifecycleManager::Unref(uint64_t file_number) {
   std::string f_del, l_del;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = files_.find(file_number);
-    if (it != files_.end() && --it->second.ref_count <= 0) {
-      f_del = it->second.file_path; l_del = it->second.link_path;
-      files_.erase(it);
+    if (it != files_.end()) {
+      int old_ref = it->second.ref_count;
+      --it->second.ref_count;
+      LifecycleLogf("[LC_UNREF] file=%lu ref: %d -> %d\n",
+                   (unsigned long)file_number, old_ref, it->second.ref_count);
+      if (it->second.ref_count <= 0) {
+        f_del = it->second.file_path; l_del = it->second.link_path;
+        files_.erase(it);
+        LifecycleLogf("[LC_DELETE] file=%lu DELETED (path=%s link=%s)\n",
+                     (unsigned long)file_number, f_del.c_str(), l_del.c_str());
+      }
+    } else {
+      LifecycleLogf("[LC_WARN] Unref on unregistered file=%lu\n",
+                   (unsigned long)file_number);
     }
   }
   if (!l_del.empty()) env_->DeleteFile(l_del);
