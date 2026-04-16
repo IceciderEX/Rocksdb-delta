@@ -541,7 +541,8 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
   const size_t kGlobalL0TriggerCount = static_cast<size_t>(std::max(
       mutable_cf_options_.delta_options.compaction_l0_trigger_count, 2));
   const size_t kPartitionL0TriggerCount = static_cast<size_t>(std::max(
-      mutable_cf_options_.delta_options.compaction_l0_trigger_count, 2));
+      mutable_cf_options_.delta_options.compaction_l0_partition_trigger_count,
+      2));
   const uint64_t kL0TriggerAge =
       mutable_cf_options_.delta_options.compaction_l0_trigger_age_sec;
   const size_t kFilesToPick = std::max<size_t>(
@@ -575,28 +576,42 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
     if (!trigger_by_global_count && !trigger_by_time) {
       return false;
     }
-    for (size_t i = total_files; i > 0 &&
-                       start_level_inputs_.files.size() < kFilesToPick;
-         --i) {
-      FileMetaData* f = l0_files[i - 1];
-      if (f->being_compacted) {
+
+    size_t current_pick_count = 0;
+    for (int i = static_cast<int>(total_files) - 1; i >= 0; --i) {
+      if (l0_files[static_cast<size_t>(i)]->being_compacted) {
+        if (current_pick_count > 0) {
+          current_pick_count = 0;
+          start_level_inputs_.files.clear();
+        }
         continue;
       }
-      start_level_inputs_.files.push_back(f);
+
+      start_level_inputs_.files.push_back(l0_files[static_cast<size_t>(i)]);
+      ++current_pick_count;
+      if (current_pick_count == kFilesToPick) {
+        break;
+      }
     }
 
-    if (start_level_inputs_.files.size() < 2) {
+    if (current_pick_count == 0) {
+      return false;
+    }
+
+    if (!trigger_by_time && current_pick_count < kFilesToPick) {
       start_level_inputs_.clear();
       return false;
     }
 
+    std::reverse(start_level_inputs_.files.begin(),
+                 start_level_inputs_.files.end());
     compaction_reason_ = CompactionReason::kLevelL0FilesNum;
     ROCKS_LOG_BUFFER(
         log_buffer_,
         "[Delta-Opt] Picked Mixed L0 Compaction (non-partitioned). Trigger: "
         "%s, Files: %zu, OutputLevel: 0",
-      trigger_by_global_count ? "GlobalCount" : "Time",
-      start_level_inputs_.size());
+        trigger_by_global_count ? "GlobalCount" : "Time",
+        start_level_inputs_.size());
     return true;
   }
 
@@ -713,24 +728,23 @@ bool LevelCompactionBuilder::PickMixedL0Compaction() {
 }
 
 Compaction* LevelCompactionBuilder::PickCompaction() {
-  // Pick up the first file to start compaction. It may have been extended
-  // to a clean cut.
-  SetupInitialFilesDelta();
+  if (ioptions_.enable_delta) {
+    SetupInitialFilesDelta();
+    if (start_level_inputs_.empty()) {
+      return nullptr;
+    }
+    assert(start_level_ == 0 && output_level_ == 0);
+    compaction_inputs_.push_back(start_level_inputs_);
+    Compaction* c = GetCompaction();
+    TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
+    return c;
+  }
+
+  // Original leveled compaction flow.
+  SetupInitialFiles();
   if (start_level_inputs_.empty()) {
     return nullptr;
   }
-  assert(start_level_ >= 0 && output_level_ >= 0);
-
-  // for delta L0 Compaction
-  if (start_level_ == 0 && output_level_ == 0) {
-      compaction_inputs_.push_back(start_level_inputs_);
-      Compaction* c = GetCompaction();
-      TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
-      return c;
-  }
-
-  // 原来的逻辑
-  SetupInitialFiles();
   assert(start_level_ >= 0 && output_level_ >= 0);
 
   // If it is a L0 -> base level compaction, we need to set up other L0
@@ -1221,7 +1235,7 @@ Compaction* LevelCompactionPicker::PickCompactionForCompactRange(
     const CompactRangeOptions& compact_range_options, const InternalKey* begin,
     const InternalKey* end, InternalKey** compaction_end, bool* manual_conflict,
     uint64_t max_file_num_to_ignore, const std::string& trim_ts) {
-  if (input_level == 0) {
+  if (input_level == 0 && ioptions_.enable_delta) {
     LogBuffer log_buffer(INFO_LEVEL, ioptions_.info_log.get());
     LevelCompactionBuilder builder(cf_name, vstorage, this, &log_buffer,
                                    mutable_cf_options, ioptions_,
@@ -1233,6 +1247,9 @@ Compaction* LevelCompactionPicker::PickCompactionForCompactRange(
       *compaction_end = nullptr;
       return c;
     }
+    log_buffer.FlushBufferToLog();
+    *compaction_end = nullptr;
+    return nullptr;
   }
 
   return CompactionPicker::PickCompactionForCompactRange(

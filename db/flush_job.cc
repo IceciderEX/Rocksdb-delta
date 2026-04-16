@@ -1029,38 +1029,23 @@ Status FlushJob::WriteLevel0Table() {
     const WriteOptions write_options(io_priority, Env::IOActivity::kFlush);
 
     const bool enable_partition =
-      mutable_cf_options_.delta_options.enable_partition;
-    // 仅在开启分区且没有 Range Deletion 时启用分区 flush。
-    const bool enable_partitioned_flush =
-      enable_partition && (total_num_range_deletes == 0);
-    if (enable_partition && !enable_partitioned_flush) {
-      ROCKS_LOG_WARN(
-          db_options_.info_log,
-          "[%s] [JOB %d] Partitioned flush disabled due to range deletions; "
-          "marking L0 output as unpartitioned",
-          cfd_->GetName().c_str(), job_context_->job_id);
-    }
-    uint64_t total_input_records_scanned = 0;
-    uint64_t total_output_records_written = 0;
-    uint64_t total_payload_bytes = 0;
-    uint64_t total_garbage_bytes = 0;
-
-    Arena arena;
-    std::vector<InternalIterator*> memtables;
-    std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
-        range_del_iters;
-    memtables.reserve(mems_.size());
-    for (ReadOnlyMemTable* m : mems_) {
-      if (logical_strip_timestamp) {
-        memtables.push_back(m->NewTimestampStrippingIterator(
-            ro, /*seqno_to_time_mapping=*/nullptr, &arena,
-            /*prefix_extractor=*/nullptr, ts_sz));
-      } else {
-        memtables.push_back(
-            m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr, &arena,
-                           /*prefix_extractor=*/nullptr, /*for_flush=*/true));
-      }
-      if (!enable_partitioned_flush) {
+        mutable_cf_options_.delta_options.enable_partition;
+    if (!enable_partition) {
+      Arena arena;
+      std::vector<InternalIterator*> memtables;
+      std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
+          range_del_iters;
+      memtables.reserve(mems_.size());
+      for (ReadOnlyMemTable* m : mems_) {
+        if (logical_strip_timestamp) {
+          memtables.push_back(m->NewTimestampStrippingIterator(
+              ro, /*seqno_to_time_mapping=*/nullptr, &arena,
+              /*prefix_extractor=*/nullptr, ts_sz));
+        } else {
+          memtables.push_back(
+              m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr, &arena,
+                             /*prefix_extractor=*/nullptr, /*for_flush=*/true));
+        }
         auto* range_del_iter =
             logical_strip_timestamp
                 ? m->NewTimestampStrippingRangeTombstoneIterator(
@@ -1071,154 +1056,328 @@ Status FlushJob::WriteLevel0Table() {
           range_del_iters.emplace_back(range_del_iter);
         }
       }
-    }
 
-    ScopedArenaPtr<InternalIterator> iter(
-        NewMergingIterator(&cfd_->internal_comparator(), memtables.data(),
-                           static_cast<int>(memtables.size()), &arena));
+      ScopedArenaPtr<InternalIterator> iter(
+          NewMergingIterator(&cfd_->internal_comparator(), memtables.data(),
+                             static_cast<int>(memtables.size()), &arena));
+      ROCKS_LOG_INFO(db_options_.info_log,
+                     "[%s] [JOB %d] Level-0 flush table #%" PRIu64 ": started",
+                     cfd_->GetName().c_str(), job_context_->job_id,
+                     meta_.fd.GetNumber());
 
-    auto build_one_file =
-        [&](InternalIterator* build_iter,
-            std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
-                input_range_del_iters,
-            uint32_t partition_id) {
-          FileMetaData partition_meta;
-          partition_meta.fd = FileDescriptor(versions_->NewFileNumber(), 0, 0);
-          partition_meta.epoch_number = meta_.epoch_number;
-          partition_meta.oldest_ancester_time = oldest_ancester_time;
-          partition_meta.file_creation_time = current_time;
+      meta_.oldest_ancester_time = oldest_ancester_time;
+      meta_.file_creation_time = current_time;
 
-          TableBuilderOptions tboptions(
-              cfd_->ioptions(), mutable_cf_options_, read_options, write_options,
-              cfd_->internal_comparator(),
-              cfd_->internal_tbl_prop_coll_factories(), output_compression_,
-              mutable_cf_options_.compression_opts, cfd_->GetID(),
-              cfd_->GetName(), 0 /* level */, current_time /* newest_key_time */,
-              false /* is_bottommost */, TableFileCreationReason::kFlush,
-              oldest_key_time, current_time, db_id_, db_session_id_,
-              0 /* target_file_size */, partition_meta.fd.GetNumber(),
-              preclude_last_level_min_seqno_ == kMaxSequenceNumber
-                  ? preclude_last_level_min_seqno_
-                  : std::min(earliest_snapshot_,
-                             preclude_last_level_min_seqno_));
+      uint64_t memtable_payload_bytes = 0;
+      uint64_t memtable_garbage_bytes = 0;
+      IOStatus io_s;
+      TableBuilderOptions tboptions(
+          cfd_->ioptions(), mutable_cf_options_, read_options, write_options,
+          cfd_->internal_comparator(), cfd_->internal_tbl_prop_coll_factories(),
+          output_compression_, mutable_cf_options_.compression_opts,
+          cfd_->GetID(), cfd_->GetName(), 0 /* level */,
+          current_time /* newest_key_time */, false /* is_bottommost */,
+          TableFileCreationReason::kFlush, oldest_key_time, current_time,
+          db_id_, db_session_id_, 0 /* target_file_size */,
+          meta_.fd.GetNumber(),
+          preclude_last_level_min_seqno_ == kMaxSequenceNumber
+              ? preclude_last_level_min_seqno_
+              : std::min(earliest_snapshot_, preclude_last_level_min_seqno_));
+      s = BuildTable(
+          dbname_, versions_, db_options_, tboptions, file_options_,
+          cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
+          &blob_file_additions, job_context_->snapshot_seqs, earliest_snapshot_,
+          job_context_->earliest_write_conflict_snapshot,
+          job_context_->GetJobSnapshotSequence(),
+          job_context_->snapshot_checker,
+          mutable_cf_options_.paranoid_file_checks, cfd_->internal_stats(),
+          &io_s, io_tracer_, BlobFileCreationReason::kFlush,
+          seqno_to_time_mapping_.get(), event_logger_, job_context_->job_id,
+          &table_properties_, write_hint, full_history_ts_low, blob_callback_,
+          base_, &memtable_payload_bytes, &memtable_garbage_bytes,
+          &flush_stats, &output_segments, db_options_.hotspot_manager.get());
+      TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
+      assert(!s.ok() || io_s.ok());
+      io_s.PermitUncheckedError();
+      if (s.ok() && total_num_input_entries != flush_stats.num_input_records) {
+        std::string msg = "Expected " +
+                          std::to_string(total_num_input_entries) +
+                          " entries in memtables, but read " +
+                          std::to_string(flush_stats.num_input_records);
+        ROCKS_LOG_WARN(db_options_.info_log, "[%s] [JOB %d] Level-0 flush %s",
+                       cfd_->GetName().c_str(), job_context_->job_id,
+                       msg.c_str());
+        if (db_options_.flush_verify_memtable_count) {
+          s = Status::Corruption(msg);
+        }
+      }
 
-          uint64_t memtable_payload_bytes = 0;
-          uint64_t memtable_garbage_bytes = 0;
-          IOStatus io_s;
-          TableProperties partition_table_properties;
-          std::vector<BlobFileAddition> partition_blob_file_additions;
-          InternalStats::CompactionStats partition_flush_stats(
-              CompactionReason::kFlush, 1 /* count */);
+      if (s.ok() &&
+          (mutable_cf_options_.table_factory->IsInstanceOf(
+               TableFactory::kBlockBasedTableName()) ||
+           mutable_cf_options_.table_factory->IsInstanceOf(
+               TableFactory::kPlainTableName())) &&
+          flush_stats.num_output_records != table_properties_.num_entries) {
+        std::string msg =
+            "Number of keys in flush output SST files does not match "
+            "number of keys added to the table. Expected " +
+            std::to_string(flush_stats.num_output_records) + " but there are " +
+            std::to_string(table_properties_.num_entries) +
+            " in output SST files";
+        ROCKS_LOG_WARN(db_options_.info_log, "[%s] [JOB %d] Level-0 flush %s",
+                       cfd_->GetName().c_str(), job_context_->job_id,
+                       msg.c_str());
+        if (db_options_.flush_verify_memtable_count) {
+          s = Status::Corruption(msg);
+        }
+      }
 
-          s = BuildTable(
-              dbname_, versions_, db_options_, tboptions, file_options_,
-              cfd_->table_cache(), build_iter, std::move(input_range_del_iters),
-              &partition_meta, &partition_blob_file_additions,
-              job_context_->snapshot_seqs, earliest_snapshot_,
-              job_context_->earliest_write_conflict_snapshot,
-              job_context_->GetJobSnapshotSequence(),
-              job_context_->snapshot_checker,
-              mutable_cf_options_.paranoid_file_checks, cfd_->internal_stats(),
-              &io_s, io_tracer_, BlobFileCreationReason::kFlush,
-              seqno_to_time_mapping_.get(), event_logger_, job_context_->job_id,
-              &partition_table_properties, write_hint, full_history_ts_low,
-              blob_callback_, base_, &memtable_payload_bytes,
-              &memtable_garbage_bytes, &partition_flush_stats, &output_segments,
-              db_options_.hotspot_manager.get());
-          TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
-          assert(!s.ok() || io_s.ok());
-          io_s.PermitUncheckedError();
-          if (!s.ok()) {
-            return;
+      if (tboptions.reason == TableFileCreationReason::kFlush) {
+        TEST_SYNC_POINT("DBImpl::FlushJob:Flush");
+        RecordTick(stats_, MEMTABLE_PAYLOAD_BYTES_AT_FLUSH,
+                   memtable_payload_bytes);
+        RecordTick(stats_, MEMTABLE_GARBAGE_BYTES_AT_FLUSH,
+                   memtable_garbage_bytes);
+      }
+      LogFlush(db_options_.info_log);
+
+      if (s.ok() && meta_.fd.GetFileSize() > 0) {
+        output_files.push_back(meta_);
+      }
+
+      if (s.ok() && meta_.fd.GetFileSize() > 0 && db_options_.hotspot_manager) {
+        uint64_t file_number = meta_.fd.GetNumber();
+        int registered_count = 0;
+
+        for (auto& kv : output_segments) {
+          uint64_t cuid = kv.first;
+          const DataSegment& seg = kv.second;
+
+          if (seg.Valid() && db_options_.hotspot_manager->IsHot(cuid)) {
+            db_options_.hotspot_manager->GetIndexTable().AddDelta(cuid, seg);
+            registered_count++;
           }
+        }
 
-          total_input_records_scanned += partition_flush_stats.num_input_records;
-          total_output_records_written +=
-              partition_flush_stats.num_output_records;
-          total_payload_bytes += memtable_payload_bytes;
-          total_garbage_bytes += memtable_garbage_bytes;
-          flush_stats.bytes_written_pre_comp +=
-              partition_flush_stats.bytes_written_pre_comp;
-          flush_stats.cpu_micros += partition_flush_stats.cpu_micros;
-
-          if (partition_meta.fd.GetFileSize() > 0) {
-            partition_meta.partition_id = enable_partitioned_flush
-                                             ? partition_id
-                                             : (enable_partition
-                                                    ? kL0PartitionUnpartitioned
-                                                    : 0);
-            output_files.emplace_back(partition_meta);
-            blob_file_additions.insert(blob_file_additions.end(),
-                                       partition_blob_file_additions.begin(),
-                                       partition_blob_file_additions.end());
-            if (output_files.size() == 1) {
-              meta_ = partition_meta;
-              table_properties_ = partition_table_properties;
-            }
-          }
-        };
-
-    if (enable_partitioned_flush) {
-      // One-pass flush: the base iterator advances monotonically and each key
-      // is consumed exactly once, while contiguous spans are routed to their
-      // corresponding partition output files.
-      iter->SeekToFirst();
-      while (iter->Valid()) {
-        const uint32_t partition_id =
-            ExtractL0PartitionFromInternalKey(iter->key());
-        PartitionSpanIterator partition_iter(iter.get(), partition_id);
-        build_one_file(
-            &partition_iter,
-            std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>(),
-            partition_id);
-        if (!s.ok()) {
-          break;
+        if (registered_count > 0) {
+          ROCKS_LOG_INFO(
+              db_options_.info_log,
+              "[%s] [FlushJob] Registered %d hot delta segments for file #%" PRIu64,
+              cfd_->GetName().c_str(), registered_count, file_number);
         }
       }
     } else {
-      build_one_file(iter.get(), std::move(range_del_iters),
-                     /*partition_id=*/0);
-    }
-    // 更新全局 flush 统计量
-    flush_stats.num_input_records = total_input_records_scanned;
-    flush_stats.num_output_records = total_output_records_written;
+      const bool enable_partitioned_flush = (total_num_range_deletes == 0);
+      if (!enable_partitioned_flush) {
+        ROCKS_LOG_WARN(
+            db_options_.info_log,
+            "[%s] [JOB %d] Partitioned flush disabled due to range deletions; "
+            "marking L0 output as unpartitioned",
+            cfd_->GetName().c_str(), job_context_->job_id);
+      }
+      uint64_t total_input_records_scanned = 0;
+      uint64_t total_output_records_written = 0;
+      uint64_t total_payload_bytes = 0;
+      uint64_t total_garbage_bytes = 0;
 
-    if (s.ok() && total_num_input_entries != flush_stats.num_input_records) {
-      std::string msg = "Expected " + std::to_string(total_num_input_entries) +
-                        " entries in memtables, but read " +
-                        std::to_string(flush_stats.num_input_records);
-      ROCKS_LOG_WARN(db_options_.info_log, "[%s] [JOB %d] Level-0 flush %s",
-                     cfd_->GetName().c_str(), job_context_->job_id,
-                     msg.c_str());
-      if (db_options_.flush_verify_memtable_count) {
-        s = Status::Corruption(msg);
+      Arena arena;
+      std::vector<InternalIterator*> memtables;
+      std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
+          range_del_iters;
+      memtables.reserve(mems_.size());
+      for (ReadOnlyMemTable* m : mems_) {
+        if (logical_strip_timestamp) {
+          memtables.push_back(m->NewTimestampStrippingIterator(
+              ro, /*seqno_to_time_mapping=*/nullptr, &arena,
+              /*prefix_extractor=*/nullptr, ts_sz));
+        } else {
+          memtables.push_back(
+              m->NewIterator(ro, /*seqno_to_time_mapping=*/nullptr, &arena,
+                             /*prefix_extractor=*/nullptr, /*for_flush=*/true));
+        }
+        if (!enable_partitioned_flush) {
+          auto* range_del_iter =
+              logical_strip_timestamp
+                  ? m->NewTimestampStrippingRangeTombstoneIterator(
+                        ro, kMaxSequenceNumber, ts_sz)
+                  : m->NewRangeTombstoneIterator(ro, kMaxSequenceNumber,
+                                                 true /* immutable_memtable */);
+          if (range_del_iter != nullptr) {
+            range_del_iters.emplace_back(range_del_iter);
+          }
+        }
+      }
+
+      ScopedArenaPtr<InternalIterator> iter(
+          NewMergingIterator(&cfd_->internal_comparator(), memtables.data(),
+                             static_cast<int>(memtables.size()), &arena));
+
+      auto build_one_file =
+          [&](InternalIterator* build_iter,
+              std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
+                  input_range_del_iters,
+              uint32_t partition_id) {
+            FileMetaData partition_meta;
+            partition_meta.fd = FileDescriptor(versions_->NewFileNumber(), 0, 0);
+            partition_meta.epoch_number = meta_.epoch_number;
+            partition_meta.oldest_ancester_time = oldest_ancester_time;
+            partition_meta.file_creation_time = current_time;
+
+            TableBuilderOptions tboptions(
+                cfd_->ioptions(), mutable_cf_options_, read_options,
+                write_options, cfd_->internal_comparator(),
+                cfd_->internal_tbl_prop_coll_factories(), output_compression_,
+                mutable_cf_options_.compression_opts, cfd_->GetID(),
+                cfd_->GetName(), 0 /* level */,
+                current_time /* newest_key_time */, false /* is_bottommost */,
+                TableFileCreationReason::kFlush, oldest_key_time, current_time,
+                db_id_, db_session_id_, 0 /* target_file_size */,
+                partition_meta.fd.GetNumber(),
+                preclude_last_level_min_seqno_ == kMaxSequenceNumber
+                    ? preclude_last_level_min_seqno_
+                    : std::min(earliest_snapshot_,
+                               preclude_last_level_min_seqno_));
+
+            uint64_t memtable_payload_bytes = 0;
+            uint64_t memtable_garbage_bytes = 0;
+            IOStatus io_s;
+            TableProperties partition_table_properties;
+            std::vector<BlobFileAddition> partition_blob_file_additions;
+            InternalStats::CompactionStats partition_flush_stats(
+                CompactionReason::kFlush, 1 /* count */);
+
+            s = BuildTable(
+                dbname_, versions_, db_options_, tboptions, file_options_,
+                cfd_->table_cache(), build_iter, std::move(input_range_del_iters),
+                &partition_meta, &partition_blob_file_additions,
+                job_context_->snapshot_seqs, earliest_snapshot_,
+                job_context_->earliest_write_conflict_snapshot,
+                job_context_->GetJobSnapshotSequence(),
+                job_context_->snapshot_checker,
+                mutable_cf_options_.paranoid_file_checks, cfd_->internal_stats(),
+                &io_s, io_tracer_, BlobFileCreationReason::kFlush,
+                seqno_to_time_mapping_.get(), event_logger_,
+                job_context_->job_id, &partition_table_properties, write_hint,
+                full_history_ts_low, blob_callback_, base_,
+                &memtable_payload_bytes, &memtable_garbage_bytes,
+                &partition_flush_stats, &output_segments,
+                db_options_.hotspot_manager.get());
+            TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
+            assert(!s.ok() || io_s.ok());
+            io_s.PermitUncheckedError();
+            if (!s.ok()) {
+              return;
+            }
+
+            total_input_records_scanned +=
+                partition_flush_stats.num_input_records;
+            total_output_records_written +=
+                partition_flush_stats.num_output_records;
+            total_payload_bytes += memtable_payload_bytes;
+            total_garbage_bytes += memtable_garbage_bytes;
+            flush_stats.bytes_written_pre_comp +=
+                partition_flush_stats.bytes_written_pre_comp;
+            flush_stats.cpu_micros += partition_flush_stats.cpu_micros;
+
+            if (partition_meta.fd.GetFileSize() > 0) {
+              partition_meta.partition_id =
+                  enable_partitioned_flush ? partition_id
+                                           : kL0PartitionUnpartitioned;
+              output_files.emplace_back(partition_meta);
+              blob_file_additions.insert(blob_file_additions.end(),
+                                         partition_blob_file_additions.begin(),
+                                         partition_blob_file_additions.end());
+              if (output_files.size() == 1) {
+                meta_ = partition_meta;
+                table_properties_ = partition_table_properties;
+              }
+            }
+          };
+
+      if (enable_partitioned_flush) {
+        // One-pass flush: the base iterator advances monotonically and each key
+        // is consumed exactly once, while contiguous spans are routed to their
+        // corresponding partition output files.
+        iter->SeekToFirst();
+        while (iter->Valid()) {
+          const uint32_t partition_id =
+              ExtractL0PartitionFromInternalKey(iter->key());
+          PartitionSpanIterator partition_iter(iter.get(), partition_id);
+          build_one_file(
+              &partition_iter,
+              std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>(),
+              partition_id);
+          if (!s.ok()) {
+            break;
+          }
+        }
+      } else {
+        build_one_file(iter.get(), std::move(range_del_iters),
+                       /*partition_id=*/0);
+      }
+
+      flush_stats.num_input_records = total_input_records_scanned;
+      flush_stats.num_output_records = total_output_records_written;
+
+      if (s.ok() && total_num_input_entries != flush_stats.num_input_records) {
+        std::string msg = "Expected " + std::to_string(total_num_input_entries) +
+                          " entries in memtables, but read " +
+                          std::to_string(flush_stats.num_input_records);
+        ROCKS_LOG_WARN(db_options_.info_log, "[%s] [JOB %d] Level-0 flush %s",
+                       cfd_->GetName().c_str(), job_context_->job_id,
+                       msg.c_str());
+        if (db_options_.flush_verify_memtable_count) {
+          s = Status::Corruption(msg);
+        }
+      }
+
+      if (s.ok() && output_files.size() == 1 &&
+          (mutable_cf_options_.table_factory->IsInstanceOf(
+               TableFactory::kBlockBasedTableName()) ||
+           mutable_cf_options_.table_factory->IsInstanceOf(
+               TableFactory::kPlainTableName())) &&
+          flush_stats.num_output_records != table_properties_.num_entries) {
+        std::string msg =
+            "Number of keys in flush output SST files does not match "
+            "number of keys added to the table. Expected " +
+            std::to_string(flush_stats.num_output_records) + " but there are " +
+            std::to_string(table_properties_.num_entries) +
+            " in output SST files";
+        ROCKS_LOG_WARN(db_options_.info_log, "[%s] [JOB %d] Level-0 flush %s",
+                       cfd_->GetName().c_str(), job_context_->job_id,
+                       msg.c_str());
+        if (db_options_.flush_verify_memtable_count) {
+          s = Status::Corruption(msg);
+        }
+      }
+
+      TEST_SYNC_POINT("DBImpl::FlushJob:Flush");
+      RecordTick(stats_, MEMTABLE_PAYLOAD_BYTES_AT_FLUSH, total_payload_bytes);
+      RecordTick(stats_, MEMTABLE_GARBAGE_BYTES_AT_FLUSH, total_garbage_bytes);
+      LogFlush(db_options_.info_log);
+
+      if (s.ok() && !output_files.empty() && db_options_.hotspot_manager) {
+        int registered_count = 0;
+
+        for (auto& kv : output_segments) {
+          uint64_t cuid = kv.first;
+          const DataSegment& seg = kv.second;
+
+          if (seg.Valid() && db_options_.hotspot_manager->IsHot(cuid)) {
+            db_options_.hotspot_manager->GetIndexTable().AddDelta(cuid, seg);
+            registered_count++;
+          }
+        }
+
+        if (registered_count > 0) {
+          ROCKS_LOG_INFO(
+              db_options_.info_log,
+              "[%s] [FlushJob] Registered %d hot delta segments from partitioned flush",
+              cfd_->GetName().c_str(), registered_count);
+        }
       }
     }
 
-    if (s.ok() && output_files.size() == 1 &&
-        (mutable_cf_options_.table_factory->IsInstanceOf(
-             TableFactory::kBlockBasedTableName()) ||
-         mutable_cf_options_.table_factory->IsInstanceOf(
-             TableFactory::kPlainTableName())) &&
-        flush_stats.num_output_records != table_properties_.num_entries) {
-      std::string msg =
-          "Number of keys in flush output SST files does not match "
-          "number of keys added to the table. Expected " +
-          std::to_string(flush_stats.num_output_records) + " but there are " +
-          std::to_string(table_properties_.num_entries) +
-          " in output SST files";
-      ROCKS_LOG_WARN(db_options_.info_log, "[%s] [JOB %d] Level-0 flush %s",
-                     cfd_->GetName().c_str(), job_context_->job_id,
-                     msg.c_str());
-      if (db_options_.flush_verify_memtable_count) {
-        s = Status::Corruption(msg);
-      }
-    }
-
-    TEST_SYNC_POINT("DBImpl::FlushJob:Flush");
-    RecordTick(stats_, MEMTABLE_PAYLOAD_BYTES_AT_FLUSH, total_payload_bytes);
-    RecordTick(stats_, MEMTABLE_GARBAGE_BYTES_AT_FLUSH, total_garbage_bytes);
-    LogFlush(db_options_.info_log);
     ROCKS_LOG_BUFFER(log_buffer_,
                      "[%s] [JOB %d] Level-0 flush table #%" PRIu64 ": %" PRIu64
                      " bytes %s"
@@ -1240,40 +1399,6 @@ Status FlushJob::WriteLevel0Table() {
     }
     TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table", &mems_);
 
-    // for delta
-    // 注册 Delta 片段到热点索引表
-    // 只有当 Flush 成功且生成了文件时才执行
-    if (s.ok() && !output_files.empty() && db_options_.hotspot_manager) {
-        int registered_count = 0;
-
-        for (auto& kv : output_segments) {
-            uint64_t cuid = kv.first;
-            const DataSegment& seg = kv.second;
-
-            // GDCT的更新（暂时不需要，假设最后一次全版本scan之后没有newdata）
-            // if (seg.Valid()) {
-            //   db_options_.hotspot_manager->UpdateFlushRefCount(cuid, file_number);
-            // }
-            
-            // 当 CUID 已经是热点时，才记录索引
-            if (seg.Valid() && db_options_.hotspot_manager->IsHot(cuid)) {
-                db_options_.hotspot_manager->GetIndexTable().AddDelta(cuid, seg);
-                registered_count++;
-                // 记录到诊断日志：此迹是追查》郣失数据属于哪个文件、什么范围的最关键一条日志
-                DiagLogf("[DIAG_DELTA_REGISTERED] CUID %lu: file=%lu registered"
-                         " first_key=[%s] last_key=[%s]\n",
-                         cuid, file_number,
-                         FormatKeyDisplay(seg.first_key).c_str(),
-                         FormatKeyDisplay(seg.last_key).c_str());
-            }
-        }
-        
-        if (registered_count > 0) {
-          ROCKS_LOG_INFO(db_options_.info_log, 
-              "[%s] [FlushJob] Registered %d hot delta segments from partitioned flush",
-              cfd_->GetName().c_str(), registered_count);
-        }
-    }
     db_mutex_->Lock();
   }
   base_->Unref();

@@ -464,12 +464,6 @@ void CompactionIterator::CheckHotspotFilters() {
 
   skip_current_file_obsolete_ = false;
 
-  const Compaction* real_compaction =
-      compaction_ != nullptr ? compaction_->real_compaction() : nullptr;
-  const bool enable_partition =
-      real_compaction != nullptr &&
-      real_compaction->mutable_cf_options().delta_options.enable_partition;
-
   // 1. 提取当前 Key 的 CUID
   uint64_t cuid = hotspot_manager_->ExtractCUID(input_.key());
   uint64_t file_id = input_file_number();
@@ -509,42 +503,14 @@ void CompactionIterator::CheckHotspotFilters() {
       // update：MVCC 如果该 CUID 的逻辑删除早于系统当前最老的快照再标记删除？
       if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid, earliest_snapshot_)) {
         skip_current_cuid_ = true;
-        DiagLogf("[DIAG_COMPACTION_SKIP] CUID %lu: file=%lu skipped"
-                " (CUID marked deleted)\n",
-                cuid, file_id);
-      } else if (!enable_partition && hotspot_manager_->IsHot(cuid) &&
-                 file_id != 0) {
-        obsolete_probe_file_.clear();
-        obsolete_probe_file_.push_back(file_id);
-        if (hotspot_manager_->ShouldSkipObsoleteDelta(cuid,
-                                                      obsolete_probe_file_)) {
-          skip_current_cuid_ = true;
-          // 打印首条被跳过 key 的信息，便于与 DIAG_COMPACTION_SPARSE 交叉验证
-          Slice skip_key = input_.key();
-          uint64_t skip_rid = 0;
-          std::string skip_key_hex;
-          if (skip_key.size() >= 34) {
-            std::string rid_str = skip_key.ToString().substr(24, 10);
-            try { skip_rid = std::stoull(rid_str); } catch (...) {}
-            // 输出 bytes 16-34 (CUID + row_id) 的 hex 表示，用于验证 rid 提取是否正确
-            const unsigned char* kd = reinterpret_cast<const unsigned char*>(skip_key.data());
-            char hex_buf[64];
-            snprintf(hex_buf, sizeof(hex_buf),
-                     "%02x%02x%02x%02x%02x%02x%02x%02x|%s",
-                     kd[16], kd[17], kd[18], kd[19], kd[20], kd[21], kd[22], kd[23],
-                     rid_str.c_str());
-            skip_key_hex = hex_buf;
-          }
-          DiagLogf("[DIAG_COMPACTION_SKIP] CUID %lu: file=%lu skipped"
-                  " (obsolete delta), first_skipped_rid=%lu key_hex=[%s]\n",
-                  cuid, file_id, skip_rid, skip_key_hex.c_str());
-        }
       }
     }
   }
 
-  // Partition mode: use key-aware obsolete filtering.
-  if (enable_partition && !skip_current_cuid_ && cuid != 0 && file_id != 0 &&
+  // Use key-aware obsolete filtering for every delta mode. The file-level skip
+  // is too coarse once a file can contain both obsolete and live ranges for
+  // the same hot CUID.
+  if (!skip_current_cuid_ && cuid != 0 && file_id != 0 &&
       hotspot_manager_->IsHot(cuid)) {
     skip_current_file_obsolete_ = hotspot_manager_->ShouldSkipObsoleteDeltaKey(
         cuid, file_id, input_.key());

@@ -1,9 +1,12 @@
 /**
  * rocksdb_perf_test.cc
  *
- * RocksDB-delta 高性能并发测试工具 (重构版 - 顺序生命周期模型)
- * 场景：16线程并发, 8分钟持续运行, 10W CUID, 15/77 负载分布
- * 逻辑：每线程领取一个 CUID 走完“增删改查”一生，所有 CUID 行数保持一致 (~2.5W行)。
+ * RocksDB-delta 高性能并发测试工具
+ *
+ * 负载模型：
+ * 1. 整体测试时长被均分为 4 个连续 phase，每个 phase 固定一个 table_id。
+ * 2. 不同 table_id 之间严格串行，不会并行产生写入/扫描。
+ * 3. 单个 phase 内部仍保持多线程、多 CUID 的并发增删改查生命周期。
  */
 
 #include <algorithm>
@@ -32,16 +35,18 @@
 const std::string kNativeDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_native";
 const std::string kDeltaDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_delta";
 const std::string kDeltaPartitionDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_delta_partition";
-const int kNumThreads = 16;
-const int kTestDurationSec = 300;       // s
+const int kNumThreads = 32;
+const int kTestDurationSec = 1800;       // s
 const int kNumCuids = 1000000;           // 100W CUID 总库
 const uint64_t kNumTableIds = 4;
 const uint64_t kDbId = 1;
 const int kBatchSize = 512;             // 每次 Put 512 行
-const int kTargetPutBatches = 120;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
+const int kTargetPutBatches = 240;      // 每个 CUID 固定写入 240 个 batch (目标约 12W 行)
+const int kMinPutBatchesBeforeScan = 16;  // 先完成一小段写入预热，再开始扫描
 const double kHotRatio = 0.15;          // 15% 的热点
-const int kHotScanTarget = 50;        // 热点访问目标
-const int kColdScanTarget = 20;        // 普通访问目标
+const int kHotScanTarget = 24;         // 热点 CUID 的部分扫描次数
+const int kColdScanTarget = 4;         // 普通 CUID 的部分扫描次数
+const size_t kDeleteWindowSize = 24;   // 延迟删除窗口，保证单个 phase 内能真实触发 delete
 
 // ==========================================
 // 辅助工具与状态管理
@@ -62,11 +67,6 @@ void EncodeUint64BE(uint64_t value, char* out) {
   for (int i = 0; i < 8; ++i) {
     out[i] = static_cast<char>((value >> (56 - 8 * i)) & 0xFF);
   }
-}
-
-uint64_t TableIdFromCUID(uint64_t cuid) {
-  // Keep CUID evenly distributed over 4 table IDs.
-  return (cuid - 1) % kNumTableIds + 1;
 }
 
 int32_t PartitionIdFromTableId(uint64_t table_id) {
@@ -120,11 +120,47 @@ struct ThreadStats {
   }
 };
 
+void MergeThreadStats(ThreadStats* dst, const ThreadStats& src) {
+  if (dst == nullptr) {
+    return;
+  }
+
+  constexpr size_t kMaxLatencySamples = 1000000;
+  auto merge_latencies = [](std::vector<double>* target,
+                            const std::vector<double>& source) {
+    constexpr size_t kMaxLatencySamplesLocal = 1000000;
+    if (target == nullptr || target->size() >= kMaxLatencySamplesLocal) {
+      return;
+    }
+    const size_t remaining = kMaxLatencySamplesLocal - target->size();
+    const size_t to_copy = std::min(remaining, source.size());
+    target->insert(target->end(), source.begin(), source.begin() + to_copy);
+  };
+
+  dst->put_ops += src.put_ops;
+  dst->scan_ops += src.scan_ops;
+  dst->del_ops += src.del_ops;
+  dst->total_rows_scanned += src.total_rows_scanned;
+  if (dst->put_latencies.size() < kMaxLatencySamples) {
+    merge_latencies(&dst->put_latencies, src.put_latencies);
+  }
+  if (dst->scan_latencies.size() < kMaxLatencySamples) {
+    merge_latencies(&dst->scan_latencies, src.scan_latencies);
+  }
+  if (dst->del_latencies.size() < kMaxLatencySamples) {
+    merge_latencies(&dst->del_latencies, src.del_latencies);
+  }
+}
+
 class PerfRunner {
  public:
   PerfRunner(rocksdb::DB* db, std::atomic<uint64_t>* next_cuid,
+             uint64_t table_id,
              bool partition_enabled)
-      : db_(db), next_cuid_(next_cuid), partition_enabled_(partition_enabled) {}
+      : db_(db),
+        next_cuid_(next_cuid),
+        table_id_(table_id),
+        partition_enabled_(partition_enabled) {}
 
     struct CuidState {
       uint64_t cuid;
@@ -143,12 +179,8 @@ class PerfRunner {
     std::vector<CuidState> active_cuids;
     std::deque<std::pair<uint64_t, int>> pending_deletes;
     
-    // === 100GB 目标数据量计算过程 ===
-    // 单个 CUID 数据量约：512 batch * 200 rows/batch * 72 bytes/row ≈ 7.37 MB
-    // 实现 100GB 常驻数据需 100,000 / 7.37 ≈ 13,568 个 CUID
-    // 设 16 线程，则每线程需维持 13,568 / 16 ≈ 848 个 CUID (活跃 + 待删除)
-    const size_t kMaxActiveCuids = 10;   
-    const size_t kDeleteWindowSize = 50; 
+    // 经验值：控制活跃/待删除窗口，既保持足够并发，也避免单线程积压过多生命周期。
+    const size_t kMaxActiveCuids = 50;
 
     auto add_new_cuid = [&]() {
       uint64_t cuid = next_cuid_->fetch_add(1);
@@ -174,9 +206,12 @@ class PerfRunner {
 
       bool do_put = false;
       if (state.puts_done < kTargetPutBatches) {
-        if (state.scans_done < state.target_scans) {
-          // 根据进度比例交替，确保 Put 均匀分布在整个 Scan 周期中
-          if ((double)state.puts_done / kTargetPutBatches <= (double)state.scans_done / state.target_scans) {
+        if (state.puts_done < kMinPutBatchesBeforeScan) {
+          do_put = true;
+        } else if (state.scans_done < state.target_scans) {
+          // 根据进度比例交替，但整体上显著偏向写入，避免 Scan 过于频繁。
+          if ((double)state.puts_done / kTargetPutBatches <=
+              (double)state.scans_done / state.target_scans) {
             do_put = true;
           } else {
             do_put = false;
@@ -195,8 +230,9 @@ class PerfRunner {
           state.puts_done++;
         }
       } else {
-        bool full_scan = (dist(gen) < 0.2); // 20% Full Scan (SAC) / 80% Partial Scan
-        DoScan(state.cuid, state.puts_done * kBatchSize, full_scan, read_opts, stats, gen);
+        // 生命周期内的常规扫描一律使用 partial scan；删除前再做一次 full scan 校验。
+        DoScan(state.cuid, state.puts_done * kBatchSize, false, read_opts,
+               stats, gen);
         state.scans_done++;
         // state.last_scan_time = now;
       }
@@ -245,10 +281,9 @@ class PerfRunner {
 
  private:
   bool DoPut(uint64_t cuid, int start_row, ThreadStats* stats) {
-    const uint64_t table_id = TableIdFromCUID(cuid);
     rocksdb::WriteBatch batch;
     for (int i = 0; i < kBatchSize; ++i) {
-      batch.Put(GenerateKey(table_id, cuid, start_row + i),
+      batch.Put(GenerateKey(table_id_, cuid, start_row + i),
                 "value_data_payload_xxxxxxxxxxxxxxxxxxxx");
     }
     auto start = std::chrono::high_resolution_clock::now();
@@ -262,16 +297,15 @@ class PerfRunner {
   }
 
   int DoScan(uint64_t cuid, int cur_rows, bool full_scan, const rocksdb::ReadOptions& ro, ThreadStats* stats, std::default_random_engine& gen) {
-    const uint64_t table_id = TableIdFromCUID(cuid);
     std::string start_key, end_key;
     if (full_scan) {
-      start_key = GenerateKey(table_id, cuid, 0);
-      end_key = GenerateKey(table_id, cuid, cur_rows);
+      start_key = GenerateKey(table_id_, cuid, 0);
+      end_key = GenerateKey(table_id_, cuid, cur_rows);
     } else {
       // 随机扫描 10%-75% 的数据范围
       if (cur_rows < 10) {
-          start_key = GenerateKey(table_id, cuid, 0);
-          end_key = GenerateKey(table_id, cuid, cur_rows);
+          start_key = GenerateKey(table_id_, cuid, 0);
+          end_key = GenerateKey(table_id_, cuid, cur_rows);
       } else {
           int min_len = static_cast<int>(cur_rows * 0.1);
           int max_len = static_cast<int>(cur_rows * 0.75);
@@ -280,8 +314,8 @@ class PerfRunner {
           
           std::uniform_int_distribution<int> start_dist(0, std::max(0, cur_rows - scan_len));
           int start_row = start_dist(gen);
-          start_key = GenerateKey(table_id, cuid, start_row);
-          end_key = GenerateKey(table_id, cuid, start_row + scan_len);
+          start_key = GenerateKey(table_id_, cuid, start_row);
+          end_key = GenerateKey(table_id_, cuid, start_row + scan_len);
       }
     }
 
@@ -290,7 +324,7 @@ class PerfRunner {
     ro_copy.iterate_upper_bound = &upper_bound;
     ro_copy.delta_full_scan = full_scan;
     if (partition_enabled_) {
-      ro_copy.read_partition_id = PartitionIdFromTableId(table_id);
+      ro_copy.read_partition_id = PartitionIdFromTableId(table_id_);
     }
 
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -311,11 +345,10 @@ class PerfRunner {
   }
 
   void DoDelete(uint64_t cuid, int total_rows, ThreadStats* stats) {
-    const uint64_t table_id = TableIdFromCUID(cuid);
     rocksdb::WriteOptions wo;
     for (int i = 0; i < total_rows; ++i) {
       auto start = std::chrono::high_resolution_clock::now();
-      db_->Delete(wo, GenerateKey(table_id, cuid, i));
+      db_->Delete(wo, GenerateKey(table_id_, cuid, i));
       auto end = std::chrono::high_resolution_clock::now();
       stats->AddDelete(std::chrono::duration<double, std::milli>(end - start).count());
     }
@@ -323,6 +356,7 @@ class PerfRunner {
 
   rocksdb::DB* db_;
   std::atomic<uint64_t>* next_cuid_;
+  uint64_t table_id_;
   bool partition_enabled_;
 };
 
@@ -354,7 +388,10 @@ void ReportStats(const std::string& label, const std::vector<ThreadStats>& all_s
   };
 
   std::cout << "\n--- " << label << " Results ---" << std::endl;
-  std::cout << "Put (Batch 128) Ops: " << total_puts << ", Avg Lat: " << std::fixed << std::setprecision(3) << get_avg(all_put_lat) << " ms, P99 Lat: " << get_p99(all_put_lat) << " ms" << std::endl;
+  std::cout << "Put (Batch " << kBatchSize << ") Ops: " << total_puts
+            << ", Avg Lat: " << std::fixed << std::setprecision(3)
+            << get_avg(all_put_lat) << " ms, P99 Lat: " << get_p99(all_put_lat)
+            << " ms" << std::endl;
   std::cout << "Scan Ops: " << total_scans << ", Avg Lat: " << get_avg(all_scan_lat) << " ms, P99 Lat: " << get_p99(all_scan_lat) << " ms" << std::endl;
   std::cout << "Delete Ops: " << total_dels << ", Avg Lat: " << get_avg(all_del_lat) << " ms, P99 Lat: " << get_p99(all_del_lat) << " ms" << std::endl;
   std::cout << "Throughput: " << (kTestDurationSec > 0 ? total_rows / kTestDurationSec : 0) << " rows/s" << std::endl;
@@ -379,7 +416,7 @@ int main() {
 
       // --- Example 1: Programmatic Configuration of DeltaOptions ---
       // These can be set directly on the options object before opening the DB.
-      options.delta_options.hotspot_scan_threshold = 200;
+      options.delta_options.hotspot_scan_threshold = 16;
       options.delta_options.hotspot_scan_window_sec = 300;
       options.delta_options.delta_merge_threshold = 3;
       options.delta_options.sac_delta_count_threshold = 5;
@@ -397,7 +434,7 @@ int main() {
       options.max_subcompactions = 4; // subcompaction 线程数
       options.soft_pending_compaction_bytes_limit = 0; // 0 表示无限制
       options.hard_pending_compaction_bytes_limit = 0; // 0 表示无限制
-      options.max_background_jobs = 16; // 与写入线程相同？
+      options.max_background_jobs = 32; // 与写入线程相同？
       options.num_levels = 1;
       options.level_compaction_dynamic_level_bytes = false;
       if(partition_enabled){
@@ -420,19 +457,45 @@ int main() {
     std::cout << ">>> Running " << label << " (Duration: " << kTestDurationSec << "s) <<<" << std::endl;
     next_cuid_counter.store(1);
 
-    std::atomic<bool> stop{false};
     std::vector<ThreadStats> all_thread_stats(kNumThreads);
-    std::vector<std::thread> workers;
-    PerfRunner runner(db, &next_cuid_counter,
-              delta_enabled && partition_enabled);
+    const int64_t phase_duration_sec =
+        kTestDurationSec / static_cast<int64_t>(kNumTableIds);
+    const int64_t phase_remainder_sec =
+        kTestDurationSec % static_cast<int64_t>(kNumTableIds);
 
-    for (int i = 0; i < kNumThreads; i++) {
-      workers.emplace_back(&PerfRunner::Run, &runner, i, &stop, &all_thread_stats[i]);
+    for (uint64_t phase_idx = 0; phase_idx < kNumTableIds; ++phase_idx) {
+      const uint64_t table_id = phase_idx + 1;
+      int64_t current_phase_sec = phase_duration_sec;
+      if (phase_idx + 1 == kNumTableIds) {
+        current_phase_sec += phase_remainder_sec;
+      }
+      if (current_phase_sec <= 0) {
+        break;
+      }
+
+      std::cout << "  -> Phase " << (phase_idx + 1) << "/" << kNumTableIds
+                << ": TableID " << table_id << ", Duration: "
+                << current_phase_sec << "s" << std::endl;
+
+      std::atomic<bool> stop{false};
+      std::vector<ThreadStats> phase_thread_stats(kNumThreads);
+      std::vector<std::thread> workers;
+      PerfRunner runner(db, &next_cuid_counter, table_id,
+                        delta_enabled && partition_enabled);
+
+      for (int i = 0; i < kNumThreads; i++) {
+        workers.emplace_back(&PerfRunner::Run, &runner, i, &stop,
+                             &phase_thread_stats[i]);
+      }
+
+      std::this_thread::sleep_for(std::chrono::seconds(current_phase_sec));
+      stop.store(true);
+      for (auto& t : workers) t.join();
+
+      for (int i = 0; i < kNumThreads; ++i) {
+        MergeThreadStats(&all_thread_stats[i], phase_thread_stats[i]);
+      }
     }
-
-    std::this_thread::sleep_for(std::chrono::seconds(kTestDurationSec));
-    stop.store(true);
-    for (auto& t : workers) t.join();
 
     ReportStats(label, all_thread_stats);
     

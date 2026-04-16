@@ -226,14 +226,14 @@ bool HotIndexTable::PromoteSnapshot(uint64_t cuid,
       replacement_count++;
 
       if (false) {
-        fprintf(
-            stderr,
-            "[DIAG_PROMOTE] CUID %lu: Mem Segment [%s - %s] replaced by SST "
-            "%lu clipped to [%s - %s]\n",
-            cuid, FormatKeyDisplay(seg.first_key).c_str(),
-            FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
-            FormatKeyDisplay(replacement.first_key).c_str(),
-            FormatKeyDisplay(replacement.last_key).c_str());
+        // fprintf(
+        //     stderr,
+        //     "[DIAG_PROMOTE] CUID %lu: Mem Segment [%s - %s] replaced by SST "
+        //     "%lu clipped to [%s - %s]\n",
+        //     cuid, FormatKeyDisplay(seg.first_key).c_str(),
+        //     FormatKeyDisplay(seg.last_key).c_str(), new_segment.file_number,
+        //     FormatKeyDisplay(replacement.first_key).c_str(),
+        //     FormatKeyDisplay(replacement.last_key).c_str());
       }
     } else {
       next_segments.push_back(seg);
