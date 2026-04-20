@@ -260,7 +260,7 @@ class PerfRunner {
     rocksdb::Slice upper_bound(end_key);
     rocksdb::ReadOptions ro_copy = ro;
     ro_copy.iterate_upper_bound = &upper_bound;
-    ro_copy.delta_full_scan = full_scan;
+    ro_copy.delta_full_scan = false;
 
     auto t_start = std::chrono::high_resolution_clock::now();
     rocksdb::Iterator* it = db_->NewIterator(ro_copy);
@@ -343,7 +343,7 @@ int main() {
 
       // --- Example 1: Programmatic Configuration of DeltaOptions ---
       // These can be set directly on the options object before opening the DB.
-      options.delta_options.hotspot_scan_threshold = 200;
+      options.delta_options.hotspot_scan_threshold = 30;
       options.delta_options.hotspot_scan_window_sec = 300;
       options.delta_options.delta_merge_threshold = 3;
       options.delta_options.sac_delta_count_threshold = 5;
