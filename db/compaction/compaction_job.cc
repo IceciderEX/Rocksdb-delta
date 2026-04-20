@@ -1850,6 +1850,33 @@ Status CompactionJob::ProcessKeyValue(
               }
             }
           }
+
+          // [FIX-INTRA] 同一文件内物理数据 gap 检测：
+          // PATH C 依赖 delta index 中的注册段边界，但当 PM 将某文件的 segment 标记为
+          // obsolete 并从 index 移除后，PATH C 的缓存中不再有该边界信息。此时若文件的
+          // 物理数据仍存在 gap（跨原注册段边界的 row_id 跳跃），compaction 会将多个物理
+          // 上不连续的段合并注册为一个 segment，造成 segment range 与实际数据不一致。
+          // 该不一致会向下游传播：PM 将此文件整个大 segment 纳入 merge 范围，导致
+          // AtomicReplace 错误裁剪掉旧 snapshot 中覆盖 gap 区间的部分，产生数据丢失。
+          //
+          // 无论 PATH C 是否触发，只要同一文件内 row_id 出现物理跳跃，
+          // 就立即 FlushSegment 以保证输出段与物理数据完全对应。
+          if (delta_ctx->has_started_segment
+              && input_file_id != 0
+              && delta_ctx->current_input_files.count(input_file_id)
+              && !delta_ctx->current_last_key.empty()) {
+            uint64_t _prev_rid = ExtractRowID(Slice(delta_ctx->current_last_key));
+            uint64_t _cur_rid  = ExtractRowID(c_iter->key());
+            if (_prev_rid > 0 && _cur_rid > 0 && _cur_rid > _prev_rid + 1) {
+              DiagLogf("[DIAG_COMPACTION_GAP_SPLIT] CUID %lu: "
+                       "intra-segment physical gap in file=%lu, "
+                       "prev_rid=%lu -> cur_rid=%lu gap=%lu rows, "
+                       "splitting segment\n",
+                       cuid, input_file_id,
+                       _prev_rid, _cur_rid, _cur_rid - _prev_rid - 1);
+              delta_ctx->FlushSegment(delta_ctx->current_file_number);
+            }
+          }
         }
 
         // internal key?

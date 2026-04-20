@@ -7,6 +7,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <filesystem>
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
@@ -35,6 +36,8 @@ struct CuidGroundTruth {
   std::set<uint64_t> row_ids;
 };
 std::map<uint64_t, CuidGroundTruth*> ground_truths;
+// [FIX] Global mutex to protect access to ground_truths map itself (not just the contents)
+std::mutex ground_truths_mtx;
 
 std::string GenerateKey(uint64_t cuid, int row_id) {
   std::string key;
@@ -89,16 +92,27 @@ void WriterThread(DB* db, const std::vector<uint64_t>& cuids) {
     int batch_size = 1024;
 
     {
-      std::lock_guard<std::mutex> lock(ground_truths[target_cuid]->mtx);
+      std::lock_guard<std::mutex> gt_lock(ground_truths_mtx);
+      auto gt_it = ground_truths.find(target_cuid);
+      if (gt_it == ground_truths.end()) continue;
+      std::lock_guard<std::mutex> lock(gt_it->second->mtx);
       for (int k = 0; k < batch_size; ++k) {
         uint64_t rid = next_rid++;
         batch.Put(GenerateKey(target_cuid, rid),
                   "val_xxxxxxxxxxxxxxxx_" + std::to_string(rid));
       }
     }
+    // 必须先写 DB，再更新 ground_truths，否则 VerifyThread 可能看到行
+    // 已在期望集合中但 DB 尚未写入，导致误报 missing rows
     db->Write(wo, &batch);
-    for (uint64_t rid = batch_start_rid; rid < next_rid; ++rid) {
-      ground_truths[target_cuid]->row_ids.insert(rid);
+    {
+      std::lock_guard<std::mutex> gt_lock(ground_truths_mtx);
+      auto gt_it = ground_truths.find(target_cuid);
+      if (gt_it == ground_truths.end()) continue;
+      std::lock_guard<std::mutex> lock(gt_it->second->mtx);
+      for (uint64_t rid = batch_start_rid; rid < next_rid; ++rid) {
+        gt_it->second->row_ids.insert(rid);
+      }
     }
     global_stats.total_writes += batch_size;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -120,8 +134,11 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
     // 获取当前数据的总量
     size_t cur_total_rows = 0;
     {
-      std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
-      cur_total_rows = ground_truths[cuid]->row_ids.size();
+      std::lock_guard<std::mutex> gt_lock(ground_truths_mtx);
+      auto gt_it = ground_truths.find(cuid);
+      if (gt_it == ground_truths.end()) continue;
+      std::lock_guard<std::mutex> lock(gt_it->second->mtx);
+      cur_total_rows = gt_it->second->row_ids.size();
     }
 
     if (cur_total_rows == 0) {
@@ -162,9 +179,12 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
     // Take snapshot of expected rows before starting the scan, filtered by range
     std::set<uint64_t> expected;
     {
-      std::lock_guard<std::mutex> lock(ground_truths[cuid]->mtx);
-      auto it_low = ground_truths[cuid]->row_ids.lower_bound(start_row);
-      auto it_high = ground_truths[cuid]->row_ids.lower_bound(end_row);
+      std::lock_guard<std::mutex> gt_lock(ground_truths_mtx);
+      auto gt_it = ground_truths.find(cuid);
+      if (gt_it == ground_truths.end()) continue;
+      std::lock_guard<std::mutex> lock(gt_it->second->mtx);
+      auto it_low = gt_it->second->row_ids.lower_bound(start_row);
+      auto it_high = gt_it->second->row_ids.lower_bound(end_row);
       for (auto it = it_low; it != it_high; ++it) {
         expected.insert(*it);
       }
@@ -244,7 +264,15 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
           }
 
           int count = 0;
-          int mod = ground_truths[cuid]->row_ids.size() / 10;
+          int mod = 0;
+          {
+            std::lock_guard<std::mutex> gt_lock(ground_truths_mtx);
+            auto gt_it = ground_truths.find(cuid);
+            if (gt_it != ground_truths.end()) {
+              std::lock_guard<std::mutex> lock(gt_it->second->mtx);
+              mod = gt_it->second->row_ids.size() / 10;
+            }
+          }
           std::unique_ptr<Iterator> it2(db->NewIterator(ro));
           for (it2->Seek(start_key); it2->Valid(); it2->Next()) {
             if (ExtractCUID(it2->key()) != cuid) break;
@@ -293,6 +321,132 @@ void ReaderThread(DB* db, const std::vector<uint64_t>& cuids, int id) {
   }
 }
 
+// 每隔 60 秒对每个 CUID 执行全量 scan，验证所有行均可见。
+// 使用 is_metadata_scan=true：走热点路径（读 delta/buffer）但不触发 ScanAsCompaction。
+void VerifyThread(DB* db, const std::vector<uint64_t>& cuids) {
+  while (!stop_test) {
+    // 等待 60 秒，每秒检查一次 stop_test
+    for (int i = 0; i < 60 && !stop_test; i++) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    if (stop_test) break;
+
+    std::cout << "[VERIFY] Starting full-range integrity check for all CUIDs..."
+              << std::endl;
+
+    for (uint64_t cuid : cuids) {
+      // 获取当前期望行的快照（取有序 vector 以便确定扫描范围）
+      std::vector<uint64_t> expected_vec;
+      {
+        std::lock_guard<std::mutex> gt_lock(ground_truths_mtx);
+        auto gt_it = ground_truths.find(cuid);
+        if (gt_it == ground_truths.end()) continue;
+        std::lock_guard<std::mutex> lock(gt_it->second->mtx);
+        expected_vec.assign(gt_it->second->row_ids.begin(),
+                            gt_it->second->row_ids.end());
+      }
+      if (expected_vec.empty()) continue;
+
+      uint64_t start_row = expected_vec.front();
+      uint64_t end_row   = expected_vec.back() + 1;  // upper_bound exclusive
+
+      std::string start_key   = GenerateKey(cuid, start_row);
+      std::string upper_bound = GenerateKey(cuid, end_row);
+      Slice ub_slice(upper_bound);
+
+      ReadOptions ro;
+      ro.is_metadata_scan = true;  // 走热点路径但不触发 ScanAsCompaction
+      ro.delta_full_scan        = false;
+      ro.enable_delta_diag_logging = false;
+      ro.iterate_upper_bound    = &ub_slice;
+
+      std::set<uint64_t> found;
+      std::unique_ptr<Iterator> it(db->NewIterator(ro));
+      for (it->Seek(start_key); it->Valid(); it->Next()) {
+        if (ExtractCUID(it->key()) != cuid) break;
+        found.insert(ExtractRowID(it->key()));
+      }
+
+      int index = 0;
+      if (!it->status().ok()) {
+        std::cerr << "[VERIFY] CUID " << cuid
+                  << " scan error: " << it->status().ToString() << std::endl;
+        global_stats.errors++;
+        continue;
+      }
+
+      // 比对：找出所有期望存在但实际未读到的行
+      std::vector<uint64_t> missing;
+      {
+        std::lock_guard<std::mutex> gt_lock(ground_truths_mtx);
+        auto gt_it = ground_truths.find(cuid);
+        if (gt_it != ground_truths.end()) {
+          std::lock_guard<std::mutex> lock(gt_it->second->mtx);
+          for (uint64_t rid : expected_vec) {
+            if (found.find(rid) == found.end()) {
+              missing.push_back(rid);
+            }
+          }
+        }
+      }
+
+      if (!missing.empty()) {
+        std::cerr << "[VERIFY] *** CUID " << cuid << ": " << missing.size()
+                  << " MISSING rows! range=[" << start_row << "," << end_row
+                  << ") expected=" << expected_vec.size()
+                  << " found=" << found.size() << std::endl;
+        size_t report_n = std::min(missing.size(), (size_t)5);
+        for (size_t i = 0; i < report_n; i++) {
+          std::cerr << "[VERIFY]   missing rid=" << missing[i] << std::endl;
+        }
+        // 输出最后 report_n 条数据
+        for (size_t i = missing.size() > report_n ? missing.size() - report_n : 0; i < missing.size(); i++) {
+          std::cerr << "[VERIFY]   missing rid=" << missing[i] << std::endl;
+        }
+        if (missing.size() > 2 * report_n) {
+          std::cerr << "[VERIFY]   ... and " << (missing.size() - 5)
+                    << " more missing rows" << std::endl;
+        }
+        auto hotspot_mgr = dynamic_cast<DBImpl*>(db)->GetHotspotManager();
+        if (hotspot_mgr) {
+          HotIndexEntry diag_entry;
+          if (hotspot_mgr->GetHotIndexEntry(cuid, &diag_entry)) {
+            std::cerr << "[VERIFY] CUID " << cuid
+                      << " snapshot_segments="
+                      << diag_entry.snapshot_segments.size()
+                      << " deltas=" << diag_entry.deltas.size() << std::endl;
+            for (size_t si = 0; si < diag_entry.snapshot_segments.size();
+                 ++si) {
+              const auto& seg = diag_entry.snapshot_segments[si];
+              std::cerr << "[VERIFY]   snap[" << si
+                        << "] file=" << static_cast<int64_t>(seg.file_number)
+                        << " first_key=" << FormatKeyDisplay(seg.first_key)
+                        << " last_key=" << FormatKeyDisplay(seg.last_key)
+                        << std::endl;
+            }
+            for (size_t di = 0; di < diag_entry.deltas.size(); ++di) {
+              const auto& seg = diag_entry.deltas[di];
+              std::cerr << "[VERIFY]   delta[" << di
+                        << "] file=" << static_cast<int64_t>(seg.file_number)
+                        << " first_key=" << FormatKeyDisplay(seg.first_key)
+                        << " last_key=" << FormatKeyDisplay(seg.last_key)
+                        << std::endl;
+            }
+          } else {
+            std::cerr << "[VERIFY] CUID " << cuid << " has NO HotIndexEntry!"
+                      << std::endl;
+          }
+        }
+        
+        global_stats.errors += missing.size();
+      } else {
+        std::cout << "[VERIFY] CUID " << cuid << ": OK  "
+                  << found.size() << " rows verified." << std::endl;
+      }
+    }
+  }
+}
+
 void ManagerThread(DBImpl* db_impl) {
   auto hotspot_mgr = db_impl->GetHotspotManager();
   while (!stop_test) {
@@ -307,7 +461,20 @@ void ManagerThread(DBImpl* db_impl) {
   }
 }
 
+bool CleanupDBPath(const std::string& path) {
+  std::error_code ec;
+  if (path != kDBPath) {
+    std::cerr << "Refusing to delete non-test path: " << path << std::endl;
+    return false;
+  }
+  std::filesystem::remove_all(path, ec);
+  return true;
+}
+
 int main() {
+  const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_tmp";
+  CleanupDBPath(kDBPath);  
+
   Options options;
   options.create_if_missing = true;
   options.enable_delta = true;
@@ -335,7 +502,7 @@ int main() {
   options.num_levels = 1;
   options.level0_file_num_compaction_trigger = 20;
   options.level_compaction_dynamic_level_bytes = false;
-  DestroyDB(kDBPath, options);
+  // DestroyDB(kDBPath, options);
 
   DB* db = nullptr;
   Status s = DB::Open(options, kDBPath, &db);
@@ -358,6 +525,8 @@ int main() {
   std::thread reader1(ReaderThread, db, cuids, 1);
   std::thread reader2(ReaderThread, db, cuids, 2);
   std::thread reader3(ReaderThread, db, cuids, 3);
+  std::thread reader4(ReaderThread, db, cuids, 4);
+  std::thread verifier(VerifyThread, db, cuids);
   std::thread manager(ManagerThread, db_impl);
 
   auto start_time = std::chrono::steady_clock::now();
@@ -377,6 +546,8 @@ int main() {
   reader1.join();
   reader2.join();
   reader3.join();
+  reader4.join();
+  verifier.join();
   manager.join();
 
   std::cout << "Stress Test Completed." << std::endl;

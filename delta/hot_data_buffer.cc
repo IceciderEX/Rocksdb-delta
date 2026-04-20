@@ -289,48 +289,115 @@ InternalIterator* HotDataBuffer::NewIterator(
 }
 
 
-// SST Lifecycle Manager Implementation (remains same)
+// SST Lifecycle Manager Implementation
 void HotSstLifecycleManager::RegisterFile(uint64_t file_number, const std::string& file_path, const std::string& link_path) {
+  if (file_number == static_cast<uint64_t>(-1)) return;
   std::lock_guard<std::mutex> lock(mutex_);
-  files_[file_number] = {file_path, link_path, 0};
+  auto now = std::chrono::steady_clock::now();
+  files_[file_number] = {file_path, link_path, 0, 0, now, now};
   LifecycleLogf("[LC_REGISTER] file=%lu path=%s link=%s ref=0\n",
                (unsigned long)file_number, file_path.c_str(), link_path.c_str());
+  MaybeDumpStatus();
 }
+
 void HotSstLifecycleManager::Ref(uint64_t file_number) {
+  if (file_number == static_cast<uint64_t>(-1)) return;
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = files_.find(file_number);
   if (it != files_.end()) {
+    it->second.last_activity_at = std::chrono::steady_clock::now();
     int old_ref = it->second.ref_count++;
+    if (it->second.ref_count > it->second.max_ref_seen)
+      it->second.max_ref_seen = it->second.ref_count;
     LifecycleLogf("[LC_REF] file=%lu ref: %d -> %d\n",
                  (unsigned long)file_number, old_ref, it->second.ref_count);
+    // 实时异常：ref 超过阈值
+    if (it->second.ref_count == kAnomalyRefThreshold) {
+      auto age = std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::steady_clock::now() - it->second.registered_at).count();
+      LifecycleLogf("[LC_ANOMALY] file=%lu ref_count=%d reached threshold=%d "
+                   "(age=%llds, max_ref=%d) -- possible ref leak!\n",
+                   (unsigned long)file_number, it->second.ref_count,
+                   kAnomalyRefThreshold, (long long)age, it->second.max_ref_seen);
+    }
+    MaybeDumpStatus();
   } else {
     LifecycleLogf("[LC_WARN] Ref on unregistered file=%lu\n",
                  (unsigned long)file_number);
   }
 }
+
 void HotSstLifecycleManager::Unref(uint64_t file_number) {
+  if (file_number == static_cast<uint64_t>(-1)) return;
   std::string f_del, l_del;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = files_.find(file_number);
     if (it != files_.end()) {
+      it->second.last_activity_at = std::chrono::steady_clock::now();
       int old_ref = it->second.ref_count;
       --it->second.ref_count;
       LifecycleLogf("[LC_UNREF] file=%lu ref: %d -> %d\n",
                    (unsigned long)file_number, old_ref, it->second.ref_count);
       if (it->second.ref_count <= 0) {
         f_del = it->second.file_path; l_del = it->second.link_path;
+        auto age = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - it->second.registered_at).count();
+        LifecycleLogf("[LC_DELETE] file=%lu DELETED (age=%llds max_ref=%d path=%s)\n",
+                     (unsigned long)file_number, (long long)age,
+                     it->second.max_ref_seen, f_del.c_str());
         files_.erase(it);
-        LifecycleLogf("[LC_DELETE] file=%lu DELETED (path=%s link=%s)\n",
-                     (unsigned long)file_number, f_del.c_str(), l_del.c_str());
       }
     } else {
       LifecycleLogf("[LC_WARN] Unref on unregistered file=%lu\n",
                    (unsigned long)file_number);
     }
+    MaybeDumpStatus();
   }
   if (!l_del.empty()) env_->DeleteFile(l_del);
   if (!f_del.empty()) env_->DeleteFile(f_del);
+}
+
+void HotSstLifecycleManager::DumpStatus() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  MaybeDumpStatus();
+}
+
+void HotSstLifecycleManager::MaybeDumpStatus() {
+  // 调用方已持有 mutex_
+  auto now = std::chrono::steady_clock::now();
+  auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+      now - last_dump_time_).count();
+  if (elapsed < kDumpIntervalSec) return;
+  last_dump_time_ = now;
+
+  LifecycleLogf("[LC_STATUS] ===== Periodic dump: %zu files tracked =====\n",
+               files_.size());
+  int anomaly_count = 0;
+  for (const auto& kv : files_) {
+    uint64_t fn = kv.first;
+    const FileState& st = kv.second;
+    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+        now - st.registered_at).count();
+    auto idle = std::chrono::duration_cast<std::chrono::seconds>(
+        now - st.last_activity_at).count();
+    const char* anomaly = "";
+    if (st.ref_count >= kAnomalyRefThreshold) {
+      anomaly = "  <== [ANOMALY:HIGH_REF]";
+      anomaly_count++;
+    } else if (idle >= kStaleRefThresholdSec && st.ref_count > 0) {
+      anomaly = "  <== [ANOMALY:STALE_WITH_REF]";
+      anomaly_count++;
+    }
+    LifecycleLogf("[LC_STATUS]   file=%lu ref=%d max_ref=%d age=%llds idle=%llds%s\n",
+                 (unsigned long)fn, st.ref_count, st.max_ref_seen,
+                 (long long)age, (long long)idle, anomaly);
+  }
+  if (anomaly_count > 0) {
+    LifecycleLogf("[LC_STATUS] WARNING: %d anomalous file(s) detected!\n",
+                 anomaly_count);
+  }
+  LifecycleLogf("[LC_STATUS] ==============================================\n");
 }
 
 }  // namespace ROCKSDB_NAMESPACE

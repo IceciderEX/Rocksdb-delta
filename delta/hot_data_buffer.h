@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <shared_mutex>
@@ -118,25 +119,43 @@ class HotDataBuffer {
 class HotSstLifecycleManager {
  public:
   HotSstLifecycleManager(const Options& options) : 
-    env_(options.env), info_log_(options.info_log) {}
+    env_(options.env), info_log_(options.info_log),
+    last_dump_time_(std::chrono::steady_clock::now()) {}
 
   void RegisterFile(uint64_t file_number, const std::string& file_path,
                     const std::string& link_path);
   void Ref(uint64_t file_number);
   void Unref(uint64_t file_number);
 
+  // 输出当前所有追踪文件的状态快照（标记潜在泄露）
+  void DumpStatus();
+
  private:
   Env* env_;
   std::shared_ptr<Logger> info_log_;
   std::mutex mutex_;
 
+  // ref 超过此阈值时立即输出 LC_ANOMALY
+  static constexpr int kAnomalyRefThreshold = 50;
+  // 最近一次 ref/unref 后静止超过此时间（秒）且 ref > 0 则标记为可疑
+  static constexpr int kStaleRefThresholdSec = 300;
+  // 定期快照间隔（秒）
+  static constexpr int kDumpIntervalSec = 30;
+
   struct FileState {
     std::string file_path;
     std::string link_path;
     int ref_count;
+    int max_ref_seen;
+    std::chrono::steady_clock::time_point registered_at;
+    std::chrono::steady_clock::time_point last_activity_at;
   };
 
   std::unordered_map<uint64_t, FileState> files_;
+  std::chrono::steady_clock::time_point last_dump_time_;
+
+  // 如果距上次快照超过 kDumpIntervalSec 秒则 dump（调用方已持有 mutex_）
+  void MaybeDumpStatus();
 };
 
 }  // namespace ROCKSDB_NAMESPACE

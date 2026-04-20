@@ -3888,6 +3888,9 @@ std::unique_ptr<MultiScan> DBImpl::NewMultiScan(
 
 Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                               ColumnFamilyHandle* column_family) {
+  // Propagate per-read diag logging flag to the global DiagLogf stderr switch.
+  DiagLogSetStderrEnabled(_read_options.enable_delta_diag_logging);
+
   if (_read_options.io_activity != Env::IOActivity::kUnknown &&
       _read_options.io_activity != Env::IOActivity::kDBIterator) {
     return NewErrorIterator(Status::InvalidArgument(
