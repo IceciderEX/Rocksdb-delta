@@ -178,7 +178,7 @@ class DeltaSwitchingIterator : public InternalIterator {
   void InitColdIter();
 
   // 初始化热点数据迭代器 (Hot Optimized Path)
-  bool InitHotIter(uint64_t cuid);
+  bool InitHotIter(uint64_t cuid, const Slice& target);
 
   void CheckAndSwitch(const Slice* target);
 

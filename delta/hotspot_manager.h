@@ -4,6 +4,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "delta/global_delete_count_table.h"
 #include "delta/hot_data_buffer.h"
@@ -37,6 +39,19 @@ struct PartialMergePendingTask {
   std::string scan_last_key;
   // 小 Scan 中精准抓取的 KV 对数据
   std::vector<std::pair<std::string, std::string>> scan_data;
+};
+
+struct PartialMergeThrottleState {
+  uint64_t last_enqueue_micros = 0;
+  size_t last_delta_count = 0;
+  std::string last_range_first;
+  std::string last_range_last;
+};
+
+struct PendingRangeScanTask {
+  uint64_t cuid = 0;
+  std::string start_user_key;
+  std::string upper_bound_user_key;
 };
 
 class HotspotManager {
@@ -78,6 +93,9 @@ class HotspotManager {
   // 计算给定 key 范围涉及的 delta 数量
   size_t CountInvolvedDeltas(uint64_t cuid, const std::string& first_key,
                              const std::string& last_key);
+
+  // Phase-1 range scans only capture scan_data when PM is not being throttled.
+  bool ShouldCapturePartialMergeForRangeScan(uint64_t cuid);
 
   void FinalizeScanAsCompaction(
       uint64_t cuid, const std::unordered_set<uint64_t>& visited_files,
@@ -133,15 +151,9 @@ class HotspotManager {
   void UpdateCompactionRefCount(
       uint64_t cuid, int32_t input_count, int32_t output_count,
       const std::vector<uint64_t>& input_files_verified,
-      uint64_t output_file_verified) {
-    delete_table_.ApplyCompactionChange(cuid, input_count, output_count,
-                                        input_files_verified,
-                                        output_file_verified);
-  }
+      uint64_t output_file_verified);
 
-  void UpdateFlushRefCount(uint64_t cuid, uint64_t output_file) {
-    delete_table_.ApplyFlushChange(cuid, output_file);
-  }
+  void UpdateFlushRefCount(uint64_t cuid, uint64_t output_file);
 
   bool GetHotIndexEntry(uint64_t cuid, HotIndexEntry* out_entry) {
     return index_table_.GetEntry(cuid, out_entry);
@@ -167,19 +179,21 @@ class HotspotManager {
   GlobalDeleteCountTable& GetDeleteTable() { return delete_table_; }
 
   // 将 CUID 加入待初始化队列 (首次成为热点时调用)
-  void EnqueueForInitScan(uint64_t cuid);
+  void EnqueueForInitScan(uint64_t cuid, const Slice& user_key);
 
   // 获取并清空部分待初始化队列 (由 DBImpl 后台线程调用)
-  std::vector<uint64_t> PopPendingInitCuids(size_t max_count = 32);
+  std::vector<PendingRangeScanTask> PopPendingInitCuids(
+      size_t max_count = 32);
 
   // 检查是否有待处理的初始化任务
   bool HasPendingInitCuids() const;
 
   // 将 CUID 加入待补全元数据的扫描队列
-  void EnqueueMetadataScan(uint64_t cuid);
+  void EnqueueMetadataScan(uint64_t cuid, const Slice& user_key);
 
   // 获取并部清空待补全元数据的扫描队列
-  std::vector<uint64_t> PopPendingMetadataScans(size_t max_count = 32);
+  std::vector<PendingRangeScanTask> PopPendingMetadataScans(
+      size_t max_count = 32);
 
   // 检查是否有待处理的物理单元计数扫描任务
   bool HasPendingMetadataScans() const;
@@ -197,6 +211,21 @@ class HotspotManager {
  private:
   Status InitGDCTLog();
   Status FlushGDCTLogBuffer();
+  bool BuildEntityScanTask(uint64_t cuid, const Slice& user_key,
+                           PendingRangeScanTask* task) const;
+  bool HasBufferedDataForCuid(uint64_t cuid);
+  bool IsCuidLocked(uint64_t cuid) const;
+  void ClearPendingStateForCuid(uint64_t cuid);
+  void MaybeCleanupDeletedCuid(uint64_t cuid);
+  bool ShouldSchedulePartialMerge(uint64_t cuid,
+                                  const std::string& scan_first_key,
+                                  const std::string& scan_last_key,
+                                  size_t delta_count);
+  void RecordPartialMergeEnqueue(uint64_t cuid,
+                                 const std::string& scan_first_key,
+                                 const std::string& scan_last_key,
+                                 size_t delta_count);
+  void ClearPartialMergeThrottleState(uint64_t cuid);
 
  private:
   Options db_options_;
@@ -225,15 +254,20 @@ class HotspotManager {
   // FinalizeScanAsCompaction -> IndexTable
   std::unordered_map<uint64_t, std::vector<DataSegment>> pending_snapshots_;
   std::mutex pending_mutex_;
+  std::unordered_set<uint64_t> active_buffered_cuids_;
+  std::mutex buffered_cuids_mutex_;
   // 待补全物理 ID 计数的扫描队列
-  std::vector<uint64_t> pending_metadata_scans_;
+  std::vector<PendingRangeScanTask> pending_metadata_scans_;
   mutable std::mutex pending_metadata_mutex_;
   // 待初始化全量扫描的 CUID 队列
-  std::vector<uint64_t> pending_init_cuids_;
+  std::vector<PendingRangeScanTask> pending_init_cuids_;
   mutable std::mutex pending_init_mutex_;
   // Partial Merge 处理队列
   std::deque<PartialMergePendingTask> partial_merge_queue_;
   mutable std::mutex partial_merge_mutex_;
+  std::unordered_map<uint64_t, PartialMergeThrottleState>
+      partial_merge_throttle_;
+  mutable std::mutex partial_merge_throttle_mutex_;
   // 正在进行的 CUID 操作 (防止并发)
   std::unordered_set<uint64_t> in_progress_cuids_;
   mutable std::mutex in_progress_mutex_;

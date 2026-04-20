@@ -51,6 +51,7 @@ class GlobalDeleteCountTable {
   std::vector<std::pair<uint64_t, SequenceNumber>> GetAllDeletedCuids() const;
 
   int GetRefCount(uint64_t cuid) const;
+  void RemoveCUID(uint64_t cuid);
 
   void ApplyCompactionChange(uint64_t cuid, int32_t input_count,
                              int32_t output_count,

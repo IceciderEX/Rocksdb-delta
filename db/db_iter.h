@@ -186,6 +186,14 @@ class DBIter final : public Iterator {
       }
     }
 
+    // for delta: 异步补全元数据 (当热路径 Full Scan 结束时入队)
+    // 非后台扫描 (!skip_hot_path) 才允许触发下一次扫描，防止无限递归
+    if (hotspot_manager_ && read_options_.delta_full_scan &&
+        delta_ctx_.is_current_hot && !read_options_.skip_hot_path &&
+        delta_ctx_.last_cuid != 0 && !delta_ctx_.scan_first_key.empty()) {
+      hotspot_manager_->EnqueueMetadataScan(
+          delta_ctx_.last_cuid, ExtractUserKey(delta_ctx_.scan_first_key));
+    }
     // for delta: 唤醒后台线程处理待执行的 tasks（condition variable）
     if (cfh_ && hotspot_manager_) {
       auto db_impl = static_cast<DBImpl*>(cfh_->db());
@@ -578,6 +586,7 @@ class DBIter final : public Iterator {
     std::string key_encode_buf;  // InternalKey buffer
     // 小 Scan 采集的精确 KV 数据，供后台 PartialMerge 使用
     std::vector<std::pair<std::string, std::string>> scan_data;
+    bool capture_partial_merge_scan = false;
 
     // 缓存当前 CUID 的 deleted 状态，避免每 key 都查询 GDCT
     bool cached_cuid_is_deleted = false;
@@ -597,6 +606,7 @@ class DBIter final : public Iterator {
       scan_last_key.clear();
       key_encode_buf.clear(); 
       scan_data.clear();
+      capture_partial_merge_scan = false;
       cached_cuid_is_deleted = false;
       cached_deleted_check_cuid = 0;
       cached_phys_id = 0;

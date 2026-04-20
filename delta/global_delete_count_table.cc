@@ -81,10 +81,6 @@ void GlobalDeleteCountTable::UntrackFiles(uint64_t cuid, const std::vector<uint6
       }
   }
 
-  // 检查是否需要清理条目 (引用归零 且 标记删除)
-  if (entry.ref_count <= 0 && entry.deleted_at_seqno.load(std::memory_order_relaxed) != kMaxSequenceNumber) {
-      shard.table.erase(it);
-  }
 }
 
 void GlobalDeleteCountTable::ApplyCompactionChange(
@@ -133,10 +129,6 @@ void GlobalDeleteCountTable::ApplyCompactionChange(
 
   // assert(entry.ref_count == (int32_t)entry.tracked_phys_ids.size());
 
-  // 2.3 检查清理条件：无文件引用 且 标记为删除
-  if (entry.ref_count <= 0 && entry.deleted_at_seqno.load(std::memory_order_relaxed) != kMaxSequenceNumber) {
-      shard.table.erase(it);
-  }
 }
 
 void GlobalDeleteCountTable::ApplyFlushChange(uint64_t cuid,
@@ -212,6 +204,12 @@ int GlobalDeleteCountTable::GetRefCount(uint64_t cuid) const {
     return it->second.GetRefCount();
   }
   return 0;
+}
+
+void GlobalDeleteCountTable::RemoveCUID(uint64_t cuid) {
+  auto& shard = GetShard(cuid);
+  std::unique_lock<std::shared_mutex> lock(shard.mutex);
+  shard.table.erase(cuid);
 }
 
 bool GlobalDeleteCountTable::IsTracked(uint64_t cuid) const {

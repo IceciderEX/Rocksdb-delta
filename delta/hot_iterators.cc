@@ -19,6 +19,40 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+
+bool SegmentOverlapsUserRange(const InternalKeyComparator& icmp,
+                              const DataSegment& seg,
+                              const Slice& lower_user,
+                              const Slice* upper_user) {
+  const Slice seg_first_user = ExtractUserKey(seg.first_key);
+  const Slice seg_last_user = ExtractUserKey(seg.last_key);
+
+  if (icmp.user_comparator()->Compare(seg_last_user, lower_user) < 0) {
+    return false;
+  }
+  if (upper_user != nullptr &&
+      icmp.user_comparator()->Compare(seg_first_user, *upper_user) >= 0) {
+    return false;
+  }
+  return true;
+}
+
+void UnrefPhysicalSegments(
+    const std::shared_ptr<HotSstLifecycleManager>& lifecycle_manager,
+    const std::vector<DataSegment>& segs) {
+  if (!lifecycle_manager) {
+    return;
+  }
+  for (const auto& seg : segs) {
+    if (seg.file_number != static_cast<uint64_t>(-1)) {
+      lifecycle_manager->Unref(seg.file_number);
+    }
+  }
+}
+
+}  // namespace
+
 static FileMetaData MakeFileMetaFromSegment(const DataSegment& seg,
                                             bool is_delta = true) {
   FileMetaData meta;
@@ -1051,8 +1085,11 @@ void DeltaSwitchingIterator::InitColdIter() {
   }
 }
 
-bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
-  if (hot_iter_ && current_hot_cuid_ == cuid) return true;
+bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid, const Slice& target) {
+  if (hot_iter_ && current_hot_cuid_ == cuid &&
+      read_options_.iterate_upper_bound == nullptr) {
+    return true;
+  }
 
   if (hybrid_iter_) {
     delete hybrid_iter_;
@@ -1074,7 +1111,8 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
     return false;
   }
 
-  if (!entry.HasSnapshot()) {
+  const bool has_snapshot_base = entry.HasSnapshot();
+  if (!has_snapshot_base) {
     // Snapshot 为空，预 Ref 也为空（nothing to Unref）
     if (read_options_.enable_delta_diag_logging) {
       fprintf(stderr, "[DIAG_HOT_PATH] CUID %lu: InitHotIter failed - No Snapshot segments yet (Initial scan might be in progress)\n", cuid);
@@ -1082,19 +1120,71 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid) {
     return false;
   }
 
-  // snapshot_segments 已预 Ref
-  InternalIterator* snapshot_iter =
-      new HotSnapshotIterator(HotSnapshotIterator::SegmentsPreRefed{},
-                              entry.snapshot_segments, cuid, hotspot_manager_,
-                              version_->cfd()->table_cache(), read_options_,
-                              file_options_, icmp_, mutable_cf_options_,
-                              hotspot_manager_->GetLifecycleManager());
+  const Slice lower_user = ExtractUserKey(target);
+  const Slice* upper_user = read_options_.iterate_upper_bound;
 
-  InternalIterator* delta_iter = new HotDeltaIterator(
-      entry.deltas, cuid, version_->cfd()->table_cache(), read_options_,
-      file_options_, icmp_, mutable_cf_options_, false);
+  std::vector<DataSegment> dropped_snapshots;
+  if (upper_user != nullptr) {
+    std::vector<DataSegment> filtered_snapshots;
+    filtered_snapshots.reserve(entry.snapshot_segments.size());
+    for (const auto& seg : entry.snapshot_segments) {
+      if (SegmentOverlapsUserRange(icmp_, seg, lower_user, upper_user)) {
+        filtered_snapshots.push_back(seg);
+      } else {
+        dropped_snapshots.push_back(seg);
+      }
+    }
+    entry.snapshot_segments.swap(filtered_snapshots);
 
-  std::vector<InternalIterator*> children = {delta_iter, snapshot_iter};
+    std::vector<DataSegment> filtered_deltas;
+    filtered_deltas.reserve(entry.deltas.size());
+    for (const auto& seg : entry.deltas) {
+      if (SegmentOverlapsUserRange(icmp_, seg, lower_user, upper_user)) {
+        filtered_deltas.push_back(seg);
+      }
+    }
+    entry.deltas.swap(filtered_deltas);
+  }
+
+  UnrefPhysicalSegments(hotspot_manager_->GetLifecycleManager(),
+                        dropped_snapshots);
+
+  if (entry.snapshot_segments.empty() && entry.deltas.empty()) {
+    if (read_options_.enable_delta_diag_logging) {
+      fprintf(stderr,
+              "[DIAG_HOT_PATH] CUID %lu: InitHotIter failed - No overlapping "
+              "hot segments for current range\n",
+              cuid);
+    }
+    return false;
+  }
+
+  std::vector<InternalIterator*> children;
+  children.reserve(2);
+
+  if (!entry.deltas.empty()) {
+    InternalIterator* delta_iter = new HotDeltaIterator(
+        entry.deltas, cuid, version_->cfd()->table_cache(), read_options_,
+        file_options_, icmp_, mutable_cf_options_, false);
+    children.push_back(delta_iter);
+  }
+
+  if (!entry.snapshot_segments.empty()) {
+    // snapshot_segments 已预 Ref
+    InternalIterator* snapshot_iter =
+        new HotSnapshotIterator(HotSnapshotIterator::SegmentsPreRefed{},
+                                entry.snapshot_segments, cuid,
+                                hotspot_manager_, version_->cfd()->table_cache(),
+                                read_options_, file_options_, icmp_,
+                                mutable_cf_options_,
+                                hotspot_manager_->GetLifecycleManager());
+    children.push_back(snapshot_iter);
+  }
+
+  if (children.empty()) {
+    return false;
+  }
+
   hot_iter_ = NewMergingIterator(&icmp_, children.data(),
                                  static_cast<int>(children.size()));
 
@@ -1121,14 +1211,11 @@ void DeltaSwitchingIterator::Seek(const Slice& target) {
   }
   // 否则，不论是点查还是全扫描(delta_full_scan)，只要是热点，全部走热点路径
   else if (cuid != 0 && hotspot_manager_->IsHot(cuid)) {
-    if (InitHotIter(cuid)) {
-      if (read_options_.delta_full_scan) {
-        InitColdIter();
-        hybrid_iter_ = new HotColdHybridIterator(hot_iter_, cold_iter_, icmp_);
-        current_iter_ = hybrid_iter_;
-      } else {
-        current_iter_ = hot_iter_;
-      }
+    if (InitHotIter(cuid, target)) {
+      // Frontend full scans rely on hot snapshot + delta. Memtable/immutable
+      // updates are still merged by DBImpl's outer iterator stack, while a
+      // dedicated metadata scan refreshes GDCT in the cold path afterwards.
+      current_iter_ = hot_iter_;
       is_hot_mode_ = true;
     } else {
       // 热点索引尚未建立（如 Init Scan 还在进行中），回退到 Cold Path

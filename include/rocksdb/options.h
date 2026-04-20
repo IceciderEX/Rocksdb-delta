@@ -2337,7 +2337,10 @@ struct ReadOptions {
 
   // *** END per-request settings for internal team use only ***
 
-  // for delta
+  // Delta mode full-entity scan flag.
+  // True for the foreground "phase 2" full scan, and also for internal
+  // init/metadata scans that intentionally reuse the same full-scan
+  // bookkeeping path (GDCT rebuild + full snapshot replacement).
   bool delta_full_scan = false;
   // 跳过热点路径，直接读取冷数据
   bool skip_hot_path = false;

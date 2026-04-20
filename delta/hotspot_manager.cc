@@ -5,6 +5,7 @@
 
 #include "delta/hotspot_manager.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cinttypes>
 #include <sstream>
@@ -19,6 +20,53 @@
 #include "util/extract_cuid.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+constexpr size_t kEntityPrefixBytes = 24;
+constexpr uint64_t kPartialMergeCooldownMicros = 250000;
+
+uint64_t SteadyNowMicros() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+bool InternalRangesOverlap(const InternalKeyComparator* icmp,
+                           const std::string& lhs_first,
+                           const std::string& lhs_last,
+                           const std::string& rhs_first,
+                           const std::string& rhs_last) {
+  if (icmp == nullptr || lhs_first.empty() || lhs_last.empty() ||
+      rhs_first.empty() || rhs_last.empty()) {
+    return false;
+  }
+
+  return !(icmp->Compare(lhs_last, rhs_first) < 0 ||
+           icmp->Compare(lhs_first, rhs_last) > 0);
+}
+
+bool IncrementFixedPrefix(std::string* prefix) {
+  if (prefix == nullptr || prefix->empty()) {
+    return false;
+  }
+  for (int i = static_cast<int>(prefix->size()) - 1; i >= 0; --i) {
+    const unsigned char current =
+        static_cast<unsigned char>((*prefix)[static_cast<size_t>(i)]);
+    if (current == 0xFF) {
+      continue;
+    }
+    (*prefix)[static_cast<size_t>(i)] = static_cast<char>(current + 1);
+    for (size_t j = static_cast<size_t>(i) + 1; j < prefix->size(); ++j) {
+      (*prefix)[j] = '\0';
+    }
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
 
 HotspotManager::HotspotManager(const Options& db_options,
                                const std::string& data_dir,
@@ -138,6 +186,157 @@ bool HotspotManager::PrepareForFullReplace(uint64_t cuid) {
   return true;
 }
 
+bool HotspotManager::BuildEntityScanTask(uint64_t cuid, const Slice& user_key,
+                                         PendingRangeScanTask* task) const {
+  if (task == nullptr || cuid == 0 || user_key.size() < kEntityPrefixBytes) {
+    return false;
+  }
+
+  const size_t key_size = user_key.size();
+  const Slice prefix(user_key.data(), kEntityPrefixBytes);
+  std::string upper_prefix = prefix.ToString();
+  if (!IncrementFixedPrefix(&upper_prefix)) {
+    return false;
+  }
+
+  task->cuid = cuid;
+  task->start_user_key.assign(key_size, '\0');
+  task->upper_bound_user_key.assign(key_size, '\0');
+  std::copy(prefix.data(), prefix.data() + prefix.size(),
+            task->start_user_key.begin());
+  std::copy(upper_prefix.begin(), upper_prefix.end(),
+            task->upper_bound_user_key.begin());
+  return true;
+}
+
+bool HotspotManager::HasBufferedDataForCuid(uint64_t cuid) {
+  std::string min_key;
+  std::string max_key;
+  return buffer_.GetBoundaryKeys(cuid, &min_key, &max_key, internal_comparator_);
+}
+
+bool HotspotManager::IsCuidLocked(uint64_t cuid) const {
+  std::lock_guard<std::mutex> lock(in_progress_mutex_);
+  return in_progress_cuids_.find(cuid) != in_progress_cuids_.end();
+}
+
+void HotspotManager::ClearPendingStateForCuid(uint64_t cuid) {
+  std::vector<DataSegment> pending_segments;
+  bool removed_partial_merge_task = false;
+
+  {
+    std::lock_guard<std::mutex> lock(pending_init_mutex_);
+    pending_init_cuids_.erase(
+        std::remove_if(pending_init_cuids_.begin(), pending_init_cuids_.end(),
+                       [cuid](const PendingRangeScanTask& task) {
+                         return task.cuid == cuid;
+                       }),
+        pending_init_cuids_.end());
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(pending_metadata_mutex_);
+    pending_metadata_scans_.erase(
+        std::remove_if(pending_metadata_scans_.begin(),
+                       pending_metadata_scans_.end(),
+                       [cuid](const PendingRangeScanTask& task) {
+                         return task.cuid == cuid;
+                       }),
+        pending_metadata_scans_.end());
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(partial_merge_mutex_);
+    auto it = std::remove_if(partial_merge_queue_.begin(),
+                             partial_merge_queue_.end(),
+                             [cuid](const PartialMergePendingTask& task) {
+                               return task.cuid == cuid;
+                             });
+    removed_partial_merge_task = (it != partial_merge_queue_.end());
+    partial_merge_queue_.erase(it, partial_merge_queue_.end());
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    auto it = pending_snapshots_.find(cuid);
+    if (it != pending_snapshots_.end()) {
+      pending_segments = std::move(it->second);
+      pending_snapshots_.erase(it);
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(buffered_cuids_mutex_);
+    active_buffered_cuids_.erase(cuid);
+  }
+
+  ClearPartialMergeThrottleState(cuid);
+
+  for (const auto& seg : pending_segments) {
+    if (seg.file_number != static_cast<uint64_t>(-1)) {
+      lifecycle_manager_->Unref(seg.file_number);
+    }
+  }
+
+  if (removed_partial_merge_task) {
+    UnlockCuid(cuid);
+  }
+}
+
+void HotspotManager::MaybeCleanupDeletedCuid(uint64_t cuid) {
+  if (cuid == 0) {
+    return;
+  }
+  if (!delete_table_.IsDeleted(cuid, kMaxSequenceNumber) ||
+      delete_table_.GetRefCount(cuid) > 0 || IsCuidLocked(cuid)) {
+    return;
+  }
+
+  index_table_.RemoveCUID(cuid);
+  frequency_table_.RemoveCUID(cuid);
+  ClearPendingStateForCuid(cuid);
+
+  if (HasBufferedDataForCuid(cuid)) {
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "[HotspotManager] Cleanup for deleted CUID %" PRIu64
+                   " delayed until buffered data drains",
+                   cuid);
+    return;
+  }
+
+  // Preserve the logical-delete tombstone so every subsequent per-row delete
+  // in the same lifecycle stays on the fast interception path instead of
+  // falling back to real DB::Delete() writes.
+  delete_table_.ResetTracking(cuid);
+  ROCKS_LOG_INFO(db_options_.info_log,
+                 "[HotspotManager] Cleaned metadata for deleted CUID %" PRIu64,
+                 cuid);
+}
+
+bool HotspotManager::ShouldCapturePartialMergeForRangeScan(uint64_t cuid) {
+  if (cuid == 0) {
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(partial_merge_mutex_);
+    for (const auto& task : partial_merge_queue_) {
+      if (task.cuid == cuid) {
+        return false;
+      }
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(partial_merge_throttle_mutex_);
+  auto it = partial_merge_throttle_.find(cuid);
+  if (it == partial_merge_throttle_.end()) {
+    return true;
+  }
+
+  return SteadyNowMicros() - it->second.last_enqueue_micros >=
+         kPartialMergeCooldownMicros;
+}
+
 Status HotspotManager::InterceptDelete(const Slice& key, SequenceNumber seq,
                                        bool sync) {
   uint64_t cuid = ExtractCUID(key);
@@ -149,9 +348,13 @@ Status HotspotManager::InterceptDelete(const Slice& key, SequenceNumber seq,
 
   if (tracked) {
     if (newly_deleted) {
-      // 第一次 delete
-      return PersistDelete(cuid, seq, sync);
+      Status s = PersistDelete(cuid, seq, sync);
+      if (s.ok()) {
+        MaybeCleanupDeletedCuid(cuid);
+      }
+      return s;
     }
+    MaybeCleanupDeletedCuid(cuid);
     return Status::OK();
   }
   // CUID 不在热点管理范围内
@@ -625,6 +828,11 @@ void HotspotManager::TriggerBufferFlush(const char* source,
     if (s.ok()) {
       for (const auto& kv : new_segments) {
         uint64_t cuid = kv.first;
+        if (delete_table_.IsDeleted(cuid, kMaxSequenceNumber)) {
+          MaybeCleanupDeletedCuid(cuid);
+          continue;
+        }
+
         // 如果 FlushBlockToSharedSST gap-split 产生了多个段，记录当前 flush 上下文
         if (kv.second.size() > 1) {
           const char* split_ctx = "normal";
@@ -1030,12 +1238,16 @@ ScanAsCompactionStrategy HotspotManager::EvaluateScanAsCompactionStrategy(
     *out_involved_delta_count = delta_count;
   }
 
-  // 根据阈值决定策略
-  if (delta_count >= db_options_.delta_options.delta_merge_threshold) {
-    return ScanAsCompactionStrategy::kPartialMerge;
+  if (delta_count < db_options_.delta_options.delta_merge_threshold) {
+    return ScanAsCompactionStrategy::kNoAction;
   }
 
-  return ScanAsCompactionStrategy::kNoAction;
+  if (!ShouldSchedulePartialMerge(cuid, scan_first_key, scan_last_key,
+                                  delta_count)) {
+    return ScanAsCompactionStrategy::kNoAction;
+  }
+
+  return ScanAsCompactionStrategy::kPartialMerge;
 }
 
 size_t HotspotManager::CountInvolvedDeltas(uint64_t cuid,
@@ -1059,6 +1271,9 @@ void HotspotManager::FinalizeScanAsCompactionWithStrategy(
                                scan_last_key);
       break;
     case ScanAsCompactionStrategy::kPartialMerge:
+      if (scan_data.empty()) {
+        return;
+      }
       EnqueuePartialMerge(cuid, scan_first_key, scan_last_key, scan_data);
       break;
   }
@@ -1102,7 +1317,23 @@ void HotspotManager::CleanUpMetadataAfterCompaction(
   // 步骤c：已删除cuid hotdata文件的处理
   for (uint64_t cuid : involved_cuids) {
     delete_table_.UntrackFiles(cuid, input_files);
+    MaybeCleanupDeletedCuid(cuid);
   }
+}
+
+void HotspotManager::UpdateCompactionRefCount(
+    uint64_t cuid, int32_t input_count, int32_t output_count,
+    const std::vector<uint64_t>& input_files_verified,
+    uint64_t output_file_verified) {
+  delete_table_.ApplyCompactionChange(cuid, input_count, output_count,
+                                      input_files_verified,
+                                      output_file_verified);
+  MaybeCleanupDeletedCuid(cuid);
+}
+
+void HotspotManager::UpdateFlushRefCount(uint64_t cuid, uint64_t output_file) {
+  delete_table_.ApplyFlushChange(cuid, output_file);
+  MaybeCleanupDeletedCuid(cuid);
 }
 
 bool HotspotManager::IsHot(uint64_t cuid) {
@@ -1116,24 +1347,35 @@ InternalIterator* HotspotManager::NewBufferIterator(
 }
 
 // --------------------- Pending Init CUID Queue --------------------- //
-void HotspotManager::EnqueueForInitScan(uint64_t cuid) {
+void HotspotManager::EnqueueForInitScan(uint64_t cuid, const Slice& user_key) {
+  PendingRangeScanTask task;
+  if (!BuildEntityScanTask(cuid, user_key, &task)) {
+    ROCKS_LOG_WARN(
+        db_options_.info_log,
+        "[HotspotManager] Failed to build init scan task for CUID %" PRIu64
+        ", key size=%zu",
+        cuid, user_key.size());
+    return;
+  }
+
   std::lock_guard<std::mutex> lock(pending_init_mutex_);
   // 避免重复添加
-  for (uint64_t c : pending_init_cuids_) {
-    if (c == cuid) return;
+  for (const auto& pending : pending_init_cuids_) {
+    if (pending.cuid == cuid) return;
   }
-  pending_init_cuids_.push_back(cuid);
+  pending_init_cuids_.push_back(std::move(task));
   ROCKS_LOG_INFO(
       db_options_.info_log,
       "[HotspotManager] Enqueued CUID %" PRIu64 " for initial full scan", cuid);
 }
 
-std::vector<uint64_t> HotspotManager::PopPendingInitCuids(size_t max_count) {
+std::vector<PendingRangeScanTask> HotspotManager::PopPendingInitCuids(
+    size_t max_count) {
   std::lock_guard<std::mutex> lock(pending_init_mutex_);
-  std::vector<uint64_t> result;
+  std::vector<PendingRangeScanTask> result;
   for (auto it = pending_init_cuids_.begin();
        it != pending_init_cuids_.end() && result.size() < max_count;) {
-    if (TryLockCuid(*it)) {
+    if (TryLockCuid(it->cuid)) {
       result.push_back(*it);
       it = pending_init_cuids_.erase(it);
     } else {
@@ -1149,23 +1391,39 @@ bool HotspotManager::HasPendingInitCuids() const {
 }
 
 // --------------------- Metadata Scan Queue --------------------- //
-void HotspotManager::EnqueueMetadataScan(uint64_t cuid) {
-  std::lock_guard<std::mutex> lock(pending_metadata_mutex_);
-  for (uint64_t c : pending_metadata_scans_) {
-    if (c == cuid) return;
+void HotspotManager::EnqueueMetadataScan(uint64_t cuid, const Slice& user_key) {
+  PendingRangeScanTask task;
+  if (!BuildEntityScanTask(cuid, user_key, &task)) {
+    ROCKS_LOG_WARN(
+        db_options_.info_log,
+        "[HotspotManager] Failed to build metadata scan task for CUID %" PRIu64
+        ", key size=%zu",
+        cuid, user_key.size());
+    return;
   }
-  pending_metadata_scans_.push_back(cuid);
+
+  std::lock_guard<std::mutex> lock(pending_metadata_mutex_);
+  for (const auto& pending : pending_metadata_scans_) {
+    if (pending.cuid == cuid) return;
+  }
+  pending_metadata_scans_.push_back(std::move(task));
   // fprintf(stdout,
   //         "[HotspotManager] Enqueued CUID %lu for metadata ref-count scan\n",
   //         cuid);
 }
 
-std::vector<uint64_t> HotspotManager::PopPendingMetadataScans(size_t max_count) {
+std::vector<PendingRangeScanTask> HotspotManager::PopPendingMetadataScans(
+    size_t max_count) {
   std::lock_guard<std::mutex> lock(pending_metadata_mutex_);
-  std::vector<uint64_t> result;
-  while (!pending_metadata_scans_.empty() && result.size() < max_count) {
-    result.push_back(pending_metadata_scans_.front());
-    pending_metadata_scans_.erase(pending_metadata_scans_.begin());
+  std::vector<PendingRangeScanTask> result;
+  for (auto it = pending_metadata_scans_.begin();
+       it != pending_metadata_scans_.end() && result.size() < max_count;) {
+    if (TryLockCuid(it->cuid)) {
+      result.push_back(*it);
+      it = pending_metadata_scans_.erase(it);
+    } else {
+      ++it;
+    }
   }
   return result;
 }
@@ -1197,12 +1455,62 @@ void HotspotManager::EnqueuePartialMerge(
   }
   partial_merge_queue_.push_back(
       {cuid, scan_first_key, scan_last_key, scan_data});
+  RecordPartialMergeEnqueue(cuid, scan_first_key, scan_last_key,
+                            CountInvolvedDeltas(cuid, scan_first_key,
+                                                scan_last_key));
   RegisterPmPending(cuid);
   ROCKS_LOG_INFO(db_options_.info_log,
                  "[HotspotManager] Enqueued PartialMerge for CUID %" PRIu64
                  ", range [%zu, %zu], %zu pairs",
                  cuid, scan_first_key.size(), scan_last_key.size(),
                  scan_data.size());
+}
+
+bool HotspotManager::ShouldSchedulePartialMerge(
+    uint64_t cuid, const std::string& scan_first_key,
+    const std::string& scan_last_key, size_t delta_count) {
+  if (cuid == 0) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(partial_merge_throttle_mutex_);
+  auto it = partial_merge_throttle_.find(cuid);
+  if (it == partial_merge_throttle_.end()) {
+    return true;
+  }
+
+  const uint64_t now_micros = SteadyNowMicros();
+  const PartialMergeThrottleState& state = it->second;
+  const uint64_t elapsed = now_micros - state.last_enqueue_micros;
+  if (elapsed >= kPartialMergeCooldownMicros) {
+    return true;
+  }
+
+  if (!InternalRangesOverlap(internal_comparator_, state.last_range_first,
+                             state.last_range_last, scan_first_key,
+                             scan_last_key)) {
+    return true;
+  }
+
+  const size_t delta_growth_threshold =
+      std::max<size_t>(1, db_options_.delta_options.delta_merge_threshold);
+  return delta_count >= state.last_delta_count + delta_growth_threshold;
+}
+
+void HotspotManager::RecordPartialMergeEnqueue(
+    uint64_t cuid, const std::string& scan_first_key,
+    const std::string& scan_last_key, size_t delta_count) {
+  std::lock_guard<std::mutex> lock(partial_merge_throttle_mutex_);
+  PartialMergeThrottleState& state = partial_merge_throttle_[cuid];
+  state.last_enqueue_micros = SteadyNowMicros();
+  state.last_delta_count = delta_count;
+  state.last_range_first = scan_first_key;
+  state.last_range_last = scan_last_key;
+}
+
+void HotspotManager::ClearPartialMergeThrottleState(uint64_t cuid) {
+  std::lock_guard<std::mutex> lock(partial_merge_throttle_mutex_);
+  partial_merge_throttle_.erase(cuid);
 }
 
 bool HotspotManager::HasPendingPartialMerge() const {

@@ -211,7 +211,7 @@ int main() {
   // ------------------------------------------------------------------
   std::cout << "\n>>> TEST 5: Background Metadata Scan (GDCT Update) <<<\n";
   // EVS 或缓存需要更新。我们会做 metadata update
-  hotspot_mgr->EnqueueMetadataScan(TEST_CUID);
+  hotspot_mgr->EnqueueMetadataScan(TEST_CUID, GenerateKey(TEST_CUID, 0));
   db_impl->ProcessPendingMetadataScans();
   std::cout << "Metadata scan processed." << std::endl;
 

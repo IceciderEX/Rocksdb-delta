@@ -592,11 +592,22 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                     }
                   }
 
+                  // full scan 需要进行一次 cold path metadata scan，更新 GDCT/refcount
+                  if (read_options_.delta_full_scan &&
+                      delta_ctx_.is_current_hot &&
+                      !read_options_.skip_hot_path &&
+                      delta_ctx_.last_cuid != 0 &&
+                      !delta_ctx_.scan_first_key.empty()) {
+                    hotspot_manager_->EnqueueMetadataScan(
+                        delta_ctx_.last_cuid,
+                        ExtractUserKey(delta_ctx_.scan_first_key));
+                  }
                   delta_ctx_.last_cuid = cuid;
                   delta_ctx_.visited_units_for_cuid.clear();
                   delta_ctx_.scan_first_key.clear();
                   delta_ctx_.scan_last_key.clear();
                   delta_ctx_.scan_data.clear();  // 清除上个 CUID 的 scan 数据
+                  delta_ctx_.capture_partial_merge_scan = false;
                   delta_ctx_.cached_deleted_check_cuid = 0;  // 清空 deleted 缓存，下次会重新查询
                   delta_ctx_.cached_phys_id = 0; // 重置 phys_id 缓存
     
@@ -607,7 +618,8 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
 
                   // 如果首次成为热点，加入待初始化队列（由后台线程处理）
                   if (became_hot) {
-                    hotspot_manager_->EnqueueForInitScan(cuid);
+                    hotspot_manager_->EnqueueForInitScan(
+                        cuid, saved_key_.GetUserKey());
                     delta_ctx_.trigger_scan_as_compaction = false;
                   } else if (delta_ctx_.is_current_hot &&
                              read_options_.skip_hot_path &&
@@ -622,6 +634,14 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                   } else {
                     // 小 Scan 或其他情况：不缓冲数据，PartialMerge 依赖 scan_data
                     delta_ctx_.trigger_scan_as_compaction = false;
+                    if (delta_ctx_.is_current_hot &&
+                        !read_options_.skip_hot_path &&
+                        !read_options_.is_metadata_scan &&
+                        !read_options_.delta_full_scan) {
+                      delta_ctx_.capture_partial_merge_scan =
+                          hotspot_manager_
+                              ->ShouldCapturePartialMergeForRangeScan(cuid);
+                    }
                   }
                 }
 
@@ -645,7 +665,7 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                 // [OPTIMIZATION] 只有当真正需要内部 Key 编码用于后续操作时才进行一次编码
                 bool need_internal_key = (delta_ctx_.scan_first_key.empty() || 
                                           delta_ctx_.trigger_scan_as_compaction || 
-                                          (!read_options_.is_metadata_scan && !read_options_.delta_full_scan));
+                                          delta_ctx_.capture_partial_merge_scan);
                 
                 if (need_internal_key) {
                   delta_ctx_.key_encode_buf.clear();
@@ -667,7 +687,8 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
                     hotspot_manager_->TriggerBufferFlush("FullScan", cuid);
                   }
                 } else if (!read_options_.is_metadata_scan &&
-                           !read_options_.delta_full_scan) {
+                           !read_options_.delta_full_scan &&
+                           delta_ctx_.capture_partial_merge_scan) {
                   // 小 Scan：not full/metadata -> partial merge
                   delta_ctx_.scan_data.emplace_back(delta_ctx_.key_encode_buf,
                                                     value().ToString());
@@ -804,6 +825,13 @@ bool DBIter::FindNextUserEntryInternalImpl(bool skipping_saved_key,
       }
     }
 
+    // 如果是 Full Scan 且允许跳入冷数据，入队更新 GDCT 的 Metadata Scan
+    if (read_options_.delta_full_scan && delta_ctx_.is_current_hot &&
+        !read_options_.skip_hot_path && delta_ctx_.last_cuid != 0 &&
+        !delta_ctx_.scan_first_key.empty()) {
+      hotspot_manager_->EnqueueMetadataScan(
+          delta_ctx_.last_cuid, ExtractUserKey(delta_ctx_.scan_first_key));
+    }
     delta_ctx_.Reset();
   }
 

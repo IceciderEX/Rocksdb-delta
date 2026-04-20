@@ -107,3 +107,4 @@ third-party/folly/
 .cache
 *.sublime-*
 .codex
+docs/scan_latency_analysis.md

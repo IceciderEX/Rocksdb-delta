@@ -114,6 +114,7 @@
 #include "util/defer.h"
 #include "util/distributed_mutex.h"
 #include "util/hash_containers.h"
+#include "util/l0_partition.h"
 #include "util/mutexlock.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
@@ -6978,45 +6979,35 @@ void DBImpl::ProcessPendingHotCuids() {
   }
 
   // 获取待处理的 CUID 列表 (按批次获取)
-  std::vector<uint64_t> pending_cuids = hotspot_manager_->PopPendingInitCuids(32);
-  if (pending_cuids.empty()) {
+  std::vector<PendingRangeScanTask> pending_tasks =
+      hotspot_manager_->PopPendingInitCuids(32);
+  if (pending_tasks.empty()) {
     return;
   }
 
   ROCKS_LOG_INFO(immutable_db_options_.info_log,
                  "[DBImpl] Processing %zu pending hot CUIDs for initial scan",
-                 pending_cuids.size());
+                 pending_tasks.size());
 
-  for (uint64_t cuid : pending_cuids) {
-    // 构造 start_key
-    std::string start_key(40, '\0');
-    unsigned char* p = reinterpret_cast<unsigned char*>(&start_key[16]);
-    for (int i = 0; i < 8; ++i) {
-      p[i] = (cuid >> (56 - 8 * i)) & 0xFF;  // Big Endian
-    }
-
-    // 构造 upper_bound_key: CUID + 1 的起始
-    uint64_t cuid_plus_one = cuid + 1;
-    std::string upper_bound_key(40, '\0');
-    unsigned char* q = reinterpret_cast<unsigned char*>(&upper_bound_key[16]);
-    for (int i = 0; i < 8; ++i) {
-      q[i] = (cuid_plus_one >> (56 - 8 * i)) & 0xFF;  // Big Endian
-    }
-
+  for (const auto& task : pending_tasks) {
     ReadOptions read_opts;
     read_opts.delta_full_scan = true;
     read_opts.skip_hot_path = true;  // Init Scan 走冷路径，读 SST 文件
-    Slice upper_bound_slice(upper_bound_key);
+    Slice start_slice(task.start_user_key);
+    Slice upper_bound_slice(task.upper_bound_user_key);
+    read_opts.iterate_lower_bound = &start_slice;
     read_opts.iterate_upper_bound = &upper_bound_slice;
+    read_opts.read_partition_id =
+        static_cast<int32_t>(ExtractL0PartitionFromUserKey(start_slice));
     ColumnFamilyHandle* cfh = DefaultColumnFamily();
     if (!cfh) {
       ROCKS_LOG_ERROR(immutable_db_options_.info_log,
                       "[DBImpl] No default column family for init scan");
+      hotspot_manager_->UnlockCuid(task.cuid);
       continue;
     }
 
     std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
-    Slice start_slice(start_key);
     size_t count = 0;
 
     for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
@@ -7026,14 +7017,14 @@ void DBImpl::ProcessPendingHotCuids() {
     if (!iter->status().ok()) {
       ROCKS_LOG_ERROR(immutable_db_options_.info_log,
                       "[DBImpl] Init scan error for CUID %" PRIu64 ": %s",
-                      cuid, iter->status().ToString().c_str());
+                      task.cuid, iter->status().ToString().c_str());
     } else {
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
                      "[DBImpl] Completed init scan for CUID %" PRIu64
                      ", %zu entries",
-                     cuid, count);
+                     task.cuid, count);
     }
-    hotspot_manager_->UnlockCuid(cuid);
+    hotspot_manager_->UnlockCuid(task.cuid);
   }
 }
 
@@ -7045,41 +7036,31 @@ void DBImpl::ProcessPendingMetadataScans() {
     return;
   }
 
-  std::vector<uint64_t> pending_cuids =
+  std::vector<PendingRangeScanTask> pending_tasks =
       hotspot_manager_->PopPendingMetadataScans(32);
-  if (pending_cuids.empty()) {
+  if (pending_tasks.empty()) {
     return;
   }
 
-  for (uint64_t cuid : pending_cuids) {
-    // 构造扫描范围
-    std::string start_key(40, '\0');
-    unsigned char* p = reinterpret_cast<unsigned char*>(&start_key[16]);
-    for (int i = 0; i < 8; ++i) {
-      p[i] = (cuid >> (56 - 8 * i)) & 0xFF;  // Big Endian
-    }
-
-    uint64_t cuid_plus_one = cuid + 1;
-    std::string upper_bound_key(40, '\0');
-    unsigned char* q = reinterpret_cast<unsigned char*>(&upper_bound_key[16]);
-    for (int i = 0; i < 8; ++i) {
-      q[i] = (cuid_plus_one >> (56 - 8 * i)) & 0xFF;  // Big Endian
-    }
-
+  for (const auto& task : pending_tasks) {
     ReadOptions read_opts;
     read_opts.delta_full_scan = true;
     read_opts.skip_hot_path = true;  // 强制走 Cold Path
     read_opts.is_metadata_scan =
         true;  // 隔离 Metadata Scan，防止其替换 Snapshot
-    Slice upper_bound_slice(upper_bound_key);
+    Slice start_slice(task.start_user_key);
+    Slice upper_bound_slice(task.upper_bound_user_key);
+    read_opts.iterate_lower_bound = &start_slice;
     read_opts.iterate_upper_bound = &upper_bound_slice;
+    read_opts.read_partition_id =
+        static_cast<int32_t>(ExtractL0PartitionFromUserKey(start_slice));
     ColumnFamilyHandle* cfh = DefaultColumnFamily();
     if (!cfh) {
+      hotspot_manager_->UnlockCuid(task.cuid);
       continue;
     }
 
     std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
-    Slice start_slice(start_key);
     size_t count = 0;
 
     for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
@@ -7089,8 +7070,9 @@ void DBImpl::ProcessPendingMetadataScans() {
     if (!iter->status().ok()) {
       ROCKS_LOG_ERROR(immutable_db_options_.info_log,
                       "[DBImpl] Metadata scan error for CUID %" PRIu64 ": %s",
-                      cuid, iter->status().ToString().c_str());
+                      task.cuid, iter->status().ToString().c_str());
     }
+    hotspot_manager_->UnlockCuid(task.cuid);
   }
 }
 
