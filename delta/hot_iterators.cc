@@ -1096,6 +1096,11 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid, const Slice& target) {
     hybrid_iter_ = nullptr;
   }
 
+  if (hybrid_iter_) {
+    delete hybrid_iter_;
+    hybrid_iter_ = nullptr;
+  }
+
   if (hot_iter_) {
     delete hot_iter_;
     hot_iter_ = nullptr;
