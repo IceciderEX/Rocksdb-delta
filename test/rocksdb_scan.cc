@@ -25,6 +25,7 @@
 #include "rocksdb/slice.h"
 #include "rocksdb/write_batch.h"
 #include "rocksdb/statistics.h"
+#include "delta/diag_log.h"
 
 // ==========================================
 // 配置常量
@@ -32,13 +33,13 @@
 const std::string kNativeDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_native";
 const std::string kDeltaDBPath = "/home/wam/Rocksdb-delta/db_perf_test/db_perf_delta";
 const int kNumThreads = 16;
-const int kTestDurationSec = 2500;       // s
+const int kTestDurationSec = 600;       // s
 const int kNumCuids = 1000000;           // 100W CUID 总库
 const int kBatchSize = 512;             // 每次 Put 128 行
 const int kTargetPutBatches = 200;      // 每个 CUID 固定写入 200 个 batch (目标约 6W 行)
 const double kHotRatio = 0.15;          // 15% 的热点
-const int kHotScanTarget = 50;        // 热点访问目标
-const int kColdScanTarget = 20;        // 普通访问目标
+const int kHotScanTarget = 80;        // 热点访问目标
+const int kColdScanTarget = 30;        // 普通访问目标
 
 // ==========================================
 // 辅助工具与状态管理
@@ -128,8 +129,8 @@ class PerfRunner {
     // 单个 CUID 数据量约：512 batch * 200 rows/batch * 72 bytes/row ≈ 7.37 MB
     // 实现 100GB 常驻数据需 100,000 / 7.37 ≈ 13,568 个 CUID
     // 设 16 线程，则每线程需维持 13,568 / 16 ≈ 848 个 CUID (活跃 + 待删除)
-    const size_t kMaxActiveCuids = 10;   
-    const size_t kDeleteWindowSize = 50; 
+    const size_t kMaxActiveCuids = 50;   
+    const size_t kDeleteWindowSize = 75; 
 
     auto add_new_cuid = [&]() {
       uint64_t cuid = next_cuid_->fetch_add(1);
@@ -327,7 +328,17 @@ void ReportStats(const std::string& label, const std::vector<ThreadStats>& all_s
   std::cout << "Throughput: " << (kTestDurationSec > 0 ? total_rows / kTestDurationSec : 0) << " rows/s" << std::endl;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+  // Parse command-line arguments
+  bool enable_diag_log = true;
+  // Set global DIAG log control
+  DiagLogSetStderrEnabled(enable_diag_log);
+  if (enable_diag_log) {
+    std::cout << "[INFO] DIAG logging enabled" << std::endl;
+  } else {
+    std::cout << "[INFO] DIAG logging disabled (use --enable-diag-log to enable)" << std::endl;
+  }
+
   CleanupDBPath(kNativeDBPath);
   CleanupDBPath(kDeltaDBPath);
 
@@ -340,10 +351,11 @@ int main() {
     
     if (delta_enabled) {
       options.enable_delta = true;
+      // HotspotManager will open the diag log file during DB initialization
 
       // --- Example 1: Programmatic Configuration of DeltaOptions ---
       // These can be set directly on the options object before opening the DB.
-      options.delta_options.hotspot_scan_threshold = 30;
+      options.delta_options.hotspot_scan_threshold = 50;
       options.delta_options.hotspot_scan_window_sec = 300;
       options.delta_options.delta_merge_threshold = 3;
       options.delta_options.sac_delta_count_threshold = 5;
@@ -377,6 +389,9 @@ int main() {
       return;
     }
 
+    DiagLogf("[DIAG_BENCHMARK_START] label=%s path=%s delta=%d\n",
+             label.c_str(), path.c_str(), delta_enabled ? 1 : 0);
+
     std::cout << ">>> Running " << label << " (Duration: " << kTestDurationSec << "s) <<<" << std::endl;
     next_cuid_counter.store(1);
 
@@ -386,12 +401,15 @@ int main() {
     PerfRunner runner(db, &next_cuid_counter);
 
     for (int i = 0; i < kNumThreads; i++) {
+      DiagLogf("[DIAG_WORKER_START] label=%s thread=%d\n", label.c_str(), i);
       workers.emplace_back(&PerfRunner::Run, &runner, i, &stop, &all_thread_stats[i]);
     }
 
     std::this_thread::sleep_for(std::chrono::seconds(kTestDurationSec));
     stop.store(true);
     for (auto& t : workers) t.join();
+
+    DiagLogf("[DIAG_BENCHMARK_END] label=%s\n", label.c_str());
 
     ReportStats(label, all_thread_stats);
     

@@ -28,16 +28,15 @@ void DiagLogOpen(const char* path) {
 }
 
 void DiagLogf(const char* fmt, ...) {
-  // Skip entirely when diag logging is disabled
-  if (!g_diag_stderr_enabled.load(std::memory_order_relaxed)) return;
-
   char buf[8192];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
 
-  fputs(buf, stderr);
+  if (g_diag_stderr_enabled.load(std::memory_order_relaxed)) {
+    // fputs(buf, stderr);
+  }
 
   std::lock_guard<std::mutex> lk(g_diag_mutex);
   if (g_diag_file) {

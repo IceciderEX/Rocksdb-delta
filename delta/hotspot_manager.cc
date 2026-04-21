@@ -42,6 +42,8 @@ HotspotManager::HotspotManager(const Options& db_options,
   InitGDCTLog();
   // 独立诊断日志文件（关键事件持久化，防止终端滚动丢失）
   DiagLogOpen((data_dir_ + "/delta_diag.log").c_str());
+  DiagLogf("[DIAG_HOTSPOT_MANAGER_INIT] data_dir=%s sharding_count=%u\n",
+           data_dir_.c_str(), db_options_.delta_options.sharding_count);
   // HotSST 生命周期独立日志（Register/Ref/Unref 事件）
   LifecycleLogOpen((data_dir_ + "/hotsst_lifecycle.log").c_str());
 }
