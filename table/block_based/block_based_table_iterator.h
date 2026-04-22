@@ -253,6 +253,14 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
     return !multi_scan_->pinned_data_blocks[block_idx].IsEmpty();
   }
 
+  // for delta physical
+  uint64_t GetPhysicalId() override {
+    if (table_ && table_->get_rep()) {
+      return table_->get_rep()->file_number;
+    }
+    return 0;
+  }
+
  private:
   enum class IterDirection {
     kForward,

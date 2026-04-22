@@ -12,6 +12,7 @@
 #include <string>
 
 #include "db/db_impl/db_impl.h"
+#include "delta/hotspot_manager.h"
 #include "memory/arena.h"
 #include "options/cf_options.h"
 #include "rocksdb/db.h"
@@ -64,23 +65,23 @@ class DBIter final : public Iterator {
   // according to options mutable_cf_options.memtable_op_scan_flush_trigger
   // and mutable_cf_options.memtable_avg_op_scan_flush_trigger.
   // @param arena_mode If true, the DBIter will be allocated from the arena.
-  static DBIter* NewIter(Env* env, const ReadOptions& read_options,
-                         const ImmutableOptions& ioptions,
-                         const MutableCFOptions& mutable_cf_options,
-                         const Comparator* user_key_comparator,
-                         InternalIterator* internal_iter,
-                         const Version* version, const SequenceNumber& sequence,
-                         ReadCallback* read_callback,
-                         ReadOnlyMemTable* active_mem,
-                         ColumnFamilyHandleImpl* cfh = nullptr,
-                         bool expose_blob_index = false,
-                         Arena* arena = nullptr) {
+  static DBIter* NewIter(
+      Env* env, const ReadOptions& read_options,
+      const ImmutableOptions& ioptions,
+      const MutableCFOptions& mutable_cf_options,
+      const Comparator* user_key_comparator, InternalIterator* internal_iter,
+      const Version* version, const SequenceNumber& sequence,
+      ReadCallback* read_callback, ReadOnlyMemTable* active_mem,
+      ColumnFamilyHandleImpl* cfh = nullptr, bool expose_blob_index = false,
+      Arena* arena = nullptr,
+      // for delta
+      std::shared_ptr<HotspotManager> hotspot_manager = nullptr) {
     void* mem = arena ? arena->AllocateAligned(sizeof(DBIter))
                       : operator new(sizeof(DBIter));
-    DBIter* db_iter = new (mem)
-        DBIter(env, read_options, ioptions, mutable_cf_options,
-               user_key_comparator, internal_iter, version, sequence, arena,
-               read_callback, cfh, expose_blob_index, active_mem);
+    DBIter* db_iter = new (mem) DBIter(
+        env, read_options, ioptions, mutable_cf_options, user_key_comparator,
+        internal_iter, version, sequence, arena, read_callback, cfh,
+        expose_blob_index, active_mem, hotspot_manager);
     return db_iter;
   }
 
@@ -159,7 +160,41 @@ class DBIter final : public Iterator {
     local_stats_.BumpGlobalStatistics(statistics_);
     iter_.DeleteIter(arena_mode_);
     ThreadStatusUtil::SetThreadOperation(cur_op_type);
+
+    // if (hotspot_manager_ && delta_ctx_.last_cuid != 0 &&
+    // delta_ctx_.trigger_scan_as_compaction) {
+    //   hotspot_manager_->FinalizeScanAsCompaction(delta_ctx_.last_cuid);
+    // }
+
+    if (hotspot_manager_ && delta_ctx_.last_cuid != 0 &&
+        !read_options_.is_metadata_scan) {
+      auto strategy = hotspot_manager_->EvaluateScanAsCompactionStrategy(
+          delta_ctx_.last_cuid, read_options_.delta_full_scan,
+          delta_ctx_.scan_first_key, delta_ctx_.GetScanLastKey());
+
+      bool execute = true;
+      if (strategy == ScanAsCompactionStrategy::kFullReplace &&
+          !delta_ctx_.trigger_scan_as_compaction) {
+        execute = false;
+      }
+
+      if (execute) {
+        hotspot_manager_->FinalizeScanAsCompactionWithStrategy(
+            delta_ctx_.last_cuid, strategy, delta_ctx_.scan_first_key,
+            delta_ctx_.GetScanLastKey(), delta_ctx_.visited_units_for_cuid,
+            delta_ctx_.scan_data);
+      }
+    }
+
+    // for delta: 唤醒后台线程处理待执行的 tasks（condition variable）
+    if (cfh_ && hotspot_manager_) {
+      auto db_impl = static_cast<DBImpl*>(cfh_->db());
+      if (db_impl) {
+        db_impl->NotifyDeltaBGWork();
+      }
+    }
   }
+
   void SetIter(InternalIterator* iter) {
     assert(iter_.iter() == nullptr);
     iter_.Set(iter);
@@ -250,7 +285,8 @@ class DBIter final : public Iterator {
          InternalIterator* iter, const Version* version, SequenceNumber s,
          bool arena_mode, ReadCallback* read_callback,
          ColumnFamilyHandleImpl* cfh, bool expose_blob_index,
-         ReadOnlyMemTable* active_mem);
+         ReadOnlyMemTable* active_mem,
+         std::shared_ptr<HotspotManager> hotspot_manager);
 
   class BlobReader {
    public:
@@ -301,6 +337,7 @@ class DBIter final : public Iterator {
   bool FindNextUserEntry(bool skipping_saved_key, const Slice* prefix);
   // Internal implementation of FindNextUserEntry().
   bool FindNextUserEntryInternal(bool skipping_saved_key, const Slice* prefix);
+  bool FindNextUserEntryInternalImpl(bool skipping_saved_key, const Slice* prefix);
   bool ParseKey(ParsedInternalKey* key);
   bool MergeValuesNewToOld();
 
@@ -525,5 +562,48 @@ class DBIter final : public Iterator {
   bool allow_unprepared_value_;
   bool is_blob_;
   bool arena_mode_;
+
+  // for delta
+  struct DeltaScanContext {
+    uint64_t last_cuid = 0;
+    // 记录当前 CUID 已经统计过的物理单元 ID
+    std::unordered_set<uint64_t> visited_units_for_cuid;
+    // bool is_counting_mode = false; // [NOTUSE] 标记本次 Scan 是否负责计数?
+    bool is_current_hot = false;
+    bool trigger_scan_as_compaction = false;
+
+    // 当前 Scan 的 key 范围
+    std::string scan_first_key;
+    std::string scan_last_key;  // 仅 Full Scan 路径使用
+    std::string key_encode_buf;  // InternalKey buffer
+    // 小 Scan 采集的精确 KV 数据，供后台 PartialMerge 使用
+    std::vector<std::pair<std::string, std::string>> scan_data;
+
+    // 缓存当前 CUID 的 deleted 状态，避免每 key 都查询 GDCT
+    bool cached_cuid_is_deleted = false;
+    uint64_t cached_deleted_check_cuid = 0;
+    uint64_t cached_phys_id = 0;
+
+    const std::string& GetScanLastKey() const {
+      return scan_data.empty() ? scan_last_key : scan_data.back().first;
+    }
+
+    void Reset() {
+      last_cuid = 0;
+      visited_units_for_cuid.clear();
+      is_current_hot = false;
+      trigger_scan_as_compaction = false;
+      scan_first_key.clear();
+      scan_last_key.clear();
+      key_encode_buf.clear(); 
+      scan_data.clear();
+      cached_cuid_is_deleted = false;
+      cached_deleted_check_cuid = 0;
+      cached_phys_id = 0;
+    }
+  } delta_ctx_;
+
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+  const ReadOptions read_options_;
 };
 }  // namespace ROCKSDB_NAMESPACE

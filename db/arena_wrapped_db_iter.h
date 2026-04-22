@@ -110,7 +110,9 @@ class ArenaWrappedDBIter : public Iterator {
             const SequenceNumber& sequence, uint64_t version_number,
             ReadCallback* read_callback, ColumnFamilyHandleImpl* cfh,
             bool expose_blob_index, bool allow_refresh,
-            ReadOnlyMemTable* active_mem);
+            ReadOnlyMemTable* active_mem,
+            // for delta
+            std::shared_ptr<HotspotManager> hotspot_manager);
 
   // Store some parameters so we can refresh the iterator at a later point
   // with these same params
@@ -138,11 +140,14 @@ class ArenaWrappedDBIter : public Iterator {
   // tombstone when added under this DBIter.
   std::unique_ptr<TruncatedRangeDelIterator>* memtable_range_tombstone_iter_ =
       nullptr;
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager_;
 };
 
 ArenaWrappedDBIter* NewArenaWrappedDbIterator(
     Env* env, const ReadOptions& read_options, ColumnFamilyHandleImpl* cfh,
     SuperVersion* sv, const SequenceNumber& sequence,
     ReadCallback* read_callback, DBImpl* db_impl, bool expose_blob_index,
-    bool allow_refresh, bool allow_mark_memtable_for_flush);
+    bool allow_refresh, bool allow_mark_memtable_for_flush,
+    std::shared_ptr<HotspotManager> hotspot_manager);
 }  // namespace ROCKSDB_NAMESPACE

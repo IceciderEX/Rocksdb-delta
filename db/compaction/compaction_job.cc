@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include "delta/diag_log.h"
+#include "util/extract_cuid.h"
 #include <memory>
 #include <optional>
 #include <set>
@@ -128,6 +130,76 @@ const char* GetCompactionProximalOutputRangeTypeString(
   }
 }
 
+// for delta
+struct DeltaCompactionContext {
+    std::shared_ptr<HotspotManager> manager;
+    std::vector<uint64_t> input_files;
+    std::vector<CompactionJob::DeltaOutputInfo>* pending_outputs;
+    
+    uint64_t current_cuid = 0;
+    uint64_t current_file_number = 0;
+    
+    std::string current_first_key;
+    std::string current_last_key;
+    uint64_t current_entry_count = 0;
+    // 记录输入文件id
+    std::unordered_set<uint64_t> current_input_files;
+
+    // [PATH C] 多段输入文件的段边界缓存：key=file_number，value=该文件在 delta index
+    // 中为 current_cuid 注册的各段 last_rid（升序）。仅当段数 > 1 时非空。
+    // 在 CUID 切换时清空；FlushSegment 时保留（同一 CUID 内可复用）。
+    std::unordered_map<uint64_t, std::vector<uint64_t>> input_file_seg_ends;
+
+    // segment 是否已经初始化 sk
+    bool has_started_segment = false;
+
+    void FlushSegment(uint64_t actual_file_number) {
+        // cuid 不为0并且有数据
+        if (current_cuid != 0 && pending_outputs && current_entry_count > 0) {
+            std::string input_str;
+            for (auto fid : current_input_files) {
+                input_str += std::to_string(fid) + " ";
+            }
+
+            // [DIAG] 检测 compaction 输出是否稀疏（key range 内有空洞）
+            uint64_t first_rid = ExtractRowID(Slice(current_first_key));
+            uint64_t last_rid  = ExtractRowID(Slice(current_last_key));
+            if (first_rid > 0 && last_rid > 0 && last_rid >= first_rid) {
+              uint64_t expected_dense = last_rid - first_rid + 1;
+              if (current_entry_count < expected_dense) {
+                DiagLogf("[DIAG_COMPACTION_SPARSE] CUID %lu: output file=%lu "
+                    "range=[rid %lu - %lu] expected_dense=%lu actual=%lu "
+                    "MISSING=%lu rows. input_files=[%s]\n",
+                    current_cuid, actual_file_number,
+                    first_rid, last_rid, expected_dense,
+                    current_entry_count,
+                    expected_dense - current_entry_count,
+                    input_str.c_str());
+              }
+            }
+
+            pending_outputs->push_back({
+                current_cuid,
+                actual_file_number,
+                current_first_key,
+                current_last_key, // 此时的 last_key 就是该段的最后一个 key
+                current_entry_count
+            });
+        }
+        current_entry_count = 0;
+        has_started_segment = false;
+        current_first_key.clear();
+        current_last_key.clear();
+        current_input_files.clear();
+    }
+
+    void HandleFileSwitch(uint64_t old_file_number, uint64_t new_file_number) {
+        // 当前cuid在旧文件的处理
+        FlushSegment(old_file_number);
+        current_file_number = new_file_number;
+    }
+};
+
 CompactionJob::CompactionJob(
     int job_id, Compaction* compaction, const ImmutableDBOptions& db_options,
     const MutableDBOptions& mutable_db_options, const FileOptions& file_options,
@@ -144,7 +216,9 @@ CompactionJob::CompactionJob(
     const std::string& db_id, const std::string& db_session_id,
     std::string full_history_ts_low, std::string trim_ts,
     BlobFileCompletionCallback* blob_callback, int* bg_compaction_scheduled,
-    int* bg_bottom_compaction_scheduled)
+    int* bg_bottom_compaction_scheduled,
+    // for delta
+    std::shared_ptr<HotspotManager> hotspot_manager)
     : compact_(new CompactionState(compaction)),
       internal_stats_(compaction->compaction_reason(), 1),
       db_options_(db_options),
@@ -188,7 +262,9 @@ CompactionJob::CompactionJob(
       blob_callback_(blob_callback),
       extra_num_subcompaction_threads_reserved_(0),
       bg_compaction_scheduled_(bg_compaction_scheduled),
-      bg_bottom_compaction_scheduled_(bg_bottom_compaction_scheduled) {
+      bg_bottom_compaction_scheduled_(bg_bottom_compaction_scheduled),
+      // for delta
+      hotspot_manager_(std::move(hotspot_manager)) {
   assert(job_stats_ != nullptr);
   assert(log_buffer_ != nullptr);
   assert(job_context);
@@ -1050,6 +1126,103 @@ Status CompactionJob::Install(bool* compaction_released) {
 
   if (status.ok()) {
     status = InstallCompactionResults(compaction_released);
+    // for delta
+    // fix: 成功之后再修改metadata
+    if (status.ok() && hotspot_manager_) {
+        if (status.ok() && hotspot_manager_) {
+          // fprintf(stderr, "CompactionJob::Install()\n");
+          DiagLogf("CompactionJob::Install()\n");
+          // CUID -> List<Segments>
+          std::map<uint64_t, std::vector<DeltaOutputInfo>> output_map;
+          for (const auto& out : global_outputs_) {
+              output_map[out.cuid].push_back(out);
+          }
+
+          // // 记录所有涉及文件的物理大小
+          // std::map<uint64_t, uint64_t> all_file_sizes;
+          // // 输入文件
+          // for (size_t i = 0; i < compact_->compaction->num_input_levels(); ++i) {
+          //    for (const auto* f : *compact_->compaction->inputs(i)) {
+          //        all_file_sizes[f->fd.GetNumber()] = f->fd.GetFileSize();
+          //    }
+          // }
+          // // 输出文件 (来自各个 subcompaction_state)
+          // for (const auto& sub_state : compact_->sub_compact_states) {
+          //      for (auto it = sub_state.GetOutputs(); it != it.end(); ++it) {
+          //          const auto& out = *it;
+          //          all_file_sizes[out.meta.fd.GetNumber()] = out.meta.fd.GetFileSize();
+          //      }
+          // }
+
+          for (auto& pair : global_cuid_inputs_) {
+              uint64_t cuid = pair.first;
+              const auto& input_set = pair.second;
+
+              // 1. 计算 Input Count & Vector
+              int32_t input_count = static_cast<int32_t>(input_set.size());
+              std::vector<uint64_t> input_files_vec(input_set.begin(), input_set.end());
+              std::sort(input_files_vec.begin(), input_files_vec.end());
+
+              // 2. 计算 Output Count & Info
+              // 注意：拆分 segment 后同一物理文件可能产生多个 DeltaOutputInfo，
+              // 但 GDCT 引用计数以物理文件为单位，需要去重统计唯一文件数。
+              int32_t output_count = 0;
+              uint64_t output_file_id = 0; // 用于 Verify，取第一个即可
+              
+              auto out_it = output_map.find(cuid);
+              if (out_it != output_map.end()) {
+                  std::unordered_set<uint64_t> unique_out_files;
+                  for (const auto& seg : out_it->second) {
+                    unique_out_files.insert(seg.file_number);
+                  }
+                  output_count = static_cast<int32_t>(unique_out_files.size());
+                  if (output_count > 0) {
+                      output_file_id = out_it->second[0].file_number;
+                  }
+              }
+
+              // - 被跳过/删除: Input=N, Output=0 -> Ref-=N
+              // - 正常存活: Input=N, Output=M -> Ref = Ref - N + M
+              hotspot_manager_->UpdateCompactionRefCount(
+                  cuid, input_count, output_count, 
+                  input_files_vec, output_file_id
+              );
+
+              // uint64_t total_input_size = 0;
+              // for (uint64_t fid : input_files_vec) {
+              //     total_input_size += all_file_sizes[fid];
+              // }
+              // uint64_t total_output_size = 0;
+              // uint64_t total_output_rows = 0;
+              // if (output_count > 0) {
+              //     for (const auto& seg : out_it->second) {
+              //         total_output_size += all_file_sizes[seg.file_number];
+              //         total_output_rows += seg.entry_count;
+              //     }
+              // }
+
+              // fprintf(stderr, "CUID: %lu, Input Files: %d (%lu bytes), Output Files: %d (%lu bytes), Output Total Rows: %lu\n",
+              //         cuid, input_count, total_input_size, 
+              //         output_count, total_output_size, total_output_rows);
+
+              if (output_count > 0) {
+                  for (const auto& seg : out_it->second) {
+                      hotspot_manager_->UpdateCompactionDelta(
+                          cuid, input_files_vec, 
+                          seg.file_number, 
+                          seg.first_key, 
+                          seg.last_key 
+                      );
+                  }
+              } else { // 没有输出新compaction文件，被删除或者过滤的cuid的处理？
+                  hotspot_manager_->GetIndexTable().RemoveObsoleteDeltasForCUIDs({cuid}, input_files_vec);
+              } 
+          }
+
+          global_cuid_inputs_.clear();
+          global_outputs_.clear();
+        }
+    }
   }
   if (!versions_->io_status().ok()) {
     io_status_ = versions_->io_status();
@@ -1439,18 +1612,33 @@ void CompactionJob::CreateBlobFileBuilder(SubcompactionState* sub_compact,
   }
 }
 
+// for delta
 std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
     SubcompactionState* sub_compact, ColumnFamilyData* cfd,
     InternalIterator* input, const CompactionFilter* compaction_filter,
     MergeHelper& merge, BlobFileResources& blob_resources,
-    const WriteOptions& write_options) {
+    const WriteOptions& write_options,
+    std::unordered_set<uint64_t>* local_involved_cuids) {
   CreateBlobFileBuilder(sub_compact, cfd, blob_resources, write_options);
 
   const std::string* const full_history_ts_low =
       full_history_ts_low_.empty() ? nullptr : &full_history_ts_low_;
   assert(job_context_);
+  
+  // for delta
+  std::vector<uint64_t> input_file_numbers;
+  // Level
+  for (size_t i = 0; i < sub_compact->compaction->num_input_levels(); ++i) {
+      // Files
+      for (const auto& file : *sub_compact->compaction->inputs(i)) {
+          input_file_numbers.push_back(file->fd.GetNumber());
+      }
+  }
 
-  return std::make_unique<CompactionIterator>(
+  std::shared_ptr<HotspotManager> hotspot_manager = hotspot_manager_;
+  input_file_numbers_ = input_file_numbers;
+
+  auto c_iter = std::make_unique<CompactionIterator>(
       input, cfd->user_comparator(), &merge, versions_->LastSequence(),
       &(job_context_->snapshot_seqs), earliest_snapshot_,
       job_context_->earliest_write_conflict_snapshot,
@@ -1461,28 +1649,60 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
       sub_compact->compaction
           ->DoesInputReferenceBlobFiles() /* must_count_input_entries */,
       sub_compact->compaction, compaction_filter, shutting_down_,
-      db_options_.info_log, full_history_ts_low, preserve_seqno_after_);
+      db_options_.info_log, full_history_ts_low, preserve_seqno_after_,
+      hotspot_manager,
+      input_file_numbers);
+
+  if (c_iter) {
+      c_iter->SetInvolvedCuids(local_involved_cuids);
+  }
+
+  return c_iter;
 }
 
 std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc>
 CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
-                                  SubcompactionKeyBoundaries& boundaries) {
+                                  SubcompactionKeyBoundaries& boundaries,
+                                  std::shared_ptr<DeltaCompactionContext> delta_ctx) {
+  // for delta
+  // auto delta_ctx = std::make_shared<DeltaCompactionContext>();
   const CompactionFileOpenFunc open_file_func =
-      [this, sub_compact](CompactionOutputs& outputs) {
-        return this->OpenCompactionOutputFile(sub_compact, outputs);
+      [this, sub_compact, delta_ctx](CompactionOutputs& outputs) {
+        Status s = this->OpenCompactionOutputFile(sub_compact, outputs);
+        if (s.ok()) {
+          FileMetaData* meta = outputs.GetMetaData();
+          if (meta && delta_ctx) {
+                // new文件id 的记录
+                delta_ctx->current_file_number = meta->fd.GetNumber();
+            }
+        }
+        return s;
       };
 
   const Slice* start_user_key =
       sub_compact->start.has_value() ? &boundaries.start_user_key : nullptr;
   const Slice* end_user_key =
       sub_compact->end.has_value() ? &boundaries.end_user_key : nullptr;
-
+  
+  // for delta
   const CompactionFileCloseFunc close_file_func =
-      [this, sub_compact, start_user_key, end_user_key](
+      [this, sub_compact, start_user_key, end_user_key, delta_ctx](
           const Status& status,
           const ParsedInternalKey& prev_iter_output_internal_key,
           const Slice& next_table_min_key, const CompactionIterator* c_iter,
           CompactionOutputs& outputs) {
+        
+        // 这个closefile的信息
+        uint64_t final_size = outputs.GetBuilder() ? outputs.GetBuilder()->FileSize() : 0;
+        uint64_t old_file_num = 0;
+        // 获取back文件，应该就是当前的输出文件
+        if (!outputs.GetOutputs().empty()) {
+            old_file_num = outputs.GetOutputs().back().meta.fd.GetNumber();
+        }
+        if (delta_ctx) {
+            delta_ctx->HandleFileSwitch(old_file_num, 0);
+        }
+        
         return this->FinishCompactionOutputFile(
             status, prev_iter_output_internal_key, next_table_min_key,
             start_user_key, end_user_key, c_iter, sub_compact, outputs);
@@ -1494,7 +1714,11 @@ CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
 Status CompactionJob::ProcessKeyValue(
     SubcompactionState* sub_compact, ColumnFamilyData* cfd,
     CompactionIterator* c_iter, const CompactionFileOpenFunc& open_file_func,
-    const CompactionFileCloseFunc& close_file_func, uint64_t& prev_cpu_micros) {
+    const CompactionFileCloseFunc& close_file_func, uint64_t& prev_cpu_micros,
+    // for delta
+    std::shared_ptr<DeltaCompactionContext> delta_ctx,
+    std::map<uint64_t, std::unordered_set<uint64_t>>& local_inputs,
+    std::vector<CompactionJob::DeltaOutputInfo>& local_outputs) {
   Status status;
   const uint64_t kRecordStatsEvery = 1000;
   [[maybe_unused]] const std::optional<const Slice> end = sub_compact->end;
@@ -1505,11 +1729,171 @@ Status CompactionJob::ProcessKeyValue(
   TEST_SYNC_POINT_CALLBACK(
       "CompactionJob::ProcessKeyValueCompaction()::Processing",
       static_cast<void*>(const_cast<Compaction*>(sub_compact->compaction)));
-
+  
+  // for delta
+  // 有kv到来，更新delta_ctx
   while (status.ok() && !cfd->IsDropped() && c_iter->Valid() &&
          c_iter->status().ok()) {
     assert(!end.has_value() ||
            cfd->user_comparator()->Compare(c_iter->user_key(), *end) < 0);
+    
+    // cuid change(如果数据有效)
+    if (delta_ctx && delta_ctx->manager) {
+        uint64_t cuid = delta_ctx->manager->ExtractCUID(c_iter->key());
+        uint64_t input_file_id = c_iter->input_file_number();
+        
+        if (cuid != delta_ctx->current_cuid) {
+             delta_ctx->FlushSegment(delta_ctx->current_file_number);
+             // newcuid
+             delta_ctx->current_cuid = cuid;
+             // CUID 切换时清空段边界缓存（不同 CUID 对同一文件的段注册不同）
+             delta_ctx->input_file_seg_ends.clear();
+             // [BUG FIX] 丢弃 stale gap 信号：
+             // cuid_gap_after_skip_ 可能在当前 CUID 的起始跳过文件（begin-of-CUID skips）
+             // 时被设置，代表 "从跳过文件切换到第一个合法文件"。但此时 ProcessKeyValue
+             // 刚开始追踪该 CUID，has_started_segment=false，没有"之前的数据"，
+             // 不应触发 gap-split。若不在此消费，该信号会被下一个 key 的 ELSE 分支
+             // 作为 false positive 消费，导致真正的 mid-CUID gap 无法检测。
+             c_iter->ConsumeSkipGap();  // 丢弃（不检查返回值）
+             DiagLogf("[DIAG_COMPACTION_CUID_CHANGE] CUID changed -> %lu at key=%s\n",
+                     cuid, c_iter->key().ToString().substr(0, 40).c_str());
+        } else {
+          // [FIX] 同一 CUID 内，若 CompactionIterator 刚完成了一次 obsolete delta skip，
+          // 说明输出数据中有 gap，需截断当前 segment，新起一段（避免注册稀疏 delta range）。
+          uint64_t gap_cuid = c_iter->ConsumeSkipGap();
+          if (gap_cuid == cuid && delta_ctx->has_started_segment) {
+            DiagLogf("[DIAG_COMPACTION_GAP_SPLIT] CUID %lu: obsolete-file gap detected, "
+                    "splitting segment at last_key=%s, next_key=%s\n",
+                    cuid,
+                    delta_ctx->current_last_key.substr(0, 40).c_str(),
+                    c_iter->key().ToString().substr(0, 40).c_str());
+            delta_ctx->FlushSegment(delta_ctx->current_file_number);
+            // 重置，但保持 current_cuid 不变（同一 CUID 继续追踪，新段开始）
+          }
+
+          // [FIX-B] 检测 valid→valid 文件切换时的数据 gap：
+          // ConsumeSkipGap 只能捕捉 "obsolete-skip 事件" 触发的 gap（路径 A），
+          // 但当前序 compaction 已跳过中间数据并将其清理出输入集合时，后续 compaction
+          // 的两个相邻 valid 文件之间可能存在大范围 row_id 空洞（中间数据在 snapshot）。
+          // 此路径在文件切换边界（input_file_id 首次出现于当前 segment）检测 row_id gap，
+          // 避免对文件内部正常连续数据产生误触发。
+          else if (delta_ctx->has_started_segment
+                   && input_file_id != 0
+                   && delta_ctx->current_input_files.find(input_file_id)
+                          == delta_ctx->current_input_files.end()
+                   && !delta_ctx->current_last_key.empty()) {
+            uint64_t prev_rid = ExtractRowID(Slice(delta_ctx->current_last_key));
+            uint64_t cur_rid = ExtractRowID(c_iter->key());
+            if (prev_rid > 0 && cur_rid > 0 && cur_rid > prev_rid + 1) {
+              DiagLogf("[DIAG_COMPACTION_GAP_SPLIT] CUID %lu: valid-file gap detected "
+                      "at file switch, prev_rid=%lu -> cur_rid=%lu(file=%lu) "
+                      "gap=%lu rows, splitting segment\n",
+                      cuid, prev_rid, cur_rid, input_file_id,
+                      cur_rid - prev_rid - 1);
+              delta_ctx->FlushSegment(delta_ctx->current_file_number);
+            }
+          }
+
+          // [PATH C] 多段输入文件边界缓存填充：
+          // 当某个输入文件不在缓存中时，查询 delta index 获取该文件为 current_cuid
+          // 注册的所有段 last_rid
+          if (input_file_id != 0
+              && !delta_ctx->input_file_seg_ends.count(input_file_id)) {
+            HotIndexEntry _idx_entry;
+            if (delta_ctx->manager->GetIndexTable().GetEntry(
+                    delta_ctx->current_cuid, &_idx_entry)) {
+              std::vector<uint64_t> seg_ends;
+              for (const auto& _seg : _idx_entry.deltas) {
+                if (_seg.file_number == input_file_id) {
+                  uint64_t _lr = ExtractRowID(Slice(_seg.last_key));
+                  if (_lr > 0) seg_ends.push_back(_lr);
+                }
+              }
+              std::sort(seg_ends.begin(), seg_ends.end());
+              if (seg_ends.size() > 1) {
+                DiagLogf("[DIAG_COMPACTION_MULTISEG] CUID %lu: input file=%lu has %zu registered segments\n",
+                        delta_ctx->current_cuid, input_file_id, seg_ends.size());
+              }
+              // 无论单段还是多段都写入缓存，避免重复查询
+              delta_ctx->input_file_seg_ends[input_file_id] = std::move(seg_ends);
+            } else {
+              // 文件不在 index（新写入尚未注册），视为单段
+              delta_ctx->input_file_seg_ends[input_file_id] = {};
+            }
+          }
+
+          // [PATH C] 同一文件内跨段边界检测：
+          // 当前文件已在 current_input_files 中（非首次），若 row_id 跨越了某个
+          // 注册段的 last_rid，说明数据跳入了下一个不连续段——分割输出段注册。
+          if (input_file_id != 0
+              && delta_ctx->has_started_segment
+              && !delta_ctx->current_last_key.empty()
+              && delta_ctx->current_input_files.count(input_file_id)) {
+            auto _it = delta_ctx->input_file_seg_ends.find(input_file_id);
+            if (_it != delta_ctx->input_file_seg_ends.end()
+                && !_it->second.empty()) {
+              uint64_t _prev_rid = ExtractRowID(Slice(delta_ctx->current_last_key));
+              uint64_t _cur_rid  = ExtractRowID(c_iter->key());
+              if (_prev_rid > 0 && _cur_rid > 0) {
+                for (uint64_t _seg_end_rid : _it->second) {
+                  if (_prev_rid <= _seg_end_rid && _cur_rid > _seg_end_rid) {
+                    DiagLogf("[DIAG_COMPACTION_GAP_SPLIT] CUID %lu: "
+                             "multi-segment file=%lu boundary crossed, "
+                             "prev_rid=%lu -> cur_rid=%lu (seg_end=%lu), "
+                             "splitting segment\n",
+                             cuid, input_file_id,
+                             _prev_rid, _cur_rid, _seg_end_rid);
+                    delta_ctx->FlushSegment(delta_ctx->current_file_number);
+                    break;
+                  }
+                }
+              }
+            }
+          }
+
+          // [FIX-INTRA] 同一文件内物理数据 gap 检测：
+          // PATH C 依赖 delta index 中的注册段边界，但当 PM 将某文件的 segment 标记为
+          // obsolete 并从 index 移除后，PATH C 的缓存中不再有该边界信息。此时若文件的
+          // 物理数据仍存在 gap（跨原注册段边界的 row_id 跳跃），compaction 会将多个物理
+          // 上不连续的段合并注册为一个 segment，造成 segment range 与实际数据不一致。
+          // 该不一致会向下游传播：PM 将此文件整个大 segment 纳入 merge 范围，导致
+          // AtomicReplace 错误裁剪掉旧 snapshot 中覆盖 gap 区间的部分，产生数据丢失。
+          //
+          // 无论 PATH C 是否触发，只要同一文件内 row_id 出现物理跳跃，
+          // 就立即 FlushSegment 以保证输出段与物理数据完全对应。
+          if (delta_ctx->has_started_segment
+              && input_file_id != 0
+              && delta_ctx->current_input_files.count(input_file_id)
+              && !delta_ctx->current_last_key.empty()) {
+            uint64_t _prev_rid = ExtractRowID(Slice(delta_ctx->current_last_key));
+            uint64_t _cur_rid  = ExtractRowID(c_iter->key());
+            if (_prev_rid > 0 && _cur_rid > 0 && _cur_rid > _prev_rid + 1) {
+              DiagLogf("[DIAG_COMPACTION_GAP_SPLIT] CUID %lu: "
+                       "intra-segment physical gap in file=%lu, "
+                       "prev_rid=%lu -> cur_rid=%lu gap=%lu rows, "
+                       "splitting segment\n",
+                       cuid, input_file_id,
+                       _prev_rid, _cur_rid, _cur_rid - _prev_rid - 1);
+              delta_ctx->FlushSegment(delta_ctx->current_file_number);
+            }
+          }
+        }
+
+        // internal key?
+        std::string key_str = c_iter->key().ToString();
+
+        if (!delta_ctx->has_started_segment) {
+            // new segment's first key
+            delta_ctx->current_first_key = key_str;
+            delta_ctx->has_started_segment = true;
+        }
+
+        delta_ctx->current_last_key = key_str;
+        delta_ctx->current_entry_count++;
+        if (input_file_id != 0) {
+            delta_ctx->current_input_files.insert(input_file_id);
+        }
+    }
 
     if (c_iter->iter_stats().num_input_records % kRecordStatsEvery ==
         kRecordStatsEvery - 1) {
@@ -1576,6 +1960,20 @@ Status CompactionJob::ProcessKeyValue(
       break;
     }
 #endif  // NDEBUG
+  }
+
+  // last cuid
+  if (status.ok() && delta_ctx && delta_ctx->manager && delta_ctx->current_cuid != 0) {
+      delta_ctx->FlushSegment(delta_ctx->current_file_number);
+  }
+  
+  if (hotspot_manager_) {
+      // 多个 subcompaction 的保护
+      std::lock_guard<std::mutex> lock(delta_mutex_);
+      for (auto& pair : local_inputs) {
+          global_cuid_inputs_[pair.first].insert(pair.second.begin(), pair.second.end());
+      }
+      global_outputs_.insert(global_outputs_.end(), local_outputs.begin(), local_outputs.end());
   }
 
   return status;
@@ -1750,6 +2148,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   ReadOptions read_options;
   const WriteOptions write_options(Env::IOPriority::IO_LOW,
                                    Env::IOActivity::kCompaction);
+  // for delta
+  std::unordered_set<uint64_t> local_involved_cuids;
 
   InternalIterator* input_iter = CreateInputIterator(
       sub_compact, cfd, iterators, boundaries, read_options);
@@ -1776,22 +2176,55 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 
   auto c_iter =
       CreateCompactionIterator(sub_compact, cfd, input_iter, compaction_filter,
-                               merge, blob_resources, write_options);
+                               merge, blob_resources, write_options, &local_involved_cuids);
   assert(c_iter);
+
+  // for delta
+  // 用于记录这个subcompaction的input/output files
+  std::map<uint64_t, std::unordered_set<uint64_t>> local_inputs;
+  std::vector<DeltaOutputInfo> local_outputs;
+
+  auto delta_ctx = std::make_shared<DeltaCompactionContext>();
+  delta_ctx->manager = hotspot_manager_;
+  delta_ctx->pending_outputs = &local_outputs;
+
+  c_iter->SetInputMap(&local_inputs);
+
+
   c_iter->SeekToFirst();
 
   TEST_SYNC_POINT("CompactionJob::Run():Inprogress");
   TEST_SYNC_POINT_CALLBACK("CompactionJob::Run():PausingManualCompaction:1",
                            static_cast<void*>(const_cast<std::atomic<bool>*>(
                                &manual_compaction_canceled_)));
+  
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager = hotspot_manager_;
+  if (hotspot_manager) {
+      delta_ctx->manager = hotspot_manager;
+      // gather Compaction Inputs
+      for (size_t i = 0; i < sub_compact->compaction->num_input_levels(); ++i) {
+          for (const auto& file : *sub_compact->compaction->inputs(i)) {
+              delta_ctx->input_files.push_back(file->fd.GetNumber());
+          }
+      }
+  }
 
+  // 修改open_file_func, close_file_func，把文件信息记录下来
   auto [open_file_func, close_file_func] =
-      CreateFileHandlers(sub_compact, boundaries);
+      CreateFileHandlers(sub_compact, boundaries, delta_ctx);
 
   status = ProcessKeyValue(sub_compact, cfd, c_iter.get(), open_file_func,
-                           close_file_func, prev_cpu_micros);
+                           close_file_func, prev_cpu_micros, delta_ctx, local_inputs, local_outputs);
 
   status = FinalizeProcessKeyValueStatus(cfd, input_iter, c_iter.get(), status);
+
+  // 将这个 subcompaction 涉及到的 cuids 加入到 compaction_involved_cuids_ 中
+  if (!local_involved_cuids.empty()) {
+      std::lock_guard<std::mutex> lock(cuids_mutex_);
+      compaction_involved_cuids_.insert(local_involved_cuids.begin(), 
+                                        local_involved_cuids.end());
+  }
 
   FinalizeSubcompaction(sub_compact, status, open_file_func, close_file_func,
                         blob_resources.blob_file_builder.get(), c_iter.get(),
@@ -3084,4 +3517,5 @@ Status CompactionJob::VerifyOutputRecordCount() const {
   }
   return Status::OK();
 }
+
 }  // namespace ROCKSDB_NAMESPACE

@@ -1,5 +1,13 @@
 make_config.mk
 rocksdb.pc
+db_tmp/
+install/
+
+perf_execute.md
+perf_opti.md
+
+.agents
+.github
 
 *.a
 *.arc

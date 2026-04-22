@@ -203,6 +203,11 @@ class IteratorWrapperBase {
     }
   }
 
+  // for delta
+  uint64_t GetPhysicalId() {
+    return iter_->GetPhysicalId();
+  }
+
  private:
   void Update() {
     valid_ = iter_->Valid();

@@ -406,7 +406,8 @@ class MemTableIterator : public InternalIterator {
             mem.moptions_.paranoid_memory_checks ||
             mem.moptions_.memtable_veirfy_per_key_checksum_on_seek),
         allow_data_in_error_(mem.moptions_.allow_data_in_errors),
-        key_validation_callback_(mem.key_validation_callback_) {
+        key_validation_callback_(mem.key_validation_callback_),
+        mem_(&mem) {
     if (kind == kRangeDelEntries) {
       iter_ = mem.range_del_table_->GetIterator(arena);
     } else if (prefix_extractor_ != nullptr &&
@@ -600,6 +601,12 @@ class MemTableIterator : public InternalIterator {
     return value_pinned_;
   }
 
+  // for delta physical
+  uint64_t GetPhysicalId() override {
+    // memtable pointer
+    return reinterpret_cast<uint64_t>(mem_); 
+  }
+
  private:
   DynamicBloom* bloom_;
   const SliceTransform* const prefix_extractor_;
@@ -618,6 +625,8 @@ class MemTableIterator : public InternalIterator {
   const bool validate_on_seek_;
   const bool allow_data_in_error_;
   const std::function<Status(const char*, bool)> key_validation_callback_;
+  // for delta physical
+  const MemTable* mem_;
 
   void VerifyEntryChecksum() {
     if (protection_bytes_per_key_ > 0 && Valid()) {

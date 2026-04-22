@@ -9,6 +9,8 @@
 #include "db/db_impl/db_impl.h"
 
 #include <cstdint>
+
+#include "util/extract_cuid.h"
 #ifdef OS_SOLARIS
 #include <alloca.h>
 #endif
@@ -56,6 +58,8 @@
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
 #include "db/write_callback.h"
+#include "delta/hotspot_manager.h"
+#include "delta/diag_log.h"
 #include "env/unique_id_gen.h"
 #include "file/file_util.h"
 #include "file/filename.h"
@@ -115,6 +119,8 @@
 #include "util/string_util.h"
 #include "util/udt_util.h"
 #include "utilities/trace/replayer_impl.h"
+// for delta
+#include "delta/hot_iterators.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -275,6 +281,28 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
                             std::memory_order_relaxed);
   if (write_buffer_manager_) {
     wbm_stall_.reset(new WBMStallInterface());
+  }
+}
+
+// for delta: only initialize when enable_delta is set
+void DBImpl::InitializeHotspotManager(const Options& options) {
+  if (immutable_db_options_.enable_delta) {
+    if (hotspot_manager_) {
+      return; // Already initialized
+    }
+    std::string hotspot_dir = dbname_ + "/hotspot_data";
+    auto* internal_comparator =
+        &versions_->GetColumnFamilySet()->GetDefault()->internal_comparator();
+    hotspot_manager_ = std::make_shared<HotspotManager>(
+        options, hotspot_dir, internal_comparator);
+    immutable_db_options_.hotspot_manager = hotspot_manager_;
+
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[DBImpl] HotspotManager initialized at %s",
+                   hotspot_dir.c_str());
+    // BGDeltaWork
+    mutex_.AssertHeld();
+    MaybeScheduleDeltaWork();
   }
 }
 
@@ -543,8 +571,9 @@ Status DBImpl::CloseHelper() {
   Status ret = Status::OK();
 
   // Wait for background work to finish
+  // for delta
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_ || bg_purge_scheduled_ ||
+         bg_flush_scheduled_ || bg_purge_scheduled_ || bg_delta_scheduled_ ||
          pending_purge_obsolete_files_ ||
          error_handler_.IsRecoveryInProgress()) {
     TEST_SYNC_POINT("DBImpl::~DBImpl:WaitJob");
@@ -2090,6 +2119,7 @@ InternalIterator* DBImpl::NewInternalIterator(
     SuperVersion* super_version, Arena* arena, SequenceNumber sequence,
     bool allow_unprepared_value, ArenaWrappedDBIter* db_iter) {
   InternalIterator* internal_iter;
+  DeltaSwitchingIterator* switching_iter_ptr = nullptr;
   assert(arena != nullptr);
   auto prefix_extractor =
       super_version->mutable_cf_options.prefix_extractor.get();
@@ -2135,12 +2165,23 @@ InternalIterator* DBImpl::NewInternalIterator(
   if (s.ok()) {
     // Collect iterators for files in L0 - Ln
     if (read_options.read_tier != kMemtableTier) {
-      super_version->current->AddIterators(read_options, file_options_,
-                                           &merge_iter_builder,
-                                           allow_unprepared_value);
+      // for delta
+      if (hotspot_manager_) {
+        // TODO: Arena?
+        switching_iter_ptr = new DeltaSwitchingIterator(
+            super_version->current, hotspot_manager_.get(), read_options,
+            file_options_, cfd->internal_comparator(),
+            super_version->mutable_cf_options, arena);
+        merge_iter_builder.AddIterator(switching_iter_ptr);
+      } else {
+        super_version->current->AddIterators(read_options, file_options_,
+                                             &merge_iter_builder,
+                                             allow_unprepared_value);
+      }
     }
     internal_iter = merge_iter_builder.Finish(
         read_options.ignore_range_deletions ? nullptr : db_iter);
+
     SuperVersionHandle* cleanup = new SuperVersionHandle(
         this, &mutex_, super_version,
         read_options.background_purge_on_iterator_cleanup ||
@@ -3917,7 +3958,9 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                              (read_options.snapshot != nullptr)
                                  ? read_options.snapshot->GetSequenceNumber()
                                  : kMaxSequenceNumber,
-                             nullptr /* read_callback */);
+                             nullptr /* read_callback */,
+                             /*expose_blob_index=*/false,
+                             /*allow_refresh=*/true, hotspot_manager_);
   }
   return result;
 }
@@ -3925,7 +3968,8 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
 ArenaWrappedDBIter* DBImpl::NewIteratorImpl(
     const ReadOptions& read_options, ColumnFamilyHandleImpl* cfh,
     SuperVersion* sv, SequenceNumber snapshot, ReadCallback* read_callback,
-    bool expose_blob_index, bool allow_refresh) {
+    bool expose_blob_index, bool allow_refresh,
+    std::shared_ptr<HotspotManager> hotspot_manager) {
   TEST_SYNC_POINT("DBImpl::NewIterator:1");
   TEST_SYNC_POINT("DBImpl::NewIterator:2");
 
@@ -3988,7 +4032,8 @@ ArenaWrappedDBIter* DBImpl::NewIteratorImpl(
   // that they are likely to be in the same cache line and/or page.
   return NewArenaWrappedDbIterator(
       env_, read_options, cfh, sv, snapshot, read_callback, this,
-      expose_blob_index, allow_refresh, /*allow_mark_memtable_for_flush=*/true);
+      expose_blob_index, allow_refresh, /*allow_mark_memtable_for_flush=*/true,
+      hotspot_manager_);
 }
 
 std::unique_ptr<Iterator> DBImpl::NewCoalescingIterator(
@@ -6919,6 +6964,708 @@ void DBImpl::TrackOrUntrackFiles(
     // There shouldn't be any duplicated files. In case there is, SstFileManager
     // will take care of deduping it.
     action(file_path, /*size=*/std::nullopt);
+  }
+}
+// for delta
+// 处理待初始化的热点 CUID
+// 对首次成为热点的 CUID 执行全量扫描以建立完整 snapshot
+void DBImpl::ProcessPendingHotCuids() {
+  if (!hotspot_manager_) {
+    return;
+  }
+
+  // 获取待处理的 CUID 列表 (按批次获取)
+  std::vector<uint64_t> pending_cuids = hotspot_manager_->PopPendingInitCuids(32);
+  if (pending_cuids.empty()) {
+    return;
+  }
+
+  ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                 "[DBImpl] Processing %zu pending hot CUIDs for initial scan",
+                 pending_cuids.size());
+
+  for (uint64_t cuid : pending_cuids) {
+    // 构造 start_key
+    std::string start_key(40, '\0');
+    unsigned char* p = reinterpret_cast<unsigned char*>(&start_key[16]);
+    for (int i = 0; i < 8; ++i) {
+      p[i] = (cuid >> (56 - 8 * i)) & 0xFF;  // Big Endian
+    }
+
+    // 构造 upper_bound_key: CUID + 1 的起始
+    uint64_t cuid_plus_one = cuid + 1;
+    std::string upper_bound_key(40, '\0');
+    unsigned char* q = reinterpret_cast<unsigned char*>(&upper_bound_key[16]);
+    for (int i = 0; i < 8; ++i) {
+      q[i] = (cuid_plus_one >> (56 - 8 * i)) & 0xFF;  // Big Endian
+    }
+
+    ReadOptions read_opts;
+    read_opts.delta_full_scan = true;
+    read_opts.skip_hot_path = true;  // Init Scan 走冷路径，读 SST 文件
+    Slice upper_bound_slice(upper_bound_key);
+    read_opts.iterate_upper_bound = &upper_bound_slice;
+    ColumnFamilyHandle* cfh = DefaultColumnFamily();
+    if (!cfh) {
+      ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                      "[DBImpl] No default column family for init scan");
+      continue;
+    }
+
+    std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
+    Slice start_slice(start_key);
+    size_t count = 0;
+
+    for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
+      count++;
+    }
+
+    if (!iter->status().ok()) {
+      ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                      "[DBImpl] Init scan error for CUID %" PRIu64 ": %s",
+                      cuid, iter->status().ToString().c_str());
+    } else {
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "[DBImpl] Completed init scan for CUID %" PRIu64
+                     ", %zu entries",
+                     cuid, count);
+    }
+    hotspot_manager_->UnlockCuid(cuid);
+  }
+}
+
+// 用户的全版本scan仍然走热数据path，
+// 在系统后台进行一次全版本的scan（冷数据path），用于更新GDCT
+// 即为MetadataScans
+void DBImpl::ProcessPendingMetadataScans() {
+  if (!hotspot_manager_) {
+    return;
+  }
+
+  std::vector<uint64_t> pending_cuids =
+      hotspot_manager_->PopPendingMetadataScans(32);
+  if (pending_cuids.empty()) {
+    return;
+  }
+
+  for (uint64_t cuid : pending_cuids) {
+    // 构造扫描范围
+    std::string start_key(40, '\0');
+    unsigned char* p = reinterpret_cast<unsigned char*>(&start_key[16]);
+    for (int i = 0; i < 8; ++i) {
+      p[i] = (cuid >> (56 - 8 * i)) & 0xFF;  // Big Endian
+    }
+
+    uint64_t cuid_plus_one = cuid + 1;
+    std::string upper_bound_key(40, '\0');
+    unsigned char* q = reinterpret_cast<unsigned char*>(&upper_bound_key[16]);
+    for (int i = 0; i < 8; ++i) {
+      q[i] = (cuid_plus_one >> (56 - 8 * i)) & 0xFF;  // Big Endian
+    }
+
+    ReadOptions read_opts;
+    read_opts.delta_full_scan = true;
+    read_opts.skip_hot_path = true;  // 强制走 Cold Path
+    read_opts.is_metadata_scan =
+        true;  // 隔离 Metadata Scan，防止其替换 Snapshot
+    Slice upper_bound_slice(upper_bound_key);
+    read_opts.iterate_upper_bound = &upper_bound_slice;
+    ColumnFamilyHandle* cfh = DefaultColumnFamily();
+    if (!cfh) {
+      continue;
+    }
+
+    std::unique_ptr<Iterator> iter(NewIterator(read_opts, cfh));
+    Slice start_slice(start_key);
+    size_t count = 0;
+
+    for (iter->Seek(start_slice); iter->Valid(); iter->Next()) {
+      count++;
+    }
+
+    if (!iter->status().ok()) {
+      ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                      "[DBImpl] Metadata scan error for CUID %" PRIu64 ": %s",
+                      cuid, iter->status().ToString().c_str());
+    }
+  }
+}
+
+namespace {
+class ScanDataIterator : public InternalIterator {
+ public:
+  explicit ScanDataIterator(
+      const std::vector<std::pair<std::string, std::string>>& data)
+      : data_(data), it_(data_.begin()) {}
+
+  bool Valid() const override { return it_ != data_.end(); }
+  void SeekToFirst() override { it_ = data_.begin(); }
+  void SeekToLast() override {
+    if (data_.empty()) {
+      it_ = data_.end();
+    } else {
+      it_ = data_.end() - 1;
+    }
+  }
+  void Seek(const Slice& target) override {
+    it_ = std::lower_bound(
+        data_.begin(), data_.end(), target,
+        [](const std::pair<std::string, std::string>& a, const Slice& b) {
+          return Slice(a.first).compare(b) < 0;
+        });
+  }
+  void SeekForPrev(const Slice& target) override {
+    Seek(target);
+    if (!Valid()) {
+      SeekToLast();
+    } else if (Slice(it_->first).compare(target) > 0) {
+      Prev();
+    }
+  }
+  void Next() override {
+    if (Valid()) ++it_;
+  }
+  void Prev() override {
+    if (it_ != data_.begin()) {
+      --it_;
+    } else {
+      it_ = data_.end();
+    }
+  }
+  Slice key() const override { return Slice(it_->first); }
+  Slice value() const override { return Slice(it_->second); }
+  Status status() const override { return Status::OK(); }
+
+ private:
+  const std::vector<std::pair<std::string, std::string>>& data_;
+  std::vector<std::pair<std::string, std::string>>::const_iterator it_;
+};
+}  // namespace
+
+// 处理 Partial Merge 任务
+void DBImpl::ProcessPendingPartialMerge() {
+  if (!hotspot_manager_) {
+    return;
+  }
+
+  ColumnFamilyHandle* cfh = DefaultColumnFamily();
+  if (!cfh) {
+    return;
+  }
+
+  auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(cfh)->cfd();
+  SuperVersion* sv = GetAndRefSuperVersion(cfd);
+  if (!sv) {
+    return;
+  }
+
+  const auto& icmp = cfd->internal_comparator();
+  ReadOptions read_opts;
+  FileOptions file_opts;
+  MutableCFOptions mutable_cf_opts = cfd->GetLatestMutableCFOptions();
+
+  // 批量处理，减少 Ref/Unref 开销
+  const int kBatchSize = 32;
+  int processed_count = 0;
+
+  while (processed_count < kBatchSize) {
+    PartialMergePendingTask task;
+    if (!hotspot_manager_->PopPendingPartialMerge(&task)) {
+      break;
+    }
+
+    processed_count++;
+
+    // 获取重叠的 segments
+    std::vector<DataSegment> overlapping_snaps, overlapping_deltas;
+    hotspot_manager_->GetIndexTable().GetOverlappingSegments(
+        task.cuid, task.scan_first_key, task.scan_last_key, &overlapping_snaps,
+        &overlapping_deltas);
+
+    // [DIAG_PM_RANGE] 简化版：仅输出 scan range 和 overlap 计数
+    DiagLogf("[DIAG_PM_RANGE] CUID %lu: scan=[%s - %s] "
+            "overlap_snaps=%zu overlap_deltas=%zu scan_data=%zu\n",
+            (unsigned long)task.cuid,
+            FormatKeyDisplay(task.scan_first_key).c_str(),
+            FormatKeyDisplay(task.scan_last_key).c_str(),
+            overlapping_snaps.size(),
+            overlapping_deltas.size(),
+            task.scan_data.size());
+
+    // [DIAG_PM_DELTA_DUMP] 在 PM 开始时记录该 CUID 所有 delta 文件的完整范围，方便查找未被吸收的文件
+    {
+      HotIndexEntry _dump;
+      hotspot_manager_->GetIndexTable().GetEntry(task.cuid, &_dump);
+      DiagLogf("[DIAG_PM_DELTA_DUMP] CUID %lu: ALL deltas at PM start "
+               "(scan=[%s - %s], total_deltas=%zu):\n",
+               (unsigned long)task.cuid,
+               FormatKeyDisplay(task.scan_first_key).c_str(),
+               FormatKeyDisplay(task.scan_last_key).c_str(),
+               _dump.deltas.size());
+      for (size_t _i = 0; _i < _dump.deltas.size(); _i++) {
+        bool _in_overlap = false;
+        for (const auto& _od : overlapping_deltas)
+          if (_od.file_number == _dump.deltas[_i].file_number) { _in_overlap = true; break; }
+        DiagLogf("  delta[%zu] file=%lu [%s - %s] %s\n",
+                 _i, _dump.deltas[_i].file_number,
+                 FormatKeyDisplay(_dump.deltas[_i].first_key).c_str(),
+                 FormatKeyDisplay(_dump.deltas[_i].last_key).c_str(),
+                 _in_overlap ? "[IN_MERGE]" : "[NOT_IN_MERGE - out of scan range]");
+      }
+    }
+
+    // 如果没有重叠数据，使用 FullReplace 逻辑
+    if (overlapping_snaps.empty() && overlapping_deltas.empty()) {
+      // PartialMerge 任务却找不到任何重叠数据，这是可疑状态，记录下来
+      HotIndexEntry entry_dbg;
+      hotspot_manager_->GetIndexTable().GetEntry(task.cuid, &entry_dbg);
+      DiagLogf("[DIAG][PartialMerge] CUID %lu: NO overlapping data for scan=[%s - %s]. "
+              "Snapshot segs=%zu deltas=%zu. Falling back to FullReplace.\n",
+              (unsigned long)task.cuid,
+              FormatKeyDisplay(task.scan_first_key).c_str(),
+              FormatKeyDisplay(task.scan_last_key).c_str(),
+              entry_dbg.snapshot_segments.size(),
+              entry_dbg.deltas.size());
+      DataSegment new_segment;
+      new_segment.file_number = static_cast<uint64_t>(-1);
+      new_segment.first_key = task.scan_first_key;
+      new_segment.last_key = task.scan_last_key;
+      hotspot_manager_->GetIndexTable().ReplaceOverlappingSegments(
+          task.cuid, new_segment, std::vector<DataSegment>{});
+      // -1 段已建立，处理 pm_pending 中可能积累的跨线程 flush SST
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
+      hotspot_manager_->UnlockCuid(task.cuid);
+      continue;
+    }
+
+    // 创建迭代器
+    std::vector<InternalIterator*> children;
+
+    // 1. Snapshot Iterator
+    if (!overlapping_snaps.empty()) {
+      InternalIterator* snap_iter = new HotSnapshotIterator(
+          overlapping_snaps, task.cuid, hotspot_manager_.get(),
+          cfd->table_cache(), read_opts, file_opts, icmp, mutable_cf_opts,
+          hotspot_manager_->GetLifecycleManager());
+      children.push_back(snap_iter);
+    }
+
+    // 2. Delta Iterator
+    if (!overlapping_deltas.empty()) {
+      InternalIterator* delta_iter = new HotDeltaIterator(
+          overlapping_deltas, task.cuid, cfd->table_cache(), read_opts,
+          file_opts, icmp, mutable_cf_opts, false);
+      children.push_back(delta_iter);
+    }
+
+    // 3. Scan Data Iterator (Local to this PartialMerge execution)
+    InternalIterator* scan_data_iter = nullptr;
+    if (!task.scan_data.empty()) {
+      scan_data_iter = new ScanDataIterator(task.scan_data);
+      children.push_back(scan_data_iter);
+    }
+
+    if (children.empty()) {
+      // 无迭代器（理论上已被前面的 early-exit 拦截），清理 pm_pending 防止 Ref 泄漏
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
+      hotspot_manager_->UnlockCuid(task.cuid);
+      continue;
+    }
+
+    // 创建 MergingIterator
+    InternalIterator* merging_iter = NewMergingIterator(
+        &icmp, children.data(), static_cast<int>(children.size()));
+
+    // 遍历归并并写入 Buffer，去重并过滤 CUID
+    std::string last_user_key;
+    std::string segment_first_key, segment_last_key;
+    size_t written_count = 0;
+    // [DIAG] per-source counters & gap detection
+    size_t src_snapshot_count = 0, src_delta_count = 0, src_scandata_count = 0, src_unknown_count = 0;
+    size_t dedup_count = 0;
+    uint64_t prev_row_id = UINT64_MAX;
+    uint64_t prev_phys_id = 0;  // [DIAG] phys_id of the last written record
+    uint64_t gap_total = 0;
+    std::string first_gap_start_key, first_gap_prev_key;
+
+    // [DIAG_PM_MERGE_START] 记录 merge iterator 的第一个 key 及其来源，便于发现
+    // "PM 从非最小 key 开始跑" 的问题（例如某个 delta 文件的 before-scan 部分被跳过）
+    merging_iter->SeekToFirst();
+    if (merging_iter->Valid()) {
+      uint64_t first_phys = merging_iter->GetPhysicalId();
+      const char* first_src = (first_phys == 0) ? "scandata" :
+          [&]() -> const char* {
+            for (const auto& s : overlapping_snaps)
+              if (s.file_number == first_phys) return "snapshot";
+            return "delta";
+          }();
+      DiagLogf("[DIAG_PM_MERGE_START] CUID %lu: merge iterator first key=%s "
+               "phys=%lu(%s)\n",
+               (unsigned long)task.cuid,
+               FormatKeyDisplay(merging_iter->key().ToString()).c_str(),
+               first_phys, first_src);
+    } else {
+      DiagLogf("[DIAG_PM_MERGE_START] CUID %lu: merge iterator EMPTY at SeekToFirst\n",
+               (unsigned long)task.cuid);
+    }
+
+    for (; merging_iter->Valid();
+         merging_iter->Next()) {
+      Slice key = merging_iter->key();
+
+      // 提取 CUID 并进行过滤
+      uint64_t current_cuid = hotspot_manager_->ExtractCUID(key);
+      // Key 是按照 CUID 有序排列的？一旦超过目标 CUID 停止扫描
+      if (current_cuid > task.cuid) {
+        break;
+      }
+      if (current_cuid < task.cuid) {
+        continue;
+      }
+
+      Slice value = merging_iter->value();
+      Slice user_key = ExtractUserKey(key);
+
+      // Slice 比较减少 ToString 开销
+      if (!last_user_key.empty() &&
+          icmp.user_comparator()->Compare(user_key, Slice(last_user_key)) == 0) {
+        dedup_count++;
+        continue;
+      }
+      last_user_key.assign(user_key.data(), user_key.size());
+
+      // [DIAG] per-source tracking
+      uint64_t phys_id = merging_iter->GetPhysicalId();
+      if (phys_id == 0) {
+        src_scandata_count++;
+      } else {
+        // Check if from snapshot or delta
+        bool from_snap = false;
+        for (const auto& seg : overlapping_snaps) {
+          if (seg.file_number == phys_id) { from_snap = true; break; }
+        }
+        if (from_snap) src_snapshot_count++;
+        else src_delta_count++;
+      }
+
+      // [DIAG] row_id gap detection
+      uint64_t cur_row_id = 0;
+      std::string key_str = key.ToString();
+      if (key_str.size() >= 34) {
+        try { cur_row_id = std::stoull(key_str.substr(24, 10)); } catch (...) {}
+      }
+      if (prev_row_id != UINT64_MAX && cur_row_id != 0 && prev_row_id != 0) {
+        if (cur_row_id > prev_row_id + 1 && cur_row_id - prev_row_id < 5000000) {
+          uint64_t gap_size = cur_row_id - prev_row_id - 1;
+          if (gap_total == 0) {
+            first_gap_prev_key = FormatKeyDisplay(segment_last_key);
+            first_gap_start_key = FormatKeyDisplay(key_str);
+          }
+          gap_total += gap_size;
+          if (gap_total <= gap_size) {  // first gap
+            // prev_phys_id: source of the last record before the gap
+            // phys_id:      source of the first record after the gap
+            const char* prev_src = (prev_phys_id == 0) ? "scandata" :
+                [&]() -> const char* {
+                  for (const auto& seg : overlapping_snaps)
+                    if (seg.file_number == prev_phys_id) return "snapshot";
+                  return "delta";
+                }();
+            const char* cur_src = (phys_id == 0) ? "scandata" :
+                [&]() -> const char* {
+                  for (const auto& seg : overlapping_snaps)
+                    if (seg.file_number == phys_id) return "snapshot";
+                  return "delta";
+                }();
+            DiagLogf("[DIAG_PM_MERGE_GAP] CUID %lu: FIRST GAP after %zu entries! "
+                    "prev_rid=%lu(phys=%lu/%s), cur_rid=%lu(phys=%lu/%s), gap=%lu\n",
+                    (unsigned long)task.cuid, written_count,
+                    prev_row_id, prev_phys_id, prev_src,
+                    cur_row_id, phys_id, cur_src, gap_size);
+          }
+        }
+      }
+      prev_row_id = cur_row_id;
+      prev_phys_id = phys_id;
+
+      // 写入 Buffer
+      if (hotspot_manager_->BufferHotData(task.cuid, key, value)) {
+      }
+
+      if (segment_first_key.empty()) {
+        segment_first_key = key.ToString();
+      }
+
+      segment_last_key = key.ToString();
+      written_count++;
+      
+      if (written_count == 1 || written_count % 300000 == 0) {
+         DiagLogf("[DIAG_PM_MERGE] CUID %lu: Merging... count=%zu current_key=%s\n", 
+                 (unsigned long)task.cuid, written_count, FormatKeyDisplay(key.ToString()).c_str());
+      }
+    }
+
+    if (written_count > 0) {
+      DiagLogf("[DIAG_PM_MERGE] CUID %lu: scan range=[%s - %s] merged_count=%zu\n",
+              (unsigned long)task.cuid,
+              FormatKeyDisplay(task.scan_first_key).c_str(),
+              FormatKeyDisplay(task.scan_last_key).c_str(),
+              written_count);
+      DiagLogf("[DIAG_PM_MERGE] CUID %lu: Merge finished. Count=%zu. First=%s, Last=%s\n",
+              (unsigned long)task.cuid, written_count, 
+              FormatKeyDisplay(segment_first_key).c_str(),
+              FormatKeyDisplay(segment_last_key).c_str());
+      DiagLogf("[DIAG_PM_MERGE] CUID %lu: Sources: snapshot=%zu delta=%zu scandata=%zu dedup=%zu",
+              (unsigned long)task.cuid, src_snapshot_count, src_delta_count, src_scandata_count, dedup_count);
+      if (gap_total > 0) {
+        DiagLogf("[DIAG_PM_MERGE_GAP] CUID %lu: TOTAL gap=%lu rows. "
+                "First gap after key %s \u2192 %s\n",
+                (unsigned long)task.cuid, gap_total,
+                first_gap_prev_key.c_str(), first_gap_start_key.c_str());
+      }
+    }
+
+
+    delete merging_iter;
+
+    if (written_count > 0) {
+      // [DIAG_PM_RANGE_UNDERCUT] 检测范围收缩情况
+      if (icmp.user_comparator()->Compare(ExtractUserKey(segment_first_key), 
+                                          ExtractUserKey(task.scan_first_key)) > 0) {
+        DiagLogf("[DIAG_PM_RANGE_UNDERCUT] CUID %lu: segment_range=[%s - %s] "
+                "scan_range=[%s - %s] written=%zu\n",
+                (unsigned long)task.cuid,
+                FormatKeyDisplay(segment_first_key).c_str(),
+                FormatKeyDisplay(segment_last_key).c_str(),
+                FormatKeyDisplay(task.scan_first_key).c_str(),
+                FormatKeyDisplay(task.scan_last_key).c_str(),
+                written_count);
+        DiagLogf("  \u2192 PM output starts LATER than scan request! Possible data loss if obsolete deltas contained the prefix.\n");
+      }
+      // 收集需要清理的旧文件 + 精确计算每个被废弃文件中未被 PM 输出覆盖的行范围
+      // [DIAG_PM_LOST_ROWS]: PM_output=[segment_first_key, segment_last_key]
+      //   若某个 obsolete 文件的范围超出 PM output，超出部分行将永久丢失。
+      auto check_data_loss = [&](const std::string& file_first, const std::string& file_last,
+                                  uint64_t file_no, const char* file_type) {
+        const Slice pm_first_user = ExtractUserKey(Slice(segment_first_key));
+        const Slice pm_last_user  = ExtractUserKey(Slice(segment_last_key));
+        const Slice f_first_user  = ExtractUserKey(Slice(file_first));
+        const Slice f_last_user   = ExtractUserKey(Slice(file_last));
+        bool prefix_lost = icmp.user_comparator()->Compare(f_first_user, pm_first_user) < 0;
+        bool suffix_lost = icmp.user_comparator()->Compare(f_last_user,  pm_last_user)  > 0;
+        if (prefix_lost) {
+          DiagLogf("[DIAG_PM_LOST_ROWS] CUID %lu: %s file=%lu range=[%s-%s] "
+                   "PM_output=[%s-%s] → PREFIX [%s ~ %s] NOT IN PM OUTPUT → PERMANENT DATA LOSS!\n",
+                   (unsigned long)task.cuid, file_type, file_no,
+                   FormatKeyDisplay(file_first).c_str(), FormatKeyDisplay(file_last).c_str(),
+                   FormatKeyDisplay(segment_first_key).c_str(), FormatKeyDisplay(segment_last_key).c_str(),
+                   FormatKeyDisplay(file_first).c_str(), FormatKeyDisplay(segment_first_key).c_str());
+        }
+        if (suffix_lost) {
+          DiagLogf("[DIAG_PM_LOST_ROWS] CUID %lu: %s file=%lu range=[%s-%s] "
+                   "PM_output=[%s-%s] → SUFFIX [%s ~ %s] NOT IN PM OUTPUT → PERMANENT DATA LOSS!\n",
+                   (unsigned long)task.cuid, file_type, file_no,
+                   FormatKeyDisplay(file_first).c_str(), FormatKeyDisplay(file_last).c_str(),
+                   FormatKeyDisplay(segment_first_key).c_str(), FormatKeyDisplay(segment_last_key).c_str(),
+                   FormatKeyDisplay(segment_last_key).c_str(), FormatKeyDisplay(file_last).c_str());
+        }
+      };
+
+      std::vector<DataSegment> obsolete_segments;
+      for (const auto& seg : overlapping_snaps) {
+        if (seg.file_number != static_cast<uint64_t>(-1)) {
+          check_data_loss(seg.first_key, seg.last_key, seg.file_number, "snap");
+          // snap segment 的 file_number 也加入，但 step⑤ 匹配的是 entry.deltas，
+          // snapshot segments 在步骤③中已被替换，这里加入不会匹配到任何 delta（无害）。
+        }
+      }
+      for (const auto& seg : overlapping_deltas) {
+        // [DIAG] 检测 delta range 是否超出 PM scan range（若超出，标记 obsolete 后
+        // L0 Compaction 会跳过该文件中该 CUID 的所有数据，包括 PM 未吸收的部分）
+        Slice delta_first_user = ExtractUserKey(Slice(seg.first_key));
+        Slice delta_last_user  = ExtractUserKey(Slice(seg.last_key));
+        Slice scan_first_user  = ExtractUserKey(Slice(task.scan_first_key));
+        Slice scan_last_user   = ExtractUserKey(Slice(task.scan_last_key));
+        bool extends_before = icmp.user_comparator()->Compare(delta_first_user, scan_first_user) < 0;
+        bool extends_after  = icmp.user_comparator()->Compare(delta_last_user, scan_last_user) > 0;
+        // 检查该 file 在 overlapping_deltas 中是否只有一个段（单段文件）。
+        // 若是多段文件（同 file_number 在 entry.deltas 中还有其他段未被 PM 吸收），
+        // Plan C 的 IsDeltaObsolete 保守检查会阻止 L0 Compaction 跳过，不会发生数据丢失。
+        bool is_multipart_file = false;
+        for (const auto& other : overlapping_deltas) {
+          // 同 file_number 不同段 → 多段（不可能出现在 overlapping_deltas 因为段不同）
+          (void)other; // overlapping_deltas 每个段唯一
+        }
+        // 真正区分：检查 _dump.deltas 中该 file_number 出现次数 > 1 则为多段
+        {
+          HotIndexEntry _chk;
+          hotspot_manager_->GetIndexTable().GetEntry(task.cuid, &_chk);
+          int active_count = 0;
+          for (const auto& d : _chk.deltas) {
+            if (d.file_number == seg.file_number) active_count++;
+          }
+          // overlapping_deltas 中本次传入一段，若 active_count > 1 则还有其他活跃段
+          is_multipart_file = (active_count > 1);
+        }
+        if (extends_before || extends_after) {
+          if (is_multipart_file) {
+            DiagLogf("[DIAG_PM_OBSOLETE_OVERFLOW] CUID %lu: delta file=%lu "
+                "range=[%s - %s] EXTENDS BEYOND scan range=[%s - %s] "
+                "(before=%d after=%d). "
+                "[Plan C: file has other active segments → IsDeltaObsolete will return false → L0 will NOT skip]\n",
+                (unsigned long)task.cuid, (unsigned long)seg.file_number,
+                FormatKeyDisplay(seg.first_key).c_str(),
+                FormatKeyDisplay(seg.last_key).c_str(),
+                FormatKeyDisplay(task.scan_first_key).c_str(),
+                FormatKeyDisplay(task.scan_last_key).c_str(),
+                (int)extends_before, (int)extends_after);
+          } else {
+            DiagLogf("[DIAG_PM_OBSOLETE_OVERFLOW] CUID %lu: delta file=%lu "
+                "range=[%s - %s] EXTENDS BEYOND scan range=[%s - %s] "
+                "(before=%d after=%d). "
+                "[SINGLE-SEGMENT FILE: marking obsolete WILL cause L0 to skip extension rows → DATA LOSS RISK!]\n",
+                (unsigned long)task.cuid, (unsigned long)seg.file_number,
+                FormatKeyDisplay(seg.first_key).c_str(),
+                FormatKeyDisplay(seg.last_key).c_str(),
+                FormatKeyDisplay(task.scan_first_key).c_str(),
+                FormatKeyDisplay(task.scan_last_key).c_str(),
+                (int)extends_before, (int)extends_after);
+          }
+        }
+        // check_data_loss 对单段文件仍然有效（超出部分将因 L0 skip 而永久丢失）。
+        // 对多段文件（is_multipart_file=true），Plan C 阻止 L0 skip，不会真正丢失，但也记录以便追踪。
+        if (is_multipart_file) {
+          // 多段文件：Plan C 保护，不会 skip，DIAG_PM_LOST_ROWS 标注说明
+          Slice dlf = ExtractUserKey(Slice(seg.first_key));
+          Slice dll = ExtractUserKey(Slice(seg.last_key));
+          Slice pmf = ExtractUserKey(Slice(segment_first_key));
+          Slice pml = ExtractUserKey(Slice(segment_last_key));
+          bool pf = icmp.user_comparator()->Compare(dlf, pmf) < 0;
+          bool sf = icmp.user_comparator()->Compare(dll, pml) > 0;
+          if (pf || sf) {
+            DiagLogf("[DIAG_PM_LOST_ROWS] CUID %lu: delta file=%lu range=[%s-%s] "
+                     "PM_output=[%s-%s] → extension outside PM output "
+                     "[Plan C PROTECTED: file has active segments → L0 will NOT skip → NOT actually lost]\n",
+                     (unsigned long)task.cuid, (unsigned long)seg.file_number,
+                     FormatKeyDisplay(seg.first_key).c_str(),
+                     FormatKeyDisplay(seg.last_key).c_str(),
+                     FormatKeyDisplay(segment_first_key).c_str(),
+                     FormatKeyDisplay(segment_last_key).c_str());
+          }
+        } else {
+          check_data_loss(seg.first_key, seg.last_key, seg.file_number, "delta");
+        }
+        obsolete_segments.push_back(seg);
+      }
+
+      // ① 取出当前 pm_pending SSTs【过程中 flush 但未被 PromoteSnapshot 消费的 SST】
+      auto pm_sst_segs = hotspot_manager_->SwapOutPmPending(task.cuid);
+
+      // ① 取出 pm_promoted SSTs【过程中 flush 且已被 PromoteSnapshot 正确放入 snapshot 的 SST】
+      // AtomicReplace 步骤① 需要保留这些 SST，不能将其移除。
+      auto pm_promoted_segs = hotspot_manager_->SwapOutPmPromoted(task.cuid);
+
+      // ② 查询 buffer 中该 CUID 当前的数据范围
+      std::string buf_min, buf_max;
+      bool has_buf_data = hotspot_manager_->GetBufferBoundaryKeys(
+          task.cuid, &buf_min, &buf_max);
+
+      // ③ 原子替换 snapshot
+      hotspot_manager_->GetIndexTable().AtomicReplaceForPartialMerge(
+          task.cuid,
+          segment_first_key, segment_last_key,
+          pm_sst_segs,
+          pm_promoted_segs,
+          has_buf_data, buf_min, buf_max,
+          obsolete_segments);
+
+      // ④ -1 段已建立（若 has_buf_data），处理步骤 ①~③ 期间
+      //    积累在 pm_pending[cuid] 的新跨线程 flush SST。
+      //    FinalizePmPendingSnapshots 会通过 PromoteSnapshot 找到 -1 段替换，
+      //    并在最后 erase pm_pending[cuid] entry
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
+
+      // ⑤ 检查 buffer 当前活跃数据量是否真正超过 flush 阈值。
+      //    使用原子读取 total_active_size_，反映此刻实际状态，
+      //    避免 trigger_flush=true 但 buffer 实际已空或低于阈值的误触发。
+      if (hotspot_manager_->BufferExceedsThreshold()) {
+        hotspot_manager_->TriggerBufferFlush("PartialMerge", task.cuid);
+      }
+
+      ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                     "[DBImpl] PartialMerge completed for CUID %" PRIu64
+                     ": merged %zu entries into HotDataBuffer (SV:%p)",
+                     task.cuid, written_count, sv);
+    } else {
+      // written_count==0：归并有overlapping数据却无输出（异常状态）。
+      // 无 -1 段建立，FinalizePmPendingSnapshots 会顷 AppendSnapshotSegment 兜底。
+      DiagLogf("[DIAG][PartialMerge] CUID %lu: written_count=0 after merge "
+              "with overlapping data. This is unexpected.\n",
+              (unsigned long)task.cuid);
+      hotspot_manager_->FinalizePmPendingSnapshots(task.cuid);
+    }
+    hotspot_manager_->UnlockCuid(task.cuid);
+  }
+
+  ReturnAndCleanupSuperVersion(cfd, sv);
+}
+
+void DBImpl::NotifyDeltaBGWork() {
+  InstrumentedMutexLock l(&mutex_);
+  MaybeScheduleDeltaWork();
+}
+
+void DBImpl::BGWorkDelta(void* arg) {
+  DBImpl* db = reinterpret_cast<DBImpl*>(arg);
+  db->BackgroundDeltaWork();
+}
+
+void DBImpl::MaybeScheduleDeltaWork() {
+  mutex_.AssertHeld();
+  
+  if (shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+  // 允许多个后台线程并发处理 delta 任务，使用系统的 LOW 优先级线程池
+  int max_delta_threads = 1;
+  auto* cfd = versions_->GetColumnFamilySet()->GetDefault();
+  if (cfd != nullptr) {
+    max_delta_threads = cfd->GetLatestMutableCFOptions().delta_options.max_delta_threads;
+  }
+  if (max_delta_threads <= 0) max_delta_threads = 1;
+  if (bg_delta_scheduled_ >= max_delta_threads) {
+    return;
+  }
+  
+  bool has_work = hotspot_manager_ &&
+                  (hotspot_manager_->HasPendingInitCuids() ||
+                   hotspot_manager_->HasPendingMetadataScans() ||
+                   hotspot_manager_->HasPendingPartialMerge());
+
+  if (has_work) {
+    bg_delta_scheduled_++;
+    env_->Schedule(&DBImpl::BGWorkDelta, this, Env::Priority::LOW, nullptr);
+  }
+}
+
+void DBImpl::BackgroundDeltaWork() {
+  TEST_SYNC_POINT("DBImpl::BackgroundDeltaWork:Start");
+  
+  if (hotspot_manager_) {
+    hotspot_manager_->CompactAndFlushGDCTLogIfNeeded();
+    
+    ProcessPendingHotCuids();
+    ProcessPendingMetadataScans();
+    ProcessPendingPartialMerge();
+  }
+  // 任务完成后，减少计数，并检查是否还有积压的任务需要调度
+  {
+    InstrumentedMutexLock l(&mutex_);
+    bg_delta_scheduled_--;
+    if (bg_delta_scheduled_ == 0) {
+      bg_cv_.SignalAll();
+    }
+    MaybeScheduleDeltaWork();
   }
 }
 

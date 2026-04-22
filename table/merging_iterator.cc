@@ -680,6 +680,14 @@ class MergingIterator : public InternalIterator {
   // position. Iterator should still be valid.
   void SwitchToBackward();
 
+  // for delta physical
+  uint64_t GetPhysicalId() override {
+    if (current_ && current_->iter()) {
+      return current_->iter()->GetPhysicalId();
+    }
+    return 0;
+  }
+
   IteratorWrapper* CurrentForward() const {
     assert(direction_ == kForward);
     assert(minHeap_.empty() ||

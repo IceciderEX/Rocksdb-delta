@@ -184,7 +184,8 @@ struct MutableCFOptions {
         uncache_aggressiveness(options.uncache_aggressiveness),
         memtable_op_scan_flush_trigger(options.memtable_op_scan_flush_trigger),
         memtable_avg_op_scan_flush_trigger(
-            options.memtable_avg_op_scan_flush_trigger) {
+            options.memtable_avg_op_scan_flush_trigger),
+        delta_options(options.delta_options) {
     RefreshDerivedOptions(options.num_levels, options.compaction_style);
   }
 
@@ -356,6 +357,9 @@ struct MutableCFOptions {
   uint32_t uncache_aggressiveness;
   uint32_t memtable_op_scan_flush_trigger;
   uint32_t memtable_avg_op_scan_flush_trigger;
+
+  // for delta
+  DeltaOptions delta_options;
 
   // Derived options
   // Per-level target file size.

@@ -75,7 +75,10 @@ Status BuildTable(
     Env::WriteLifeTimeHint write_hint, const std::string* full_history_ts_low,
     BlobFileCompletionCallback* blob_callback, Version* version,
     uint64_t* memtable_payload_bytes, uint64_t* memtable_garbage_bytes,
-    InternalStats::CompactionStats* flush_stats) {
+    InternalStats::CompactionStats* flush_stats,
+    // for delta
+    std::unordered_map<uint64_t, DataSegment>* output_segments,
+    HotspotManager* hotspot_manager) {
   assert((tboptions.column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          tboptions.column_family_name.empty());
@@ -212,6 +215,12 @@ Status BuildTable(
     SequenceNumber smallest_preferred_seqno = kMaxSequenceNumber;
     std::string key_after_flush_buf;
     std::string value_buf;
+
+    // for delta
+    uint64_t current_cuid = 0;
+    std::string current_first_key;
+    std::string current_last_key;
+
     c_iter.SeekToFirst();
     for (; c_iter.Valid(); c_iter.Next()) {
       const Slice& key = c_iter.key();
@@ -250,6 +259,28 @@ Status BuildTable(
       if (!s.ok()) {
         break;
       }
+      
+      // for delta
+      if (hotspot_manager && output_segments) {
+        uint64_t cuid = hotspot_manager->ExtractCUID(key);
+        
+        if (cuid != current_cuid) {
+          // end last Segment
+          if (cuid != 0) {
+            DataSegment& seg = (*output_segments)[cuid];
+            seg.file_number = meta->fd.GetNumber();
+            seg.first_key = key_after_flush.ToString(); // 记录 First Key
+            seg.last_key = seg.first_key;               // 初始化 Last Key
+          } 
+          current_cuid = cuid;
+        } else {
+          // same CUID，更新 Last Key
+          if (current_cuid != 0) {
+             (*output_segments)[current_cuid].last_key = key_after_flush.ToString();
+          }
+        }
+      }
+
       builder->Add(key_after_flush, value_after_flush);
 
       if (flush_stats) {
@@ -273,6 +304,7 @@ Status BuildTable(
             ThreadStatus::FLUSH_BYTES_WRITTEN, IOSTATS(bytes_written));
       }
     }
+    
     if (!s.ok()) {
       c_iter.status().PermitUncheckedError();
     } else if (!c_iter.status().ok()) {

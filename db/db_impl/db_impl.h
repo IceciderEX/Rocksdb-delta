@@ -9,14 +9,17 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <limits>
 #include <list>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -47,6 +50,9 @@
 #include "db/wal_manager.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
+#include "delta/hot_data_buffer.h"
+#include "delta/hot_index_table.h"
+#include "delta/hotspot_manager.h"
 #include "logging/event_logger.h"
 #include "memtable/wbwi_memtable.h"
 #include "monitoring/instrumented_mutex.h"
@@ -722,7 +728,8 @@ class DBImpl : public DB {
                                       SuperVersion* sv, SequenceNumber snapshot,
                                       ReadCallback* read_callback,
                                       bool expose_blob_index = false,
-                                      bool allow_refresh = true);
+                                      bool allow_refresh = true,
+                                      std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
 
   virtual SequenceNumber GetLastPublishedSequence() const {
     if (last_seq_same_as_publish_seq_) {
@@ -2471,6 +2478,7 @@ class DBImpl : public DB {
   static void BGWorkPurge(void* arg);
   static void UnscheduleCompactionCallback(void* arg);
   static void UnscheduleFlushCallback(void* arg);
+
   void BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                 Env::Priority thread_pri);
   void BackgroundCallFlush(Env::Priority thread_pri);
@@ -3196,6 +3204,25 @@ class DBImpl : public DB {
   // The number of LockWAL called without matching UnlockWAL call.
   // See also lock_wal_write_token_
   uint32_t lock_wal_count_ = 0;
+
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+  
+  // Delta background work [TO ROCKSDB Env]
+  int bg_delta_scheduled_ = 0;
+  static void BGWorkDelta(void* arg);
+  void BackgroundDeltaWork();
+  void MaybeScheduleDeltaWork();
+  void InitializeHotspotManager(const Options& options);
+
+ public:
+  std::shared_ptr<HotspotManager> GetHotspotManager() { return hotspot_manager_; }
+  // Wake up delta background thread to drain pending tasks
+  void NotifyDeltaBGWork();
+
+  void ProcessPendingHotCuids();
+  void ProcessPendingMetadataScans();
+  void ProcessPendingPartialMerge();
 };
 
 class GetWithTimestampReadCallback : public ReadCallback {

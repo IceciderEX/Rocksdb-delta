@@ -15,6 +15,8 @@
 #include "db/snapshot_checker.h"
 #include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
+#include "delta/hotspot_manager.h"
+#include "delta/diag_log.h"
 #include "logging/logging.h"
 #include "port/likely.h"
 #include "rocksdb/listener.h"
@@ -38,7 +40,9 @@ CompactionIterator::CompactionIterator(
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
-    std::optional<SequenceNumber> preserve_seqno_min)
+    std::optional<SequenceNumber> preserve_seqno_min,
+    std::shared_ptr<HotspotManager> hotspot_manager,
+    std::vector<uint64_t> input_file_numbers)
     : CompactionIterator(
           input, cmp, merge_helper, last_sequence, snapshots, earliest_snapshot,
           earliest_write_conflict_snapshot, job_snapshot, snapshot_checker, env,
@@ -47,7 +51,8 @@ CompactionIterator::CompactionIterator(
           manual_compaction_canceled,
           compaction ? std::make_unique<RealCompaction>(compaction) : nullptr,
           must_count_input_entries, compaction_filter, shutting_down, info_log,
-          full_history_ts_low, preserve_seqno_min) {}
+          full_history_ts_low, preserve_seqno_min,
+          hotspot_manager, input_file_numbers) {}
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
@@ -65,7 +70,9 @@ CompactionIterator::CompactionIterator(
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
-    std::optional<SequenceNumber> preserve_seqno_min)
+    std::optional<SequenceNumber> preserve_seqno_min,
+    std::shared_ptr<HotspotManager> hotspot_manager,
+    std::vector<uint64_t> input_file_numbers)
     : input_(input, cmp, must_count_input_entries),
       cmp_(cmp),
       merge_helper_(merge_helper),
@@ -104,7 +111,11 @@ CompactionIterator::CompactionIterator(
       current_key_committed_(false),
       cmp_with_history_ts_low_(0),
       level_(compaction_ == nullptr ? 0 : compaction_->level()),
-      preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)) {
+      preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)),
+      hotspot_manager_(hotspot_manager), // for delta new Init
+      current_cuid_(0),
+      skip_current_cuid_(false),
+      input_file_numbers_(std::move(input_file_numbers)) {
   assert(snapshots_ != nullptr);
   assert(preserve_seqno_after_ <= earliest_snapshot_);
 
@@ -447,12 +458,103 @@ bool CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
   return true;
 }
 
+// for delta
+void CompactionIterator::CheckHotspotFilters() {
+  if (!hotspot_manager_) return;
+
+  // 1. 提取当前 Key 的 CUID
+  uint64_t cuid = hotspot_manager_->ExtractCUID(input_.key());
+  uint64_t file_id = input_file_number();
+
+  // 文件编号进行了改变或 CUID 改变，重新评估是否需要跳过
+  if (cuid != current_cuid_ || file_id != current_file_number_) {
+    // [FIX] 检测 gap：之前 (current_cuid_, *) 正在被 skip，现在来了同 cuid 的新有效 key。
+    // 说明中间有 obsolete file 被整体跳过，输出数据出现了 gap，需要截断当前 segment。
+    if (skip_current_cuid_ && cuid == current_cuid_) {
+      cuid_gap_after_skip_ = cuid;
+    }
+
+    // [DIAG] 同一 CUID 切换文件时，若上一个文件是 valid（未 skip），
+    // ConsumeSkipGap 不会产生 gap 信号。若两个 valid 文件之间存在数据空隙
+    // （前序 compaction 已清除中间数据），该 gap 将无法被检测到。
+    if (cuid == current_cuid_ && !skip_current_cuid_ && current_file_number_ != 0) {
+      // DiagLogf("[DIAG_COMPACTION_FILE_SWITCH] CUID %lu: valid file %lu -> file %lu "
+      //         "(no skip signal, potential undetectable gap)\n",
+      //         cuid, current_file_number_, file_id);
+    }
+
+    // 记录涉及到的物理输入文件
+    if (input_map_ && cuid != 0) {
+      if (file_id != 0) {
+        (*input_map_)[cuid].insert(file_id);
+      }
+    }
+    
+    current_cuid_ = cuid;
+    current_file_number_ = file_id;
+    skip_current_cuid_ = false;
+
+    if (cuid != 0) {
+      // c)
+      // 当读取到某个CUid的数据时，检查全局CUid删除计数表，若该CUid已被标记为删除，
+      // 则直接跳过该段数据，不写入新文件，并减去一次该CUid在计数表中的引用计数
+      // update：MVCC 如果该 CUID 的逻辑删除早于系统当前最老的快照再标记删除？
+      if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid, earliest_snapshot_)) {
+        skip_current_cuid_ = true;
+        DiagLogf("[DIAG_COMPACTION_SKIP] CUID %lu: file=%lu skipped"
+                " (CUID marked deleted)\n",
+                cuid, file_id);
+      } 
+      // d) 检查热点索引表（仅判断当前文件 id）
+      // 若遇到热点CUid，检查其热点索引表，若发现Deltas列表中对应的该段数据已被标记为
+      // Obsolete， 则直接跳过该段数据，并删除对应的Deltas记录。
+      else if (hotspot_manager_->IsHot(cuid)) {
+        if (hotspot_manager_->ShouldSkipObsoleteDelta(cuid, std::vector<uint64_t>{file_id})) {
+          skip_current_cuid_ = true;
+          // 打印首条被跳过 key 的信息，便于与 DIAG_COMPACTION_SPARSE 交叉验证
+          Slice skip_key = input_.key();
+          uint64_t skip_rid = 0;
+          std::string skip_key_hex;
+          if (skip_key.size() >= 34) {
+            std::string rid_str = skip_key.ToString().substr(24, 10);
+            try { skip_rid = std::stoull(rid_str); } catch (...) {}
+            // 输出 bytes 16-34 (CUID + row_id) 的 hex 表示，用于验证 rid 提取是否正确
+            const unsigned char* kd = reinterpret_cast<const unsigned char*>(skip_key.data());
+            char hex_buf[64];
+            snprintf(hex_buf, sizeof(hex_buf),
+                     "%02x%02x%02x%02x%02x%02x%02x%02x|%s",
+                     kd[16], kd[17], kd[18], kd[19], kd[20], kd[21], kd[22], kd[23],
+                     rid_str.c_str());
+            skip_key_hex = hex_buf;
+          }
+          DiagLogf("[DIAG_COMPACTION_SKIP] CUID %lu: file=%lu skipped"
+                  " (obsolete delta), first_skipped_rid=%lu key_hex=[%s]\n",
+                  cuid, file_id, skip_rid, skip_key_hex.c_str());
+        }
+      }
+    }
+  }
+}
+
 void CompactionIterator::NextFromInput() {
   at_next_ = false;
   validity_info_.Invalidate();
 
   while (!Valid() && input_.Valid() && !IsPausingManualCompaction() &&
          !IsShuttingDown()) {
+    
+    // for delta
+    if (hotspot_manager_) { // 防止 flush 调用这个函数导致问题
+        CheckHotspotFilters();
+        // 当前 cuid 是否跳过
+        if (skip_current_cuid_) {
+            iter_stats_.num_record_drop_obsolete++;    
+            // 直接跳过当前 Key
+            input_.Next();
+            continue; 
+        }
+    }
+
     key_ = input_.key();
     value_ = input_.value();
     blob_value_.Reset();

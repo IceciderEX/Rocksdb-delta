@@ -58,6 +58,60 @@ class InternalKeyComparator;
 class WalFilter;
 class FileSystem;
 class UserDefinedIndexFactory;
+// for delta
+struct DeltaOptions {
+  // Hotness Detection
+  uint64_t hotspot_scan_threshold = 200;
+  uint64_t hotspot_scan_window_sec = 600;
+
+  // Delta Merging & SAC
+  uint32_t delta_merge_threshold = 3;
+  uint32_t sac_delta_count_threshold = 5;
+
+  // Data Buffering
+  size_t hot_data_buffer_threshold_bytes = 1048576;  // 1MB
+  uint32_t hot_data_buffer_shards = 32;
+
+  // GDCT Log Persistence
+  uint64_t gdct_log_compact_size = 33554432;           // 32MB
+  uint32_t gdct_flush_threshold_records = 15;
+  uint64_t gdct_flush_interval_us = 30000000;          // 30s
+  uint64_t gdct_compact_interval_us = 600000000;       // 600s
+
+  // Compaction Picker (Mixed L0)
+  int compaction_l0_trigger_count = 10;
+  uint64_t compaction_l0_trigger_age_sec = 3600;
+  size_t compaction_l0_files_to_pick = 5;
+
+  // Global Concurrency/Sharding (Default for GDCT/HotIndex/ScanFreq)
+  uint32_t sharding_count = 128;
+  
+  // Background threads for Delta workloads
+  int max_delta_threads = 1;
+
+  bool operator==(const DeltaOptions& other) const {
+    return hotspot_scan_threshold == other.hotspot_scan_threshold &&
+           hotspot_scan_window_sec == other.hotspot_scan_window_sec &&
+           delta_merge_threshold == other.delta_merge_threshold &&
+           sac_delta_count_threshold == other.sac_delta_count_threshold &&
+           hot_data_buffer_threshold_bytes ==
+               other.hot_data_buffer_threshold_bytes &&
+           hot_data_buffer_shards == other.hot_data_buffer_shards &&
+           gdct_log_compact_size == other.gdct_log_compact_size &&
+           gdct_flush_threshold_records == other.gdct_flush_threshold_records &&
+           gdct_flush_interval_us == other.gdct_flush_interval_us &&
+           gdct_compact_interval_us == other.gdct_compact_interval_us &&
+           compaction_l0_trigger_count == other.compaction_l0_trigger_count &&
+           compaction_l0_trigger_age_sec == other.compaction_l0_trigger_age_sec &&
+           compaction_l0_files_to_pick == other.compaction_l0_files_to_pick &&
+           max_delta_threads == other.max_delta_threads &&
+           sharding_count == other.sharding_count;
+  }
+
+  bool operator!=(const DeltaOptions& other) const { return !(*this == other); }
+};
+
+class HotspotManager;
 
 struct Options;
 struct DbPath;
@@ -404,6 +458,9 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Once validated in production, the default will likely change to something
   // around 300.
   uint32_t uncache_aggressiveness = 0;
+
+  // for delta
+  DeltaOptions delta_options;
 
   // Create ColumnFamilyOptions with default values for all fields
   ColumnFamilyOptions();
@@ -1726,6 +1783,10 @@ struct DBOptions {
   CompactionStyleSet calculate_sst_write_lifetime_hint_set = {
       CompactionStyle::kCompactionStyleLevel};
   // End EXPERIMENTAL
+
+  // for delta
+  bool enable_delta = true;
+  std::shared_ptr<HotspotManager> hotspot_manager = nullptr;
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
@@ -2267,6 +2328,15 @@ struct ReadOptions {
   const std::string* request_id = nullptr;
 
   // *** END per-request settings for internal team use only ***
+
+  // for delta
+  bool delta_full_scan = false;
+  // 跳过热点路径，直接读取冷数据
+  bool skip_hot_path = false;
+  // 用于标记是否为系统后台触发的 Metadata Scan，如果是，则不执行缓冲和替换
+  bool is_metadata_scan = false;
+  // 启用热数据路径的诊断日志（如段切换、计数等），仅用于调试
+  bool enable_delta_diag_logging = false;
 
   ReadOptions() {}
   ReadOptions(bool _verify_checksums, bool _fill_cache);

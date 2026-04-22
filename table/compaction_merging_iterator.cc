@@ -158,6 +158,11 @@ class CompactionMergingIterator : public InternalIterator {
     return false;
   }
 
+  // for delta
+  uint64_t GetPhysicalId() override {
+    return current_->iter.GetPhysicalId();
+  }
+
  private:
   struct HeapItem {
     HeapItem() = default;
