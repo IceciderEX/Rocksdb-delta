@@ -6980,7 +6980,7 @@ void DBImpl::ProcessPendingHotCuids() {
 
   // 获取待处理的 CUID 列表 (按批次获取)
   std::vector<PendingRangeScanTask> pending_tasks =
-      hotspot_manager_->PopPendingInitCuids(32);
+      hotspot_manager_->PopPendingInitCuids(8);
   if (pending_tasks.empty()) {
     return;
   }
@@ -7037,7 +7037,7 @@ void DBImpl::ProcessPendingMetadataScans() {
   }
 
   std::vector<PendingRangeScanTask> pending_tasks =
-      hotspot_manager_->PopPendingMetadataScans(32);
+      hotspot_manager_->PopPendingMetadataScans(8);
   if (pending_tasks.empty()) {
     return;
   }
@@ -7150,7 +7150,7 @@ void DBImpl::ProcessPendingPartialMerge() {
   MutableCFOptions mutable_cf_opts = cfd->GetLatestMutableCFOptions();
 
   // 批量处理，减少 Ref/Unref 开销
-  const int kBatchSize = 32;
+  const int kBatchSize = 4;
   int processed_count = 0;
 
   while (processed_count < kBatchSize) {
@@ -7160,12 +7160,45 @@ void DBImpl::ProcessPendingPartialMerge() {
     }
 
     processed_count++;
+    const std::string pm_lower_user =
+        ExtractUserKey(Slice(task.scan_first_key)).ToString();
+    std::string pm_upper_user =
+        ExtractUserKey(Slice(task.scan_last_key)).ToString();
+    pm_upper_user.push_back('\0');
+    const Slice pm_lower_slice(pm_lower_user);
+    const Slice pm_upper_slice(pm_upper_user);
+    read_opts.iterate_lower_bound = &pm_lower_slice;
+    read_opts.iterate_upper_bound = &pm_upper_slice;
 
     // 获取重叠的 segments
     std::vector<DataSegment> overlapping_snaps, overlapping_deltas;
     hotspot_manager_->GetIndexTable().GetOverlappingSegments(
         task.cuid, task.scan_first_key, task.scan_last_key, &overlapping_snaps,
         &overlapping_deltas);
+    std::vector<DataSegment> merge_snaps = overlapping_snaps;
+    std::vector<DataSegment> merge_deltas = overlapping_deltas;
+    auto clip_segments_to_scan_range = [&](std::vector<DataSegment>* segments) {
+      if (segments == nullptr) {
+        return;
+      }
+      for (auto& seg : *segments) {
+        if (icmp.Compare(seg.first_key, task.scan_first_key) < 0) {
+          seg.first_key = task.scan_first_key;
+        }
+        if (icmp.Compare(seg.last_key, task.scan_last_key) > 0) {
+          seg.last_key = task.scan_last_key;
+        }
+      }
+      segments->erase(
+          std::remove_if(
+              segments->begin(), segments->end(),
+              [&](const DataSegment& seg) {
+                return icmp.Compare(seg.first_key, seg.last_key) > 0;
+              }),
+          segments->end());
+    };
+    clip_segments_to_scan_range(&merge_snaps);
+    clip_segments_to_scan_range(&merge_deltas);
 
     // [DIAG_PM_RANGE] 简化版：仅输出 scan range 和 overlap 计数
     DiagLogf("[DIAG_PM_RANGE] CUID %lu: scan=[%s - %s] "
@@ -7227,18 +7260,18 @@ void DBImpl::ProcessPendingPartialMerge() {
     std::vector<InternalIterator*> children;
 
     // 1. Snapshot Iterator
-    if (!overlapping_snaps.empty()) {
+    if (!merge_snaps.empty()) {
       InternalIterator* snap_iter = new HotSnapshotIterator(
-          overlapping_snaps, task.cuid, hotspot_manager_.get(),
+          merge_snaps, task.cuid, hotspot_manager_.get(),
           cfd->table_cache(), read_opts, file_opts, icmp, mutable_cf_opts,
           hotspot_manager_->GetLifecycleManager());
       children.push_back(snap_iter);
     }
 
     // 2. Delta Iterator
-    if (!overlapping_deltas.empty()) {
+    if (!merge_deltas.empty()) {
       InternalIterator* delta_iter = new HotDeltaIterator(
-          overlapping_deltas, task.cuid, cfd->table_cache(), read_opts,
+          merge_deltas, task.cuid, cfd->table_cache(), read_opts,
           file_opts, icmp, mutable_cf_opts, false);
       children.push_back(delta_iter);
     }
@@ -7326,7 +7359,7 @@ void DBImpl::ProcessPendingPartialMerge() {
       } else {
         // Check if from snapshot or delta
         bool from_snap = false;
-        for (const auto& seg : overlapping_snaps) {
+        for (const auto& seg : merge_snaps) {
           if (seg.file_number == phys_id) { from_snap = true; break; }
         }
         if (from_snap) src_snapshot_count++;

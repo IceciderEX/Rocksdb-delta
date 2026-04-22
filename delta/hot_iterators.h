@@ -48,6 +48,7 @@ class HotDeltaIterator : public InternalIterator {
   // [seg0_lower, seg0_upper, seg1_lower, seg1_upper, ...]
   std::vector<std::string> bounds_storage_;
   std::vector<Slice> bounds_slices_;
+  std::vector<std::string> lower_bound_internal_storage_;
   // all ReadOptions (BlockBasedTableIterator
   std::vector<ReadOptions> read_options_storage_;
   uint64_t cuid_;

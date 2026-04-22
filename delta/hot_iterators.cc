@@ -5,6 +5,7 @@
 #include <chrono>
 #include <sstream>
 
+#include "db/dbformat.h"
 #include "rocksdb/env.h"
 #include "logging/logging.h"
 
@@ -48,6 +49,34 @@ void UnrefPhysicalSegments(
     if (seg.file_number != static_cast<uint64_t>(-1)) {
       lifecycle_manager->Unref(seg.file_number);
     }
+  }
+}
+
+std::string MakeMinInternalKeyForUser(const Slice& user_key) {
+  InternalKey ikey;
+  ikey.SetMinPossibleForUserKey(user_key);
+  return ikey.Encode().ToString();
+}
+
+void BuildEffectiveUserBounds(const InternalKeyComparator& icmp,
+                              const DataSegment& seg,
+                              const Slice* request_lower_user,
+                              const Slice* request_upper_user,
+                              std::string* lower_user,
+                              std::string* upper_user_exclusive) {
+  *lower_user = ExtractUserKey(seg.first_key).ToString();
+  if (request_lower_user != nullptr &&
+      icmp.user_comparator()->Compare(*request_lower_user,
+                                      Slice(*lower_user)) > 0) {
+    *lower_user = request_lower_user->ToString();
+  }
+
+  *upper_user_exclusive = ExtractUserKey(seg.last_key).ToString();
+  upper_user_exclusive->push_back('\0');
+  if (request_upper_user != nullptr &&
+      icmp.user_comparator()->Compare(*request_upper_user,
+                                      Slice(*upper_user_exclusive)) < 0) {
+    *upper_user_exclusive = request_upper_user->ToString();
   }
 }
 
@@ -280,6 +309,7 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
 
   bounds_storage_.reserve(deltas_.size() * 2);
   bounds_slices_.reserve(deltas_.size() * 2);
+  lower_bound_internal_storage_.reserve(deltas_.size());
   read_options_storage_.reserve(deltas_.size());
 
   std::vector<InternalIterator*> children;
@@ -287,10 +317,16 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
 
   // slices for bounds
   for (const auto& delta : deltas_) {
-    bounds_storage_.push_back(ExtractUserKey(delta.first_key).ToString());
-    std::string upper = ExtractUserKey(delta.last_key).ToString();
-    upper.push_back('\0');  // Make it an exclusive bound
-    bounds_storage_.push_back(upper);
+    std::string lower_user;
+    std::string upper_user_exclusive;
+    BuildEffectiveUserBounds(icmp, delta, read_options.iterate_lower_bound,
+                             read_options.iterate_upper_bound, &lower_user,
+                             &upper_user_exclusive);
+    bounds_storage_.push_back(std::move(lower_user));
+    bounds_storage_.push_back(std::move(upper_user_exclusive));
+    lower_bound_internal_storage_.push_back(
+        MakeMinInternalKeyForUser(
+            Slice(bounds_storage_[bounds_storage_.size() - 2])));
   }
   for (size_t i = 0; i < bounds_storage_.size(); ++i) {
     bounds_slices_.emplace_back(bounds_storage_[i]);
@@ -315,7 +351,8 @@ HotDeltaIterator::HotDeltaIterator(const std::vector<DataSegment>& deltas,
         0, nullptr, nullptr, allow_unprepared_value, nullptr, nullptr);
 
     if (iter) {
-      children.push_back(new LowerBoundedSSTIterator(iter, delta.first_key));
+      children.push_back(new LowerBoundedSSTIterator(
+          iter, lower_bound_internal_storage_[i]));
     }
   }
 
@@ -543,13 +580,31 @@ HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
     // Case A: 内存 Buffer fileid -1
     InternalIterator* mem_iter =
         hotspot_manager_->NewBufferIterator(cuid_, &icmp_);
+    std::string mem_lower_bound = seg.first_key;
+    std::string mem_upper_bound = seg.last_key;
+    if (read_options_.iterate_lower_bound != nullptr &&
+        icmp_.user_comparator()->Compare(
+            *read_options_.iterate_lower_bound,
+            ExtractUserKey(seg.first_key)) > 0) {
+      mem_lower_bound =
+          MakeMinInternalKeyForUser(*read_options_.iterate_lower_bound);
+    }
+    if (read_options_.iterate_upper_bound != nullptr &&
+        icmp_.user_comparator()->Compare(
+            *read_options_.iterate_upper_bound,
+            ExtractUserKey(seg.last_key)) <= 0) {
+      mem_upper_bound =
+          MakeMinInternalKeyForUser(*read_options_.iterate_upper_bound);
+    }
 
     // 检查 buffer 是否还有数据。如果为空，由于 SAC 机制，很可能是发生了 Flush
     // 导致 segments changed 
-    mem_iter->Seek(seg.first_key);
+    mem_iter->Seek(mem_lower_bound);
 
     if (!mem_iter->Valid() ||
-        icmp_.Compare(mem_iter->key(), seg.first_key) > 0) {
+        icmp_.user_comparator()->Compare(
+            ExtractUserKey(mem_iter->key()),
+            ExtractUserKey(mem_lower_bound)) > 0) {
       HotIndexEntry latest_entry;
       if (hotspot_manager_->GetHotIndexEntry(cuid_, &latest_entry) &&
           latest_entry.HasSnapshot()) {
@@ -573,18 +628,18 @@ HotSnapshotIterator::SegmentInitStatus HotSnapshotIterator::InitIterForSegment(
         }
       }
     }
-    current_iter_.reset(new BoundedMemIterator(mem_iter, seg.first_key,
-                                               seg.last_key, &icmp_));
+    current_iter_.reset(new BoundedMemIterator(
+        mem_iter, mem_lower_bound, mem_upper_bound, &icmp_));
     return SegmentInitStatus::kSuccess;
   } else {
     // Case B: 物理 SST
     FileMetaData meta = MakeFileMetaFromSegment(seg, false);
 
     current_read_options_ = read_options_;
-    current_lower_bound_str_ = ExtractUserKey(seg.first_key).ToString();
-    current_upper_bound_str_ = ExtractUserKey(seg.last_key).ToString();
-
-    current_upper_bound_str_.push_back('\0');  // Make it an exclusive bound
+    BuildEffectiveUserBounds(icmp_, seg, read_options_.iterate_lower_bound,
+                             read_options_.iterate_upper_bound,
+                             &current_lower_bound_str_,
+                             &current_upper_bound_str_);
     current_lower_bound_slice_ = Slice(current_lower_bound_str_);
     current_upper_bound_slice_ = Slice(current_upper_bound_str_);
     current_read_options_.iterate_lower_bound = &current_lower_bound_slice_;
@@ -1096,11 +1151,6 @@ bool DeltaSwitchingIterator::InitHotIter(uint64_t cuid, const Slice& target) {
     hybrid_iter_ = nullptr;
   }
 
-  if (hybrid_iter_) {
-    delete hybrid_iter_;
-    hybrid_iter_ = nullptr;
-  }
-
   if (hot_iter_) {
     delete hot_iter_;
     hot_iter_ = nullptr;
@@ -1217,10 +1267,20 @@ void DeltaSwitchingIterator::Seek(const Slice& target) {
   // 否则，不论是点查还是全扫描(delta_full_scan)，只要是热点，全部走热点路径
   else if (cuid != 0 && hotspot_manager_->IsHot(cuid)) {
     if (InitHotIter(cuid, target)) {
-      // Frontend full scans rely on hot snapshot + delta. Memtable/immutable
-      // updates are still merged by DBImpl's outer iterator stack, while a
-      // dedicated metadata scan refreshes GDCT in the cold path afterwards.
-      current_iter_ = hot_iter_;
+      // Partial scans stay on the hot path. For user-facing full scans we keep
+      // a bounded cold merge alongside hot snapshot+delta to avoid missing any
+      // rows that have not yet been fully reflected in the hot index.
+      if (read_options_.delta_full_scan) {
+        InitColdIter();
+        if (hybrid_iter_) {
+          delete hybrid_iter_;
+          hybrid_iter_ = nullptr;
+        }
+        hybrid_iter_ = new HotColdHybridIterator(hot_iter_, cold_iter_, icmp_);
+        current_iter_ = hybrid_iter_;
+      } else {
+        current_iter_ = hot_iter_;
+      }
       is_hot_mode_ = true;
     } else {
       // 热点索引尚未建立（如 Init Scan 还在进行中），回退到 Cold Path

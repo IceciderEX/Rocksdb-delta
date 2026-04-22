@@ -36,7 +36,7 @@ const std::string kNativeDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_n
 const std::string kDeltaDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_delta";
 const std::string kDeltaPartitionDBPath = "/home/jx/Rocksdb-delta/db_perf_test/db_perf_delta_partition";
 const int kNumThreads = 32;
-const int kTestDurationSec = 1800;       // s
+const int kTestDurationSec = 3600;       // s
 const int kNumCuids = 1000000;           // 100W CUID 总库
 const uint64_t kNumTableIds = 4;
 const uint64_t kDbId = 1;
@@ -421,6 +421,7 @@ int main() {
       options.delta_options.delta_merge_threshold = 3;
       options.delta_options.sac_delta_count_threshold = 5;
       options.delta_options.sharding_count = 64; // Power of 2 recommended
+      options.delta_options.max_delta_threads = 4;
       options.delta_options.hot_data_buffer_threshold_bytes = 64 * 1024 * 1024;
       options.delta_options.hot_data_buffer_shards = 128;
       options.delta_options.compaction_l0_trigger_count = 30;
@@ -518,7 +519,7 @@ int main() {
     delete db;
   };
   run_benchmark(kNativeDBPath, false, false, "NATIVE MODE");
-  run_benchmark(kDeltaDBPath, true, false, "DELTA MODE");
-  run_benchmark(kDeltaPartitionDBPath, true, true, "Partition MODE");
+  // run_benchmark(kDeltaDBPath, true, false, "DELTA MODE");
+  // run_benchmark(kDeltaPartitionDBPath, true, true, "Partition MODE");
   return 0;
 }
