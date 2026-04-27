@@ -9,10 +9,13 @@
 
 #include "db/compaction/compaction_picker_level.h"
 
+#include <algorithm>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "db/delta_l0.h"
 #include "db/version_edit.h"
 #include "logging/log_buffer.h"
 #include "test_util/sync_point.h"
@@ -45,6 +48,199 @@ bool LevelCompactionPicker::NeedsCompaction(
 }
 
 namespace {
+// Delta L0 compaction 的分区排序 key。
+// 用于把 L0 文件按 Delta L0 partition 维度归组和排序，
+// 从而让 compaction picker 优先处理更“紧迫”的 partition。
+struct DeltaL0CompactionPartitionKey {
+  // 表示该文件是否带有有效的 Delta L0 元信息。
+  // 新格式文件一般为 true；旧文件或未填充元信息的文件为 false。
+  
+  bool has_valid_meta = false;
+  // Delta L0 partition 的唯一标识。
+  // 仅当 has_valid_meta 为 true 时有效。
+  uint64_t partition_id = 0;
+
+  // Delta L0 partition 的 generation。
+  // partition split 后 generation 会变化，用于区分旧分区和新分区。
+  // 仅当 has_valid_meta 为 true 时有效。
+  uint64_t partition_generation = 0;
+
+  // 旧格式文件没有 partition_id / generation。
+  // 为了避免把所有 legacy 文件错误地归到同一个 partition，
+  // 使用文件号作为 fallback key，保证排序稳定且确定。
+  uint64_t legacy_file_number = 0;
+
+  // 定义 map key 的排序规则。
+  // 排序顺序依次为：
+  // 1. 是否有有效 Delta L0 meta；
+  // 2. partition_id；
+  // 3. partition_generation；
+  // 4. legacy_file_number。
+  //
+  // 这样相同 partition_id / generation 的文件会被归为同一组，
+  // 没有有效 meta 的 legacy 文件则按文件号各自独立分组。
+  bool operator<(const DeltaL0CompactionPartitionKey& other) const {
+    if (has_valid_meta != other.has_valid_meta) {
+      return has_valid_meta < other.has_valid_meta;
+    }
+    if (partition_id != other.partition_id) {
+      return partition_id < other.partition_id;
+    }
+    if (partition_generation != other.partition_generation) {
+      return partition_generation < other.partition_generation;
+    }
+    return legacy_file_number < other.legacy_file_number;
+  }
+};
+
+// 记录某个 Delta L0 compaction partition 下的文件统计信息。
+// 后续会根据总大小和文件数计算 partition 的 compaction 优先级。
+struct DeltaL0CompactionPartitionStats {
+  // 该 partition 下所有 L0 文件的总字节数。
+  uint64_t total_bytes = 0;
+
+  // 该 partition 下的 L0 文件数量。
+  uint64_t file_count = 0;
+};
+
+// 判断当前 level 是否应该使用 Delta L0 partition 优先级策略。
+// 只有 Delta Column Family 的 L0 层才启用该策略。
+// 普通 CF 或非 L0 层仍然使用原有 compaction 优先级逻辑。
+bool UseDeltaL0PartitionPriority(const std::string& cf_name, int level) {
+  return level == 0 && IsDeltaColumnFamilyName(cf_name);
+}
+
+// 根据单个 L0 文件的元信息生成 Delta L0 compaction partition key。
+// 如果文件带有有效的 delta_l0_meta，则使用 partition_id 和 generation
+// 作为分组依据；否则认为它是 legacy 文件，使用文件号作为 fallback，
+// 避免多个旧文件被错误合并到同一个虚拟 partition。
+DeltaL0CompactionPartitionKey GetDeltaL0CompactionPartitionKey(
+    const FileMetaData& file_meta) {
+  DeltaL0CompactionPartitionKey key;
+  if (file_meta.delta_l0_meta.valid) {
+    key.has_valid_meta = true;
+    key.partition_id = file_meta.delta_l0_meta.partition_id;
+    key.partition_generation = file_meta.delta_l0_meta.partition_generation;
+  } else {
+    // Keep legacy files deterministic without inventing a shared partition.
+    key.legacy_file_number = file_meta.fd.GetNumber();
+  }
+  return key;
+}
+
+// 计算某个 Delta L0 partition 的 compaction 优先级分数。
+// 分数由两部分组成：
+// 1. 当前 partition 文件总大小 / max_compaction_bytes；
+// 2. 当前 partition 文件数 / level0_file_num_compaction_trigger。
+//
+// 分数越高，说明该 partition 中的数据量或文件数越接近/超过阈值，
+// 因此越应该优先被选中进行 L0 内部 compaction。
+double ScoreDeltaL0CompactionPartition(
+    const DeltaL0CompactionPartitionStats& stats,
+    const MutableCFOptions& mutable_cf_options) {
+  const double target_l0_bytes = static_cast<double>(
+      std::max<uint64_t>(1, mutable_cf_options.max_compaction_bytes));
+  const double target_l0_files = static_cast<double>(
+      std::max(1, mutable_cf_options.level0_file_num_compaction_trigger));
+  return static_cast<double>(stats.total_bytes) / target_l0_bytes +
+         static_cast<double>(stats.file_count) / target_l0_files;
+}
+
+// 遍历当前 L0 的所有文件，按 Delta L0 compaction partition key 进行归组，
+// 并统计每个 partition 的总大小和文件数量。
+// 返回结果用于后续计算每个 partition 的 compaction 优先级。
+std::map<DeltaL0CompactionPartitionKey, DeltaL0CompactionPartitionStats>
+BuildDeltaL0CompactionPartitionStats(
+    const std::vector<FileMetaData*>& level_files) {
+  std::map<DeltaL0CompactionPartitionKey, DeltaL0CompactionPartitionStats>
+      partition_stats;
+  for (const FileMetaData* file_meta : level_files) {
+    DeltaL0CompactionPartitionStats& stats =
+        partition_stats[GetDeltaL0CompactionPartitionKey(*file_meta)];
+    stats.total_bytes += file_meta->fd.GetFileSize();
+    ++stats.file_count;
+  }
+  return partition_stats;
+}
+
+// 根据 Delta L0 partition 的统计信息，重新构造 L0 文件的 compaction 优先级顺序。
+// 输入 file_order 是原始文件顺序；输出 prioritized 是按 partition 压力排序后的文件顺序。
+//
+// 排序逻辑：
+// 1. 先按 partition score 从高到低排序；
+// 2. score 相同则文件数更多的 partition 优先；
+// 3. 文件数也相同则总字节数更大的 partition 优先；
+// 4. 如果仍然相同，保持 stable_sort 的原始相对顺序。
+//
+// 这样可以让同一个高压力 partition 下的文件更早进入 compaction 候选集，
+// 避免 L0 内部 compaction 在多个 Delta partition 之间过度分散。
+std::vector<int> BuildDeltaL0CompactionPriorityOrder(
+    const std::vector<FileMetaData*>& level_files,
+    const std::vector<int>& file_order,
+    const MutableCFOptions& mutable_cf_options) {
+  std::vector<int> prioritized = file_order;
+  if (prioritized.size() <= 1) {
+    return prioritized;
+  }
+
+  const auto partition_stats = BuildDeltaL0CompactionPartitionStats(level_files);
+  std::stable_sort(
+      prioritized.begin(), prioritized.end(),
+      [&](int lhs_index, int rhs_index) {
+        const auto lhs_key =
+            GetDeltaL0CompactionPartitionKey(*level_files[lhs_index]);
+        const auto rhs_key =
+            GetDeltaL0CompactionPartitionKey(*level_files[rhs_index]);
+        const auto lhs_it = partition_stats.find(lhs_key);
+        const auto rhs_it = partition_stats.find(rhs_key);
+        assert(lhs_it != partition_stats.end());
+        assert(rhs_it != partition_stats.end());
+
+        const double lhs_score =
+            ScoreDeltaL0CompactionPartition(lhs_it->second, mutable_cf_options);
+        const double rhs_score =
+            ScoreDeltaL0CompactionPartition(rhs_it->second, mutable_cf_options);
+        if (lhs_score != rhs_score) {
+          return lhs_score > rhs_score;
+        }
+        if (lhs_it->second.file_count != rhs_it->second.file_count) {
+          return lhs_it->second.file_count > rhs_it->second.file_count;
+        }
+        if (lhs_it->second.total_bytes != rhs_it->second.total_bytes) {
+          return lhs_it->second.total_bytes > rhs_it->second.total_bytes;
+        }
+        return false;
+      });
+  return prioritized;
+}
+
+// 构建 Delta L0 内部 compaction 的候选文件列表。
+// 该函数会先生成 L0 文件的自然顺序索引，然后根据 Delta L0 partition
+// 的优先级重新排序，最后返回排序后的 FileMetaData* 列表。
+//
+// 返回结果用于 compaction picker，使其更倾向于优先压缩：
+// 1. 文件数较多的 Delta L0 partition；
+// 2. 数据量较大的 Delta L0 partition；
+// 3. 已经超过配置阈值、compaction 压力更高的 partition。
+std::vector<FileMetaData*> BuildDeltaL0IntraL0CompactionCandidates(
+    const std::vector<FileMetaData*>& level_files,
+    const MutableCFOptions& mutable_cf_options) {
+  std::vector<int> natural_order;
+  natural_order.reserve(level_files.size());
+  for (size_t index = 0; index < level_files.size(); ++index) {
+    natural_order.push_back(static_cast<int>(index));
+  }
+  const std::vector<int> prioritized_order =
+      BuildDeltaL0CompactionPriorityOrder(level_files, natural_order,
+                                          mutable_cf_options);
+  std::vector<FileMetaData*> prioritized_files;
+  prioritized_files.reserve(prioritized_order.size());
+  for (int index : prioritized_order) {
+    prioritized_files.push_back(level_files[index]);
+  }
+  return prioritized_files;
+}
+
 // A class to build a leveled compaction step-by-step.
 class LevelCompactionBuilder {
  public:
@@ -734,11 +930,46 @@ bool LevelCompactionBuilder::PickFileToCompact() {
   // being compacted.
   const std::vector<int>& file_scores =
       vstorage_->FilesByCompactionPri(start_level_);
+  // Delta L0 partition priority 使用单独的文件顺序数组。
+  // 默认情况下 candidate_order 指向 RocksDB 原有的 file_scores；
+  // 如果当前是 Delta Column Family 的 L0 层，则会重新构造一个
+  // 按 Delta L0 partition 压力排序后的 delta_file_scores。
+  std::vector<int> delta_file_scores;
+  const std::vector<int>* candidate_order = &file_scores;
+  // 判断当前 level 是否启用 Delta L0 partition-aware 的 compaction 优先级。
+  // 只有 Delta Column Family 的 L0 层会启用；普通 CF 或非 L0 层保持原逻辑。
+  const bool use_delta_l0_partition_priority =
+      UseDeltaL0PartitionPriority(cf_name_, start_level_);
+  if (use_delta_l0_partition_priority) {
+    // 对 Delta L0 文件按 partition 维度重新排序。
+    // 排序依据来自每个 partition 的文件数量和总大小：
+    // 压力更高的 partition 会排在更前面，从而更早被 compaction picker 选中。
+    //
+    // 注意这里没有改变 level_files 本身，只是生成一个新的索引顺序。
+    delta_file_scores = BuildDeltaL0CompactionPriorityOrder(
+        level_files, file_scores, mutable_cf_options_);
+
+    // 后续遍历候选文件时，改用 Delta partition-aware 的候选顺序。
+    candidate_order = &delta_file_scores;
+  }
 
   unsigned int cmp_idx;
-  for (cmp_idx = vstorage_->NextCompactionIndex(start_level_);
-       cmp_idx < file_scores.size(); cmp_idx++) {
-    int index = file_scores[cmp_idx];
+  // 普通 compaction priority 使用 vstorage_ 中记录的 NextCompactionIndex，
+  // 以支持原有 round-robin / cursor 行为。
+  //
+  // Delta L0 partition priority 每次都从重新排序后的候选列表开头扫描，
+  // 因为该列表已经根据当前 partition 压力动态排序；
+  // 如果沿用旧的 NextCompactionIndex，可能会跳过当前最需要 compact 的 partition。
+  const unsigned int initial_cmp_idx =
+      use_delta_l0_partition_priority
+          ? 0
+          : static_cast<unsigned int>(vstorage_->NextCompactionIndex(
+                start_level_));
+  for (cmp_idx = initial_cmp_idx; cmp_idx < candidate_order->size();
+       cmp_idx++) {
+    // candidate_order 可能是原始 file_scores，也可能是 Delta L0 partition
+    // 重新排序后的 delta_file_scores。这里统一通过索引取出候选文件。
+    int index = (*candidate_order)[cmp_idx];
     auto* f = level_files[index];
 
     // do not pick a file to compact if it is being compacted
@@ -805,7 +1036,14 @@ bool LevelCompactionBuilder::PickFileToCompact() {
 
   // store where to start the iteration in the next call to PickCompaction
   if (ioptions_.compaction_pri != kRoundRobin) {
-    vstorage_->SetNextCompactionIndex(start_level_, cmp_idx);
+    // 普通路径继续记录下一次 compaction 的扫描起点。
+    //
+    // Delta L0 partition priority 路径固定写回 0：
+    // 因为下一次调用会重新基于最新 L0 文件分布计算 partition score，
+    // 应该重新从最高优先级 partition 开始，而不是沿用本次扫描到的位置。
+    vstorage_->SetNextCompactionIndex(
+        start_level_, use_delta_l0_partition_priority ? 0
+                                                      : static_cast<int>(cmp_idx));
   }
   return start_level_inputs_.size() > 0;
 }
@@ -821,6 +1059,31 @@ bool LevelCompactionBuilder::PickIntraL0Compaction() {
     // If L0 isn't accumulating much files beyond the regular trigger, don't
     // resort to L0->L0 compaction yet.
     return false;
+  }
+  // Delta Column Family 的 L0->L0 compaction 优先使用 partition-aware
+  // 的候选文件顺序。
+  //
+  // 这样可以让文件数更多、总大小更大、compaction 压力更高的 Delta L0
+  // partition 被优先整理，减少 L0 文件在多个 partition 之间无序堆积。
+  if (UseDeltaL0PartitionPriority(cf_name_, 0 /* level */)) {
+    const std::vector<FileMetaData*> prioritized_level_files =
+        BuildDeltaL0IntraL0CompactionCandidates(level_files,
+                                                mutable_cf_options_);
+    // 构造按 Delta L0 partition 压力排序后的 L0 文件列表。
+    // 这里返回的是 FileMetaData* 顺序，不改变 VersionStorage 中原始 L0 文件顺序。
+    if (FindIntraL0Compaction(prioritized_level_files,
+                              kMinFilesForIntraL0Compaction,
+                              std::numeric_limits<uint64_t>::max(),
+                              mutable_cf_options_.max_compaction_bytes,
+                              &start_level_inputs_)) {
+      return true;
+    }
+    // 如果 Delta partition-aware 顺序没有找到合适的 L0->L0 compaction，
+    // 清空临时输入，继续回退到原始 level_files 顺序。
+    //
+    // 这样可以保证新增的 Delta 优先级策略只是增强候选排序，
+    // 不会破坏原有 Intra-L0 compaction 的兜底行为。
+    start_level_inputs_.clear();
   }
   return FindIntraL0Compaction(level_files, kMinFilesForIntraL0Compaction,
                                std::numeric_limits<uint64_t>::max(),

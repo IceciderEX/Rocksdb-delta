@@ -7,10 +7,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <limits>
 #include <tuple>
 
 #include "compaction/compaction_picker_universal.h"
+#include "db/column_family.h"
 #include "db/blob/blob_index.h"
+#include "db/delta_l0.h"
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
 #include "env/mock_env.h"
@@ -6933,6 +6936,307 @@ class DBCompactionTestL0FilesMisorderCorruption : public DBCompactionTest {
   std::atomic<bool> compaction_path_sync_point_called_;
   std::shared_ptr<test::SleepingBackgroundTask> sleeping_task_;
 };
+
+namespace {
+
+// 按大端序将 32 位整数追加到测试 key 中。
+// Delta 的真实二进制 key 使用固定宽度字段，并按大端序编码，
+// 这样字节序比较可以保持和数值大小一致。
+void AppendDeltaTestBigEndian32(std::string* dst, uint32_t value) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    dst->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+// 按大端序将 64 位整数追加到测试 key 中。
+// 该函数用于构造 cuid、event_seq 等 8 字节字段。
+void AppendDeltaTestBigEndian64(std::string* dst, uint64_t value) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    dst->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+// 构造 Delta 测试用的固定宽度二进制 user key。
+// key 布局与 Delta 真实 key 保持一致：
+//   dbid[4] relid/tableid[4] cuid[8] rowid/offset[4] event_seq/udseq[8]
+//
+// 其中 relid/tableid 字段会被 Delta L0 partition 逻辑解析，
+// 用于判断 key 属于哪个 Delta L0 partition。
+std::string DeltaTestKey(uint64_t tableid, uint64_t rowid,
+                         uint64_t event_seq = 1, uint64_t cuid = 1) {
+  std::string key;
+  key.reserve(kDeltaBinaryKeySize);
+  AppendDeltaTestBigEndian32(&key, 1);
+  AppendDeltaTestBigEndian32(&key, static_cast<uint32_t>(tableid));
+  AppendDeltaTestBigEndian64(&key, cuid);
+  AppendDeltaTestBigEndian32(&key, static_cast<uint32_t>(rowid));
+  AppendDeltaTestBigEndian64(&key, event_seq);
+  return key;
+}
+}  // namespace
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: removable Delta feature
+// verification coverage.
+// 测试 Delta L0->L0 compaction 在 partition split 之后，
+// 是否会把旧 parent partition 中的 L0 文件重新切分成新的子 partition 文件。
+//
+// 测试场景：
+// 1. 先写入两个相距很远的 tableid 区间：
+//    - 低区间：tableid 1~32；
+//    - 高区间：tableid 1000~1031；
+// 2. 前 6 次 flush 时，Delta L0 partition directory 仍只有一个 parent partition；
+// 3. 第 7 次 flush 额外写入 tableid 1032，触发 directory split；
+// 4. 后台 Intra-L0 compaction 应该识别旧 parent 文件，并将其改写成
+//    低区间和高区间两个新 partition 的文件；
+// 5. 最终验证 L0 中不再存在横跨 1~1031 的旧 parent 文件。
+TEST_F(DBCompactionTestL0FilesMisorderCorruption,
+       DeltaIntraL0CompactionRepartitionsOldParentFiles) {
+  SetupOptions(CompactionStyle::kCompactionStyleLevel);
+  DestroyAndReopen(options_);
+  CreateAndReopenWithCF({"Delta"}, options_);
+
+  PauseCompactionThread();
+
+  VersionSet* const versions = dbfull()->GetVersionSet();
+  ASSERT_NE(nullptr, versions);
+  ColumnFamilyData* const delta_cfd =
+      versions->GetColumnFamilySet()->GetColumnFamily("Delta");
+  ASSERT_NE(nullptr, delta_cfd);
+  ASSERT_TRUE(delta_cfd->IsDeltaColumnFamily());
+  DeltaL0PartitionDirectory* const directory =
+      delta_cfd->delta_l0_partition_directory();
+  ASSERT_NE(nullptr, directory);
+
+  for (uint64_t flush_round = 0; flush_round < 7; ++flush_round) {
+    for (uint64_t tableid = 1; tableid <= 32; ++tableid) {
+      ASSERT_OK(Put(1, DeltaTestKey(tableid, flush_round), "parent-low"));
+    }
+    for (uint64_t tableid = 1000; tableid <= 1031; ++tableid) {
+      ASSERT_OK(Put(1, DeltaTestKey(tableid, flush_round), "parent-high"));
+    }
+    if (flush_round == 6) {
+      ASSERT_OK(Put(1, DeltaTestKey(1032, flush_round), "split-high"));
+    }
+    ASSERT_OK(Flush(1));
+    ASSERT_EQ(static_cast<int>(flush_round + 1), NumTableFilesAtLevel(0, 1));
+    ASSERT_EQ(flush_round == 6 ? 2U : 1U, directory->PartitionCount());
+  }
+  ASSERT_EQ(7, NumTableFilesAtLevel(0, 1));
+
+  SetupSyncPoints("FindIntraL0Compaction");
+  ResumeCompactionThread();
+
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_TRUE(SyncPointsCalled());
+  DisableSyncPoints();
+
+  std::vector<std::vector<FileMetaData>> level_to_files;
+  dbfull()->TEST_GetFilesMetaData(handles_[1], &level_to_files);
+  ASSERT_GE(level_to_files.size(), 1U);
+
+  const FileMetaData* low_file = nullptr;
+  const FileMetaData* high_file = nullptr;
+  bool saw_parent_file = false;
+  for (const auto& file : level_to_files[0]) {
+    ASSERT_TRUE(file.delta_l0_meta.valid);
+    ASSERT_EQ(1U, file.delta_l0_meta.partition_generation);
+    if (file.delta_l0_meta.tableid_max < 1000) {
+      low_file = &file;
+    } else {
+      high_file = &file;
+    }
+    saw_parent_file = saw_parent_file ||
+                      (file.delta_l0_meta.tableid_min == 1 &&
+                       file.delta_l0_meta.tableid_max == 1031);
+  }
+
+  ASSERT_NE(nullptr, low_file);
+  ASSERT_NE(nullptr, high_file);
+  ASSERT_FALSE(saw_parent_file);
+  ASSERT_EQ(1U, low_file->delta_l0_meta.tableid_min);
+  ASSERT_EQ(32U, low_file->delta_l0_meta.tableid_max);
+  ASSERT_EQ(1000U, high_file->delta_l0_meta.tableid_min);
+  ASSERT_EQ(1032U, high_file->delta_l0_meta.tableid_max);
+  ASSERT_NE(low_file->delta_l0_meta.partition_id,
+            high_file->delta_l0_meta.partition_id);
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: end-to-end persistence coverage
+// for intra-L0 repartitioning plus restart recovery.
+// 测试 Delta L0 partition directory 在 Intra-L0 repartition 后，
+// 是否可以通过 manifest/version edit 中的 snapshot 跨 reopen 正确恢复。
+//
+// 该测试覆盖端到端路径：
+// 1. 构造 Delta L0 partition split；
+// 2. 触发 L0->L0 repartition compaction；
+// 3. 验证 reopen 前的 L0 文件已经按新 partition 分开；
+// 4. reopen DB；
+// 5. 验证 directory 的 partition_count/split_count 仍然保持；
+// 6. 验证读路径和 kDeltaL0Stats 统计信息仍然正确。
+TEST_F(DBCompactionTestL0FilesMisorderCorruption,
+       DeltaIntraL0CompactionPersistsDirectoryAcrossReopen) {
+  SetupOptions(CompactionStyle::kCompactionStyleLevel);
+  DestroyAndReopen(options_);
+  CreateAndReopenWithCF({"Delta"}, options_);
+
+  PauseCompactionThread();
+  auto get_delta_cfd = [&]() -> ColumnFamilyData* {
+    VersionSet* const versions = dbfull()->GetVersionSet();
+    EXPECT_NE(nullptr, versions);
+    if (versions == nullptr) {
+      return nullptr;
+    }
+    ColumnFamilyData* const delta_cfd =
+        versions->GetColumnFamilySet()->GetColumnFamily("Delta");
+    EXPECT_NE(nullptr, delta_cfd);
+    if (delta_cfd != nullptr) {
+      EXPECT_TRUE(delta_cfd->IsDeltaColumnFamily());
+    }
+    return delta_cfd;
+  };
+  auto collect_l0_partition_counts = [](
+                                        const std::vector<FileMetaData*>& files,
+                                        size_t* low_files, size_t* high_files) {
+    *low_files = 0;
+    *high_files = 0;
+    for (FileMetaData* file_meta : files) {
+      ASSERT_TRUE(file_meta->delta_l0_meta.valid);
+      ASSERT_EQ(1U, file_meta->delta_l0_meta.partition_generation);
+      if (file_meta->delta_l0_meta.tableid_max < 1000) {
+        ++(*low_files);
+      } else {
+        ASSERT_GE(file_meta->delta_l0_meta.tableid_min, 1000U);
+        ++(*high_files);
+      }
+    }
+  };
+
+  ColumnFamilyData* delta_cfd = get_delta_cfd();
+  ASSERT_NE(nullptr, delta_cfd);
+  DeltaL0PartitionDirectory* directory =
+      delta_cfd->delta_l0_partition_directory();
+  ASSERT_NE(nullptr, directory);
+
+  for (uint64_t flush_round = 0; flush_round < 7; ++flush_round) {
+    for (uint64_t tableid = 1; tableid <= 32; ++tableid) {
+      ASSERT_OK(Put(1, DeltaTestKey(tableid, flush_round), "parent-low"));
+    }
+    for (uint64_t tableid = 1000; tableid <= 1031; ++tableid) {
+      ASSERT_OK(Put(1, DeltaTestKey(tableid, flush_round), "parent-high"));
+    }
+    if (flush_round == 6) {
+      ASSERT_OK(Put(1, DeltaTestKey(1032, flush_round), "split-high"));
+    }
+    ASSERT_OK(Flush(1));
+  }
+  ASSERT_EQ(2U, directory->PartitionCount());
+
+  SetupSyncPoints("FindIntraL0Compaction");
+  ResumeCompactionThread();
+
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_TRUE(SyncPointsCalled());
+  DisableSyncPoints();
+
+  delta_cfd = get_delta_cfd();
+  ASSERT_NE(nullptr, delta_cfd);
+  directory = delta_cfd->delta_l0_partition_directory();
+  ASSERT_NE(nullptr, directory);
+  ASSERT_EQ(2U, directory->PartitionCount());
+
+  const auto& level0_files_before_reopen =
+      delta_cfd->current()->storage_info()->LevelFiles(0);
+  ASSERT_FALSE(level0_files_before_reopen.empty());
+
+  bool saw_old_parent_before_reopen = false;
+  size_t low_partition_files_before_reopen = 0;
+  size_t high_partition_files_before_reopen = 0;
+  collect_l0_partition_counts(level0_files_before_reopen,
+                              &low_partition_files_before_reopen,
+                              &high_partition_files_before_reopen);
+  for (FileMetaData* file_meta : level0_files_before_reopen) {
+    saw_old_parent_before_reopen =
+        saw_old_parent_before_reopen ||
+        (file_meta->delta_l0_meta.tableid_min == 1 &&
+         file_meta->delta_l0_meta.tableid_max == 1031);
+  }
+  ASSERT_FALSE(saw_old_parent_before_reopen);
+  ASSERT_GT(low_partition_files_before_reopen, 0U);
+  ASSERT_GT(high_partition_files_before_reopen, 0U);
+
+  ReopenWithColumnFamilies({"default", "Delta"}, options_);
+
+  delta_cfd = get_delta_cfd();
+  ASSERT_NE(nullptr, delta_cfd);
+  directory = delta_cfd->delta_l0_partition_directory();
+  ASSERT_NE(nullptr, directory);
+  ASSERT_EQ(2U, directory->PartitionCount());
+  ASSERT_EQ(1U, directory->SplitCount());
+
+  const auto& level0_files_after_reopen =
+      delta_cfd->current()->storage_info()->LevelFiles(0);
+  ASSERT_EQ(level0_files_before_reopen.size(), level0_files_after_reopen.size());
+
+  size_t low_partition_files_after_reopen = 0;
+  size_t high_partition_files_after_reopen = 0;
+  collect_l0_partition_counts(level0_files_after_reopen,
+                              &low_partition_files_after_reopen,
+                              &high_partition_files_after_reopen);
+  ASSERT_EQ(low_partition_files_before_reopen, low_partition_files_after_reopen);
+  ASSERT_EQ(high_partition_files_before_reopen,
+            high_partition_files_after_reopen);
+
+  PinnableSlice value;
+  ASSERT_OK(db_->Get(ReadOptions(), handles_[1], DeltaTestKey(1, 0), &value));
+  ASSERT_EQ("parent-low", value.ToString());
+
+  ReadOptions read_options;
+  const std::string high_lower = DeltaTestKey(1000, 0, 0);
+  const std::string high_upper =
+      DeltaTestKey(1032, std::numeric_limits<uint32_t>::max(),
+                   std::numeric_limits<uint64_t>::max());
+  const Slice high_lower_slice(high_lower);
+  const Slice high_upper_slice(high_upper);
+  read_options.iterate_lower_bound = &high_lower_slice;
+  read_options.iterate_upper_bound = &high_upper_slice;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options, handles_[1]));
+  iter->Seek(high_lower);
+  ASSERT_TRUE(iter->Valid());
+  uint64_t iter_tableid = 0;
+  ASSERT_TRUE(TryParseDeltaTableIdFromUserKey(iter->key(), &iter_tableid));
+  ASSERT_EQ(1000U, iter_tableid);
+
+  std::map<std::string, std::string> delta_stats;
+  ASSERT_TRUE(
+      db_->GetMapProperty(handles_[1], DB::Properties::kDeltaL0Stats, &delta_stats));
+  ASSERT_EQ("2", delta_stats.at("partition_count"));
+  ASSERT_EQ("1", delta_stats.at("split_count"));
+  ASSERT_EQ("0", delta_stats.at("legacy_l0_file_count_without_meta"));
+  ASSERT_EQ("0", delta_stats.at("old_parent_l0_file_count"));
+  ASSERT_GT(std::stoull(delta_stats.at("directory_snapshot_bytes")), 0U);
+  ASSERT_EQ(level0_files_after_reopen.size(),
+            std::stoull(delta_stats.at("get_l0_candidate_files_before_prune")));
+  ASSERT_EQ(low_partition_files_after_reopen,
+            std::stoull(delta_stats.at("get_l0_candidate_files_after_prune")));
+  ASSERT_EQ(level0_files_after_reopen.size(),
+            std::stoull(delta_stats.at("scan_l0_candidate_files_before_prune")));
+  ASSERT_EQ(high_partition_files_after_reopen,
+            std::stoull(delta_stats.at("scan_l0_candidate_files_after_prune")));
+
+  for (uint64_t partition_index = 0; partition_index < 2; ++partition_index) {
+    const std::string prefix =
+        "partition." + std::to_string(partition_index) + ".";
+    ASSERT_EQ(1U, std::stoull(delta_stats.at(prefix + "partition_generation")));
+    if (std::stoull(delta_stats.at(prefix + "tableid_end")) < 1000U) {
+      ASSERT_EQ(low_partition_files_after_reopen,
+                std::stoull(delta_stats.at(prefix + "l0_file_count")));
+    } else {
+      ASSERT_GE(std::stoull(delta_stats.at(prefix + "tableid_begin")), 1000U);
+      ASSERT_EQ(high_partition_files_after_reopen,
+                std::stoull(delta_stats.at(prefix + "l0_file_count")));
+    }
+  }
+}
 
 TEST_F(DBCompactionTestL0FilesMisorderCorruption,
        FlushAfterIntraL0LevelCompactionWithIngestedFile) {

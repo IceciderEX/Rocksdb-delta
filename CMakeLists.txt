@@ -1591,6 +1591,11 @@ if(WITH_BENCHMARK_TOOLS)
     utilities/persistent_cache/hash_table_bench.cc)
   target_link_libraries(hash_table_bench${ARTIFACT_SUFFIX}
     ${ROCKSDB_LIB} ${GFLAGS_LIB} ${FOLLY_LIBS})
+
+  add_executable(delta_partition_bench${ARTIFACT_SUFFIX}
+    tools/delta_partition_bench.cc)
+  target_link_libraries(delta_partition_bench${ARTIFACT_SUFFIX}
+    ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
 endif()
 
 option(WITH_TRACE_TOOLS "build with trace tools" ON)
@@ -1630,5 +1635,7 @@ if(WITH_BENCHMARK)
 endif()
 
 # for delta
-add_executable(rocksdb_scan test/rocksdb_scan.cc)
-target_link_libraries(rocksdb_scan rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+if(EXISTS "${PROJECT_SOURCE_DIR}/test/rocksdb_scan.cc")
+  add_executable(rocksdb_scan test/rocksdb_scan.cc)
+  target_link_libraries(rocksdb_scan rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+endif()

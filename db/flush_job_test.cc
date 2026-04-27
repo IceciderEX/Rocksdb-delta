@@ -12,6 +12,7 @@
 
 #include "db/blob/blob_index.h"
 #include "db/column_family.h"
+#include "db/delta_l0.h"
 #include "db/db_impl/db_impl.h"
 #include "db/version_set.h"
 #include "file/writable_file_writer.h"
@@ -31,14 +32,17 @@ namespace ROCKSDB_NAMESPACE {
 // 2. Memtable
 class FlushJobTestBase : public testing::Test {
  protected:
-  FlushJobTestBase(std::string dbname, const Comparator* ucmp)
+  FlushJobTestBase(
+      std::string dbname, const Comparator* ucmp,
+      std::vector<std::string> column_family_names = {
+          kDefaultColumnFamilyName, "foo", "bar"})
       : env_(Env::Default()),
         fs_(env_->GetFileSystem()),
         dbname_(std::move(dbname)),
         ucmp_(ucmp),
         options_(),
         db_options_(options_),
-        column_family_names_({kDefaultColumnFamilyName, "foo", "bar"}),
+        column_family_names_(std::move(column_family_names)),
         table_cache_(NewLRUCache(50000, 16)),
         write_buffer_manager_(db_options_.db_write_buffer_size),
         shutting_down_(false),
@@ -159,6 +163,14 @@ class FlushJobTest : public FlushJobTestBase {
                          BytewiseComparator()) {}
 };
 
+class DeltaFlushJobTest : public FlushJobTestBase {
+ public:
+  DeltaFlushJobTest()
+      : FlushJobTestBase(test::PerThreadDBPath("delta_flush_job_test"),
+                         BytewiseComparator(),
+                         {kDefaultColumnFamilyName, "Delta"}) {}
+};
+
 TEST_F(FlushJobTest, Empty) {
   JobContext job_context(0);
   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
@@ -275,6 +287,118 @@ TEST_F(FlushJobTest, NonEmpty) {
   ASSERT_EQ(10006, file_meta.fd.largest_seqno);
   ASSERT_EQ(17, file_meta.oldest_blob_file_number);
   mock_table_factory_->AssertSingleFile(inserted_keys);
+  job_context.Clean();
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: removable Delta feature
+// verification coverage.
+TEST_F(DeltaFlushJobTest, FlushMemTableUsesPreSplitDirectory) {
+  JobContext job_context(0);
+  auto* cfd = versions_->GetColumnFamilySet()->GetColumnFamily("Delta");
+  ASSERT_NE(nullptr, cfd);
+  ASSERT_TRUE(cfd->IsDeltaColumnFamily());
+  auto* directory = cfd->delta_l0_partition_directory();
+  ASSERT_NE(nullptr, directory);
+
+  for (uint64_t tableid = 1; tableid <= 32; ++tableid) {
+    directory->Observe(tableid);
+  }
+  for (uint64_t tableid = 1000; tableid <= 1032; ++tableid) {
+    directory->Observe(tableid);
+  }
+  ASSERT_EQ(2U, directory->PartitionCount());
+
+  MemTable* mem = cfd->ConstructNewMemtable(*cfd->GetLatestMutableCFOptions(),
+                                            kMaxSequenceNumber);
+  mem->SetID(1);
+  mem->Ref();
+
+  mock::KVVector low_partition_keys;
+  mock::KVVector high_partition_keys;
+  auto pad_tableid = [](uint64_t tableid) {
+    std::string tableid_str = std::to_string(tableid);
+    if (tableid_str.size() < 4) {
+      tableid_str.insert(0, 4 - tableid_str.size(), '0');
+    }
+    return tableid_str;
+  };
+
+  SequenceNumber seq = 1;
+  for (uint64_t tableid = 1; tableid <= 32; ++tableid, ++seq) {
+    const std::string user_key = "1_" + pad_tableid(tableid) + "_1_0001_1";
+    const std::string value = "value" + std::to_string(tableid);
+    ASSERT_OK(mem->Add(seq, kTypeValue, user_key, value,
+                       nullptr /* kv_prot_info */));
+    InternalKey internal_key(user_key, seq, kTypeValue);
+    low_partition_keys.push_back({internal_key.Encode().ToString(), value});
+  }
+  for (uint64_t tableid = 1000; tableid <= 1032; ++tableid, ++seq) {
+    const std::string user_key = "1_" + pad_tableid(tableid) + "_1_0001_1";
+    const std::string value = "value" + std::to_string(tableid);
+    ASSERT_OK(mem->Add(seq, kTypeValue, user_key, value,
+                       nullptr /* kv_prot_info */));
+    InternalKey internal_key(user_key, seq, kTypeValue);
+    high_partition_keys.push_back({internal_key.Encode().ToString(), value});
+  }
+  mock::SortKVVector(&low_partition_keys);
+  mock::SortKVVector(&high_partition_keys);
+
+  autovector<MemTable*> to_delete;
+  mem->ConstructFragmentedRangeTombstones();
+  cfd->imm()->Add(mem, &to_delete);
+
+  EventLogger event_logger(db_options_.info_log.get());
+  SnapshotChecker* snapshot_checker = nullptr;
+  FlushJob flush_job(
+      dbname_, cfd, db_options_, *cfd->GetLatestMutableCFOptions(),
+      std::numeric_limits<uint64_t>::max() /* memtable_id */, env_options_,
+      versions_.get(), &mutex_, &shutting_down_, {}, kMaxSequenceNumber,
+      snapshot_checker, &job_context, FlushReason::kTest, nullptr, nullptr,
+      nullptr, kNoCompression, db_options_.statistics.get(), &event_logger,
+      true, true /* sync_output_directory */, true /* write_manifest */,
+      Env::Priority::USER, nullptr /*IOTracer*/, empty_seqno_to_time_mapping_);
+
+  FileMetaData file_meta;
+  mutex_.Lock();
+  flush_job.PickMemTable();
+  ASSERT_OK(flush_job.Run(nullptr /* prep_tracker */, &file_meta));
+  mutex_.Unlock();
+
+  const auto& level0_files = cfd->current()->storage_info()->LevelFiles(0);
+  ASSERT_EQ(2U, level0_files.size());
+
+  const FileMetaData* low_file = nullptr;
+  const FileMetaData* high_file = nullptr;
+  for (const auto* level0_file : level0_files) {
+    ASSERT_TRUE(level0_file->delta_l0_meta.valid);
+    if (level0_file->delta_l0_meta.tableid_min < 1000) {
+      low_file = level0_file;
+    } else {
+      high_file = level0_file;
+    }
+  }
+
+  ASSERT_NE(nullptr, low_file);
+  ASSERT_NE(nullptr, high_file);
+  ASSERT_EQ(1U, low_file->delta_l0_meta.tableid_min);
+  ASSERT_EQ(32U, low_file->delta_l0_meta.tableid_max);
+  ASSERT_EQ(1000U, high_file->delta_l0_meta.tableid_min);
+  ASSERT_EQ(1032U, high_file->delta_l0_meta.tableid_max);
+  ASSERT_EQ(1U, low_file->delta_l0_meta.partition_generation);
+  ASSERT_EQ(1U, high_file->delta_l0_meta.partition_generation);
+  ASSERT_NE(low_file->delta_l0_meta.partition_id,
+            high_file->delta_l0_meta.partition_id);
+  ASSERT_EQ(file_meta.delta_l0_meta.tableid_min,
+            low_file->delta_l0_meta.tableid_min);
+  ASSERT_EQ(file_meta.delta_l0_meta.tableid_max,
+            low_file->delta_l0_meta.tableid_max);
+
+  mock_table_factory_->AssertLatestFiles(
+      {low_partition_keys, high_partition_keys});
+
+  for (auto* m : to_delete) {
+    delete m;
+  }
   job_context.Clean();
 }
 

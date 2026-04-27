@@ -252,6 +252,20 @@ class VersionBuilder::Rep {
   NewestFirstByEpochNumber level_zero_cmp_by_epochno_;
   NewestFirstBySeqNo level_zero_cmp_by_seqno_;
   BySmallestKey level_nonzero_cmp_;
+  // 当前一组 VersionEdit 是否携带 Delta L0 partition directory snapshot。
+  //
+  // Delta Column Family 会维护一个 L0 partition directory，用于记录
+  // tableid 到 L0 partition 的映射、partition generation、split 状态等信息。
+  // 当 VersionEdit 中包含该 snapshot 时，需要在应用 edit 的过程中保留它，
+  // 最终写入 VersionStorageInfo，供 reopen/recovery 时恢复目录状态。
+  bool has_delta_l0_partition_snapshot_ = false;
+  // Delta L0 partition directory 的编码快照内容。
+  //
+  // 该字符串通常来自 manifest/version edit，内容由
+  // DeltaL0PartitionDirectory::EncodeSnapshot() 生成。
+  // replay manifest 或应用 VersionEdit 时，如果后续 edit 没有更新 snapshot，
+  // 可以继续沿用 base_vstorage 中已有的 snapshot。
+  std::string delta_l0_partition_snapshot_;
 
   // Mutable metadata objects for all blob files affected by the series of
   // version edits.
@@ -276,6 +290,21 @@ class VersionBuilder::Rep {
     assert(ioptions_);
 
     levels_ = new LevelState[num_levels_];
+    // 初始化 VersionBuilder::Rep 时，如果 base_vstorage 中已经保存了
+    // Delta L0 partition directory snapshot，则先继承这份 snapshot。
+    //
+    // 这样在应用一系列 VersionEdit 时，如果新的 edit 没有显式携带
+    // Delta L0 partition snapshot，构建出的新 VersionStorageInfo 仍然可以
+    // 继承上一版的目录状态，避免 Delta L0 partition directory 在普通 edit
+    // 应用过程中丢失。
+    if (base_vstorage_ != nullptr && base_vstorage_->HasDeltaL0PartitionSnapshot()) {
+      has_delta_l0_partition_snapshot_ = true;
+      // 拷贝 base version 中持久化的 Delta L0 partition snapshot。
+      // 后续如果遇到新的 VersionEdit::delta_l0_partition_snapshot，
+      // 会用新的 snapshot 覆盖这里继承的旧 snapshot。
+      delta_l0_partition_snapshot_ =
+          base_vstorage_->GetDeltaL0PartitionSnapshot();
+    }
   }
 
   ~Rep() {
@@ -904,6 +933,21 @@ class VersionBuilder::Rep {
         return s;
       }
     }
+    // 如果当前 VersionEdit 携带了 Delta L0 partition directory snapshot，
+    // 则用 edit 中的新 snapshot 覆盖当前 VersionBuilder::Rep 中保存的 snapshot。
+    //
+    // 该 snapshot 记录 Delta L0 partition directory 的持久化状态，
+    // 包括 partition 边界、partition_id、generation、split_count、
+    // observed tableids 等信息。
+    //
+    // 应用 VersionEdit 时保存它，是为了在构建新的 VersionStorageInfo 后，
+    // 能将最新的 Delta L0 partition directory 状态继续传递下去；
+    // 这样 DB reopen / manifest replay / recovery 时可以恢复 Delta L0
+    // partition directory，而不是只能从 L0 文件元信息中做不完整推断。
+    if (edit->HasDeltaL0PartitionSnapshot()) {
+      has_delta_l0_partition_snapshot_ = true;
+      delta_l0_partition_snapshot_ = edit->GetDeltaL0PartitionSnapshot();
+    }
     return Status::OK();
   }
 
@@ -1226,6 +1270,31 @@ class VersionBuilder::Rep {
     }
   }
 
+  // 将当前 VersionBuilder::Rep 中保存的 Delta L0 partition directory snapshot
+  // 写入目标 VersionStorageInfo。
+  //
+  // 该函数通常在 VersionBuilder 构建新 VersionStorageInfo 的过程中调用，
+  // 用于把应用 VersionEdit 后得到的最新 Delta L0 partition 目录状态
+  // 传递到新的 vstorage 中。
+  //
+  // 如果当前 Rep 中有有效 snapshot：
+  //   - 写入 vstorage，供后续 Version 使用；
+  //   - manifest replay / DB reopen 时可基于该 snapshot 恢复
+  //     DeltaL0PartitionDirectory。
+  //
+  // 如果当前 Rep 中没有 snapshot：
+  //   - 清空 vstorage 中的 Delta L0 partition snapshot；
+  //   - 避免新 VersionStorageInfo 误继承旧的目录状态。
+  void SaveDeltaL0PartitionSnapshotTo(VersionStorageInfo* vstorage) const {
+    if (has_delta_l0_partition_snapshot_) {
+      // 保存最新的 Delta L0 partition directory 编码快照。
+      vstorage->SetDeltaL0PartitionSnapshot(delta_l0_partition_snapshot_);
+    } else {
+      // 当前版本没有 Delta L0 partition snapshot，显式清空目标 vstorage 中的状态。
+      vstorage->ClearDeltaL0PartitionSnapshot();
+    }
+  }
+
   // Save the current state in *vstorage.
   Status SaveTo(VersionStorageInfo* vstorage) const {
     Status s;
@@ -1248,6 +1317,8 @@ class VersionBuilder::Rep {
     SaveBlobFilesTo(vstorage);
 
     SaveCompactCursorsTo(vstorage);
+
+    SaveDeltaL0PartitionSnapshotTo(vstorage);
 
     s = CheckConsistency(vstorage);
     return s;

@@ -253,6 +253,62 @@ TEST_F(CompactionPickerTest, Level0Trigger) {
   ASSERT_EQ(2U, compaction->input(0, 1)->fd.GetNumber());
 }
 
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: removable Delta feature
+// verification coverage.
+// 测试 Delta L0 partition-aware compaction priority 是否会优先选择“热点”分区。
+// 这里构造两个 Delta L0 partition：
+// 1. partition 11：包含 4 个文件；
+// 2. partition 22：包含 2 个文件。
+//
+// 在 level0_file_num_compaction_trigger = 4 的配置下，partition 11 的
+// 文件数压力更高，因此 compaction picker 应该优先选择 partition 11
+// 中的文件，而不是 partition 22。
+TEST_F(CompactionPickerTest, DeltaL0PriorityPrefersHotPartition) {
+  NewVersionStorage(6, kCompactionStyleLevel);
+  cf_name_ = "Delta";
+  mutable_cf_options_.level0_file_num_compaction_trigger = 4;
+
+  Add(0, 1U, "100", "149", 10U);
+  Add(0, 2U, "150", "199", 10U);
+  Add(0, 3U, "200", "249", 10U);
+  Add(0, 4U, "250", "299", 10U);
+  Add(0, 5U, "900", "949", 15U);
+  Add(0, 6U, "950", "999", 15U);
+
+  for (uint32_t file_number : {1U, 2U, 3U, 4U}) {
+    FileMetaData* const file = file_map_[file_number].first;
+    file->delta_l0_meta.valid = true;
+    file->delta_l0_meta.partition_id = 11;
+    file->delta_l0_meta.partition_generation = 1;
+    file->delta_l0_meta.tableid_min = 1;
+    file->delta_l0_meta.tableid_max = 32;
+  }
+  for (uint32_t file_number : {5U, 6U}) {
+    FileMetaData* const file = file_map_[file_number].first;
+    file->delta_l0_meta.valid = true;
+    file->delta_l0_meta.partition_id = 22;
+    file->delta_l0_meta.partition_generation = 1;
+    file->delta_l0_meta.tableid_min = 1000;
+    file->delta_l0_meta.tableid_max = 1032;
+  }
+
+  UpdateVersionStorageInfo();
+
+  std::unique_ptr<Compaction> compaction(level_compaction_picker.PickCompaction(
+      cf_name_, mutable_cf_options_, mutable_db_options_, vstorage_.get(),
+      &log_buffer_));
+  ASSERT_TRUE(compaction.get() != nullptr);
+  ASSERT_EQ(0, compaction->start_level());
+  ASSERT_EQ(1, compaction->output_level());
+  ASSERT_GE(compaction->num_input_files(0), 1U);
+  for (size_t i = 0; i < compaction->num_input_files(0); ++i) {
+    ASSERT_EQ(11U, compaction->input(0, i)->delta_l0_meta.partition_id);
+    ASSERT_EQ(1U, compaction->input(0, i)->delta_l0_meta.partition_generation);
+    ASSERT_EQ(1U, compaction->input(0, i)->delta_l0_meta.tableid_min);
+    ASSERT_EQ(32U, compaction->input(0, i)->delta_l0_meta.tableid_max);
+  }
+}
+
 TEST_F(CompactionPickerTest, Level1Trigger) {
   NewVersionStorage(6, kCompactionStyleLevel);
   Add(1, 66U, "150", "200", 1000000000U);

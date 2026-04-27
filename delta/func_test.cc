@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <vector>
 
+#include "db/delta_l0.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
@@ -42,6 +43,22 @@ const int kColdScanTarget = 150;        // 普通访问目标
 // 辅助工具与状态管理
 // ==========================================
 
+namespace {
+
+void AppendBigEndian32(std::string* dst, uint32_t value) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    dst->push_back(static_cast<char>((value >> shift) & 0xFF));
+  }
+}
+
+void AppendBigEndian64(std::string* dst, uint64_t value) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    dst->push_back(static_cast<char>((value >> shift) & 0xFF));
+  }
+}
+
+}  // namespace
+
 bool CleanupDBPath(const std::string& path) {
   std::error_code ec;
   if (path != kNativeDBPath && path != kDeltaDBPath) {
@@ -54,26 +71,21 @@ bool CleanupDBPath(const std::string& path) {
 
 std::string GenerateKey(uint64_t cuid, int row_id) {
   std::string key;
-  key.resize(40);
-  std::memset(&key[0], 0, 40);
-  unsigned char* p = reinterpret_cast<unsigned char*>(&key[0]) + 16;
-  for (int i = 0; i < 8; ++i) {
-    p[i] = (cuid >> (56 - 8 * i)) & 0xFF; // Big Endian
-  }
-  char row_buf[16];
-  snprintf(row_buf, sizeof(row_buf), "%010d", row_id);
-  std::memcpy(&key[24], row_buf, 10);
+  key.reserve(kDeltaBinaryKeySize);
+  AppendBigEndian32(&key, 1);
+  AppendBigEndian32(&key, 1);
+  AppendBigEndian64(&key, cuid);
+  AppendBigEndian32(&key, static_cast<uint32_t>(row_id));
+  AppendBigEndian64(&key, 1);
   return key;
 }
 
 uint64_t ExtractCUID(const rocksdb::Slice& key) {
-  if (key.size() < 24) return 0;
-  const unsigned char* p = reinterpret_cast<const unsigned char*>(key.data()) + 16;
-  uint64_t c = 0;
-  for (int i = 0; i < 8; ++i) {
-    c = (c << 8) | p[i];
+  uint64_t cuid = 0;
+  if (!TryParseDeltaBinaryKeyPrefix(key, nullptr, nullptr, &cuid)) {
+    return 0;
   }
-  return c;
+  return cuid;
 }
 
 struct ThreadStats {

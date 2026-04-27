@@ -27,6 +27,7 @@
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction.h"
 #include "db/compaction/file_pri.h"
+#include "db/delta_l0.h"
 #include "db/dbformat.h"
 #include "db/internal_stats.h"
 #include "db/log_reader.h"
@@ -130,6 +131,32 @@ Status OverlapWithIterator(const Comparator* ucmp,
   return iter->status();
 }
 
+bool GetDeltaL0PointLookupTableId(const std::string& cf_name,
+                                  const Slice& user_key,
+                                  uint64_t* tableid) {
+  return IsDeltaColumnFamilyName(cf_name) &&
+         TryParseDeltaTableIdFromUserKey(user_key, tableid);
+}
+
+bool GetDeltaL0IterateTableIdRange(const std::string& cf_name,
+                                   const ReadOptions& read_options,
+                                   uint64_t* tableid_min,
+                                   uint64_t* tableid_max) {
+  if (!IsDeltaColumnFamilyName(cf_name) ||
+      read_options.iterate_lower_bound == nullptr ||
+      read_options.iterate_upper_bound == nullptr ||
+      !TryParseDeltaTableIdFromUserKey(*read_options.iterate_lower_bound,
+                                       tableid_min) ||
+      !TryParseDeltaTableIdFromUserKey(*read_options.iterate_upper_bound,
+                                       tableid_max)) {
+    return false;
+  }
+  if (*tableid_max < *tableid_min) {
+    std::swap(*tableid_min, *tableid_max);
+  }
+  return true;
+}
+
 // Class to help choose the next file to search for the particular key.
 // Searches and returns files level by level.
 // We can search level-by-level since entries never hop across
@@ -141,7 +168,9 @@ class FilePicker {
   FilePicker(const Slice& user_key, const Slice& ikey,
              autovector<LevelFilesBrief>* file_levels, unsigned int num_levels,
              FileIndexer* file_indexer, const Comparator* user_comparator,
-             const InternalKeyComparator* internal_comparator)
+             const InternalKeyComparator* internal_comparator,
+             bool delta_l0_pruning_enabled = false,
+             uint64_t delta_l0_target_tableid = 0)
       : num_levels_(num_levels),
         curr_level_(static_cast<unsigned int>(-1)),
         returned_file_level_(static_cast<unsigned int>(-1)),
@@ -155,7 +184,9 @@ class FilePicker {
         ikey_(ikey),
         file_indexer_(file_indexer),
         user_comparator_(user_comparator),
-        internal_comparator_(internal_comparator) {
+        internal_comparator_(internal_comparator),
+        delta_l0_pruning_enabled_(delta_l0_pruning_enabled),
+        delta_l0_target_tableid_(delta_l0_target_tableid) {
     // Setup member variables to search first level.
     search_ended_ = !PrepareNextLevel();
     if (!search_ended_) {
@@ -180,6 +211,13 @@ class FilePicker {
         is_hit_file_last_in_level_ =
             curr_index_in_curr_level_ == curr_file_level_->num_files - 1;
         int cmp_largest = -1;
+
+        if (curr_level_ == 0 && delta_l0_pruning_enabled_ &&
+            !DeltaL0FileMayContainTableId(*f->file_metadata,
+                                          delta_l0_target_tableid_)) {
+          ++curr_index_in_curr_level_;
+          continue;
+        }
 
         // Do key range filtering of files or/and fractional cascading if:
         // (1) not all the files are in level 0, or
@@ -266,6 +304,8 @@ class FilePicker {
   FileIndexer* file_indexer_;
   const Comparator* user_comparator_;
   const InternalKeyComparator* internal_comparator_;
+  bool delta_l0_pruning_enabled_;
+  uint64_t delta_l0_target_tableid_;
 
   // Setup local variables to search next level.
   // Returns false if there are no more levels to search.
@@ -1931,10 +1971,22 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
 
   auto* arena = merge_iter_builder->GetArena();
   if (level == 0) {
+    uint64_t l0_tableid_min = 0;
+    uint64_t l0_tableid_max = 0;
+    const bool has_delta_l0_range = GetDeltaL0IterateTableIdRange(
+        cfd_->GetName(), read_options, &l0_tableid_min, &l0_tableid_max);
+    uint64_t l0_candidates_after_prune = 0;
     // Merge all level zero files together since they may overlap
     TruncatedRangeDelIterator* tombstone_iter = nullptr;
     for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
       const auto& file = storage_info_.LevelFilesBrief(0).files[i];
+      if (has_delta_l0_range &&
+          !DeltaL0FileMayOverlapTableIdRange(*file.file_metadata,
+                                             l0_tableid_min,
+                                             l0_tableid_max)) {
+        continue;
+      }
+      ++l0_candidates_after_prune;
       auto table_iter = cfd_->table_cache()->NewIterator(
           read_options, soptions, cfd_->internal_comparator(),
           *file.file_metadata, /*range_del_agg=*/nullptr,
@@ -1958,7 +2010,22 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
       // If users execute one range query per iterator, there may be some
       // discrepancy here.
       for (FileMetaData* meta : storage_info_.LevelFiles(0)) {
-        sample_file_read_inc(meta);
+        if (!has_delta_l0_range ||
+            DeltaL0FileMayOverlapTableIdRange(*meta, l0_tableid_min,
+                                              l0_tableid_max)) {
+          sample_file_read_inc(meta);
+        }
+      }
+    }
+    if (has_delta_l0_range) {
+      const DeltaL0PartitionDirectory* const directory =
+          cfd_->delta_l0_partition_directory();
+      if (directory != nullptr) {
+        // DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: candidate counting for
+        // temporary Delta L0 pruning introspection.
+        directory->RecordScanL0CandidateFiles(
+            storage_info_.LevelFilesBrief(0).num_files,
+            l0_candidates_after_prune);
       }
     }
   } else if (storage_info_.LevelFilesBrief(level).num_files > 0) {
@@ -2002,8 +2069,24 @@ Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
   *overlap = false;
 
   if (level == 0) {
+    uint64_t l0_tableid_min = 0;
+    uint64_t l0_tableid_max = 0;
+    const bool has_delta_l0_range = IsDeltaColumnFamilyName(cfd_->GetName()) &&
+                                    TryParseDeltaTableIdFromUserKey(
+                                        smallest_user_key, &l0_tableid_min) &&
+                                    TryParseDeltaTableIdFromUserKey(
+                                        largest_user_key, &l0_tableid_max);
+    if (has_delta_l0_range && l0_tableid_max < l0_tableid_min) {
+      std::swap(l0_tableid_min, l0_tableid_max);
+    }
     for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
       const auto file = &storage_info_.LevelFilesBrief(0).files[i];
+      if (has_delta_l0_range &&
+          !DeltaL0FileMayOverlapTableIdRange(*file->file_metadata,
+                                             l0_tableid_min,
+                                             l0_tableid_max)) {
+        continue;
+      }
       if (AfterFile(ucmp, &smallest_user_key, file) ||
           BeforeFile(ucmp, &largest_user_key, file)) {
         continue;
@@ -2092,6 +2175,10 @@ VersionStorageInfo::VersionStorageInfo(
     oldest_snapshot_seqnum_ = ref_vstorage->oldest_snapshot_seqnum_;
     compact_cursor_ = ref_vstorage->compact_cursor_;
     compact_cursor_.resize(num_levels_);
+    has_delta_l0_partition_snapshot_ =
+        ref_vstorage->has_delta_l0_partition_snapshot_;
+    delta_l0_partition_snapshot_ =
+        ref_vstorage->delta_l0_partition_snapshot_;
   }
 }
 
@@ -2308,10 +2395,31 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     pinned_iters_mgr->StartPinning();
   }
 
+  uint64_t delta_l0_target_tableid = 0;
+  const bool delta_l0_pruning_enabled = GetDeltaL0PointLookupTableId(
+      cfd_->GetName(), user_key, &delta_l0_target_tableid);
+  if (delta_l0_pruning_enabled) {
+    const DeltaL0PartitionDirectory* const directory =
+        cfd_->delta_l0_partition_directory();
+    if (directory != nullptr) {
+      // DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: candidate counting for
+      // temporary Delta L0 pruning introspection.
+      uint64_t l0_candidates_after_prune = 0;
+      for (FileMetaData* file_meta : storage_info_.LevelFiles(0)) {
+        if (DeltaL0FileMayContainTableId(*file_meta, delta_l0_target_tableid)) {
+          ++l0_candidates_after_prune;
+        }
+      }
+      directory->RecordGetL0CandidateFiles(storage_info_.LevelFiles(0).size(),
+                                           l0_candidates_after_prune);
+    }
+  }
+
   FilePicker fp(user_key, ikey, &storage_info_.level_files_brief_,
                 storage_info_.num_non_empty_levels_,
                 &storage_info_.file_indexer_, user_comparator(),
-                internal_comparator());
+                internal_comparator(), delta_l0_pruning_enabled,
+                delta_l0_target_tableid);
   FdWithKeyRange* f = fp.GetNextFile();
 
   while (f != nullptr) {
@@ -3681,6 +3789,9 @@ bool CompareCompensatedSizeDescending(const Fsize& first, const Fsize& second) {
 }  // anonymous namespace
 
 void VersionStorageInfo::AddFile(int level, FileMetaData* f) {
+  if (level != 0) {
+    f->delta_l0_meta = {};
+  }
   auto& level_files = files_[level];
   level_files.push_back(f);
 
@@ -5705,6 +5816,7 @@ Status VersionSet::Recover(
     }
     if (s.ok()) {
       RecoverEpochNumbers();
+      RecoverDeltaL0PartitionDirectories();
     }
   }
 
@@ -5878,6 +5990,7 @@ Status VersionSet::TryRecoverFromOneManifest(
   s = handler_pit.status();
   if (s.ok()) {
     RecoverEpochNumbers();
+    RecoverDeltaL0PartitionDirectories();
   }
   return s;
 }
@@ -5889,6 +6002,16 @@ void VersionSet::RecoverEpochNumbers() {
     }
     assert(cfd->initialized());
     cfd->RecoverEpochNumbers();
+  }
+}
+
+void VersionSet::RecoverDeltaL0PartitionDirectories() {
+  for (auto cfd : *column_family_set_) {
+    if (cfd->IsDropped()) {
+      continue;
+    }
+    assert(cfd->initialized());
+    cfd->RecoverDeltaL0PartitionDirectory();
   }
 }
 
@@ -6268,15 +6391,7 @@ Status VersionSet::WriteCurrentStateToManifest(
 
         for (const auto& f : level_files) {
           assert(f);
-
-          edit.AddFile(level, f->fd.GetNumber(), f->fd.GetPathId(),
-                       f->fd.GetFileSize(), f->smallest, f->largest,
-                       f->fd.smallest_seqno, f->fd.largest_seqno,
-                       f->marked_for_compaction, f->temperature,
-                       f->oldest_blob_file_number, f->oldest_ancester_time,
-                       f->file_creation_time, f->epoch_number, f->file_checksum,
-                       f->file_checksum_func_name, f->unique_id,
-                       f->compensated_range_deletion_size);
+          edit.AddFile(level, *f);
         }
       }
 
@@ -6316,6 +6431,14 @@ Status VersionSet::WriteCurrentStateToManifest(
       const std::string& full_history_ts_low = iter->second.full_history_ts_low;
       if (!full_history_ts_low.empty()) {
         edit.SetFullHistoryTsLow(full_history_ts_low);
+      }
+
+      if (cfd->IsDeltaColumnFamily()) {
+        const DeltaL0PartitionDirectory* const directory =
+            cfd->delta_l0_partition_directory();
+        if (directory != nullptr) {
+          edit.SetDeltaL0PartitionSnapshot(directory->EncodeSnapshot());
+        }
       }
 
       edit.SetLastSequence(descriptor_last_sequence_);
@@ -6991,6 +7114,7 @@ Status ReactiveVersionSet::Recover(
   s = manifest_tailer_->status();
   if (s.ok()) {
     RecoverEpochNumbers();
+    RecoverDeltaL0PartitionDirectories();
   }
   return s;
 }

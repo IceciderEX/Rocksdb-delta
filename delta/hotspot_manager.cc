@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include "delta/diag_log.h"
+#include "db/delta_l0.h"
 #include "db/dbformat.h"
 #include "logging/logging.h"
 #include "rocksdb/env.h"
@@ -20,18 +21,6 @@ constexpr char kGDCTLogMagic[8] = {'G', 'D', 'C', 'T', 'V', '2', '\r', '\n'};
 constexpr size_t kGDCTLogMagicSize = sizeof(kGDCTLogMagic);
 constexpr size_t kGDCTWalPayloadSize = 1 + sizeof(uint64_t) * 5;
 constexpr size_t kGDCTWalRecordSize = kGDCTWalPayloadSize + sizeof(uint32_t);
-
-uint64_t DecodeBigEndian64(const char* data) {
-  const auto* bytes = reinterpret_cast<const unsigned char*>(data);
-  return (static_cast<uint64_t>(bytes[0]) << 56) |
-         (static_cast<uint64_t>(bytes[1]) << 48) |
-         (static_cast<uint64_t>(bytes[2]) << 40) |
-         (static_cast<uint64_t>(bytes[3]) << 32) |
-         (static_cast<uint64_t>(bytes[4]) << 24) |
-         (static_cast<uint64_t>(bytes[5]) << 16) |
-         (static_cast<uint64_t>(bytes[6]) << 8) |
-         static_cast<uint64_t>(bytes[7]);
-}
 
 void EncodeWalRecord(const GDCTDeleteRecord& record, std::string* out) {
   out->clear();
@@ -236,13 +225,20 @@ uint64_t HotspotManager::RefreshOldestActiveReadEpoch() const {
 }
 
 bool HotspotManager::ExtractGDCTKey(const Slice& key, GDCTKey* gdct_key) const {
-  if (gdct_key == nullptr || key.size() < 24) {
+  if (gdct_key == nullptr) {
     return false;
   }
 
-  gdct_key->dbid = DecodeBigEndian64(key.data());
-  gdct_key->tableid = DecodeBigEndian64(key.data() + 8);
-  gdct_key->cuid = DecodeBigEndian64(key.data() + 16);
+  uint32_t dbid = 0;
+  uint32_t relid = 0;
+  uint64_t cuid = 0;
+  if (!TryParseDeltaBinaryKeyPrefix(key, &dbid, &relid, &cuid)) {
+    return false;
+  }
+
+  gdct_key->dbid = dbid;
+  gdct_key->tableid = relid;
+  gdct_key->cuid = cuid;
   return true;
 }
 

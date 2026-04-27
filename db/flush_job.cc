@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "db/builder.h"
+#include "db/delta_l0.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
 #include "db/event_helpers.h"
@@ -48,6 +49,220 @@
 #include "util/stop_watch.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+// Delta flush 专用的分区迭代器。
+// 
+// 作用：
+// 在 flush memtable 生成 L0 文件时，将 base iterator 中的数据按
+// Delta L0 partition 分段输出，确保一次 flush 可以按 partition 边界
+// 拆成多个 SST 文件，而不是把多个 partition 的 key 混在同一个 L0 文件中。
+//
+// 工作方式：
+// 1. 外层 flush 逻辑创建该 iterator 包装原始 InternalIterator；
+// 2. SeekToFirst() 定位到当前待 flush 数据的第一条 key；
+// 3. 根据第一条 key 的 tableid 查询/注册所属 Delta L0 partition；
+// 4. Next() 只在当前 partition 范围内推进；
+// 5. 一旦遇到不属于 current_partition_ 的 tableid，valid_ 变为 false；
+// 6. 外层 flush 结束当前 SST 文件后，可以再次调用 SeekToFirst() / 后续流程
+//    从 base_iter_ 当前停留的位置继续处理下一个 partition。
+class DeltaPartitionedFlushIterator : public InternalIterator {
+ public:
+  // 构造 Delta partition-aware flush iterator。
+  //
+  // base_iter 是原始 memtable/internal iterator，数据读取仍由它完成；
+  // directory 用于根据 tableid 查找、注册和动态 split Delta L0 partition。
+  DeltaPartitionedFlushIterator(InternalIterator* base_iter,
+                                DeltaL0PartitionDirectory* directory)
+      : base_iter_(base_iter), directory_(directory) {}
+
+  // 当前 iterator 是否有效。
+  // 只有内部状态正常且当前 key 仍属于当前 partition 时才返回 true。
+  bool Valid() const override { return status_.ok() && valid_; }
+
+  // 定位到当前分区段的第一条记录。
+  //
+  // 第一次调用时会将 base_iter_ SeekToFirst()；
+  // 后续调用不会重置 base_iter_，而是从上一次停止的位置继续，
+  // 这样可以让 flush 逻辑逐个 partition 地生成多个输出文件。
+  void SeekToFirst() override {
+    status_ = Status::OK();
+    valid_ = false;
+    if (!initialized_) {
+      base_iter_->SeekToFirst();
+      initialized_ = true;
+    }
+    if (!base_iter_->status().ok()) {
+      status_ = base_iter_->status();
+      return;
+    }
+    PrepareCurrentPartition();
+  }
+
+  // 不支持反向定位到最后一条记录。
+  // 该 iterator 只服务于 flush 顺序写文件场景，因此只需要正向遍历。
+  void SeekToLast() override {
+    status_ = Status::NotSupported("DeltaPartitionedFlushIterator::SeekToLast");
+    valid_ = false;
+  }
+
+  // 不支持任意 Seek。
+  // flush 过程中要求从当前位置顺序扫描，避免破坏按 partition 分段输出的状态。
+  void Seek(const Slice& /*target*/) override {
+    status_ = Status::NotSupported("DeltaPartitionedFlushIterator::Seek");
+    valid_ = false;
+  }
+
+  // 不支持反向 Seek。
+  void SeekForPrev(const Slice& /*target*/) override {
+    status_ =
+        Status::NotSupported("DeltaPartitionedFlushIterator::SeekForPrev");
+    valid_ = false;
+  }
+
+  // 前进到下一条记录。
+  // 如果下一条记录仍属于 current_partition_，iterator 保持有效；
+  // 如果跨越到其他 partition，则 valid_ 变为 false，
+  // 外层 flush 可以结束当前输出文件并开始下一个 partition 文件。
+  void Next() override {
+    assert(valid_);
+    base_iter_->Next();
+    AdvanceWithinPartition();
+  }
+
+  // 不支持反向遍历。
+  void Prev() override {
+    status_ = Status::NotSupported("DeltaPartitionedFlushIterator::Prev");
+    valid_ = false;
+  }
+
+  // 返回当前 key。
+  // 实际 key 数据来自底层 base_iter_。
+  Slice key() const override {
+    assert(valid_);
+    return base_iter_->key();
+  }
+
+  // 返回当前 value。
+  // 实际 value 数据来自底层 base_iter_。
+  Slice value() const override {
+    assert(valid_);
+    return base_iter_->value();
+  }
+
+  // 返回 iterator 状态。
+  // 优先返回本包装 iterator 自己记录的错误；
+  // 如果自身状态正常，则透传 base_iter_ 的状态。
+  Status status() const override {
+    if (!status_.ok()) {
+      return status_;
+    }
+    return base_iter_->status();
+  }
+
+  // 准备当前 value。
+  // value 的实际加载仍交给底层 base_iter_。
+  bool PrepareValue() override {
+    return base_iter_->PrepareValue();
+  }
+
+  // 返回当前输出段对应的 Delta L0 partition。
+  // flush 结束当前 SST 文件时，可以把该 partition 的 partition_id
+  // 和 generation 写入输出文件的 FileMetaData::delta_l0_meta。
+  const DeltaL0Partition& current_partition() const {
+    return current_partition_;
+  }
+
+  // 判断底层 base_iter_ 是否还有尚未 flush 的数据。
+  //
+  // 当当前 partition 段结束时，本 iterator 的 Valid() 可能为 false，
+  // 但 base_iter_ 仍然可能停在下一个 partition 的第一条 key 上；
+  // 外层逻辑可通过该函数判断是否需要继续打开下一个输出文件。
+  bool HasPendingData() const {
+    return status_.ok() && base_iter_->Valid();
+  }
+
+ private:
+  // 根据 base_iter_ 当前 key 初始化当前 partition。
+  //
+  // 该函数会：
+  // 1. 从 internal key 中提取 user key；
+  // 2. 从 Delta user key 中解析 tableid；
+  // 3. 在 DeltaL0PartitionDirectory 中查找并注册该 tableid；
+  // 4. 将查到的 partition 保存为 current_partition_；
+  // 5. 设置 last_tableid_，用于后续避免重复 Observe 同一个 tableid。
+  void PrepareCurrentPartition() {
+    if (!base_iter_->Valid()) {
+      valid_ = false;
+      return;
+    }
+
+    uint64_t tableid = 0;
+    if (!TryParseDeltaTableIdFromUserKey(ExtractUserKey(base_iter_->key()),
+                                         &tableid)) {
+      status_ = Status::InvalidArgument("Invalid Delta user key during flush");
+      valid_ = false;
+      return;
+    }
+
+    current_partition_ = directory_->LookupAndRegister(tableid);
+    last_tableid_ = tableid;
+    valid_ = true;
+  }
+
+  // 在当前 partition 内推进。
+  //
+  // 如果下一条 key 仍属于 current_partition_，则继续保持 valid；
+  // 如果下一条 key 属于其他 partition，则将 valid_ 置为 false，
+  // 表示当前输出文件的 partition 段已经结束。
+  void AdvanceWithinPartition() {
+    if (!base_iter_->status().ok()) {
+      status_ = base_iter_->status();
+      valid_ = false;
+      return;
+    }
+    if (!base_iter_->Valid()) {
+      valid_ = false;
+      return;
+    }
+
+    uint64_t tableid = 0;
+    if (!TryParseDeltaTableIdFromUserKey(ExtractUserKey(base_iter_->key()),
+                                         &tableid)) {
+      status_ = Status::InvalidArgument("Invalid Delta user key during flush");
+      valid_ = false;
+      return;
+    }
+
+    if (tableid != last_tableid_) {
+      directory_->Observe(tableid);
+      last_tableid_ = tableid;
+    }
+
+    valid_ = current_partition_.Contains(tableid);
+  }
+
+  // 被包装的底层 iterator，负责实际遍历 memtable/internal key-value。
+  InternalIterator* base_iter_;
+  // Delta L0 partition directory，用于根据 tableid 查找、注册和 split partition。
+  DeltaL0PartitionDirectory* directory_;
+  // 当前 flush 输出文件对应的 Delta L0 partition。
+  DeltaL0Partition current_partition_;
+  // 包装 iterator 自身记录的错误状态。
+  Status status_;
+  // 是否已经对 base_iter_ 执行过第一次 SeekToFirst。
+  // 后续 SeekToFirst 不会重头开始，而是从 base_iter_ 当前停留位置继续。
+  bool initialized_ = false;
+  // 当前包装 iterator 是否有效。
+  // valid_ 为 false 可能表示底层耗尽，也可能表示跨出了当前 partition。
+  bool valid_ = false;
+  // 上一次观察到的 tableid。
+  // 用于避免连续相同 tableid 重复调用 directory_->Observe()。
+  uint64_t last_tableid_ = 0;
+};
+
+}  // namespace
 
 const char* GetFlushReasonString(FlushReason flush_reason) {
   switch (flush_reason) {
@@ -478,6 +693,8 @@ Status FlushJob::MemPurge() {
         ioptions->enforce_single_del_contracts,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse,
         /*compaction=*/nullptr, compaction_filter.get(),
+        /*hotspot_manager=*/nullptr,
+        /*oldest_active_read_epoch=*/0,
         /*shutting_down=*/nullptr, ioptions->info_log, full_history_ts_low);
 
     // Set earliest sequence number in the new memtable
@@ -917,33 +1134,183 @@ Status FlushJob::WriteLevel0Table() {
       uint64_t memtable_payload_bytes = 0;
       uint64_t memtable_garbage_bytes = 0;
       IOStatus io_s;
+      // 记录本次 flush 产生的所有 L0 文件元信息。
+      //
+      // 普通 flush 通常只产生一个 SST 文件，原有逻辑只需要使用 meta_。
+      // Delta partitioned flush 可能会按 Delta L0 partition 边界拆成多个 SST，
+      // 因此需要用 output_metas 收集每个输出文件，最后统一写入 VersionEdit。
+      std::vector<FileMetaData> output_metas;
 
       const std::string* const full_history_ts_low =
           (full_history_ts_low_.empty()) ? nullptr : &full_history_ts_low_;
-      TableBuilderOptions tboptions(
-          *cfd_->ioptions(), mutable_cf_options_, cfd_->internal_comparator(),
-          cfd_->int_tbl_prop_collector_factories(), output_compression_,
-          mutable_cf_options_.compression_opts, cfd_->GetID(), cfd_->GetName(),
-          0 /* level */, false /* is_bottommost */,
-          TableFileCreationReason::kFlush, oldest_key_time, current_time,
-          db_id_, db_session_id_, 0 /* target_file_size */,
-          meta_.fd.GetNumber());
       const SequenceNumber job_snapshot_seq =
           job_context_->GetJobSnapshotSequence();
-      s = BuildTable(
-          dbname_, versions_, db_options_, tboptions, file_options_,
-          cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
-          &blob_file_additions, existing_snapshots_,
-          earliest_write_conflict_snapshot_, job_snapshot_seq,
-          snapshot_checker_, mutable_cf_options_.paranoid_file_checks,
-          cfd_->internal_stats(), &io_s, io_tracer_,
-          BlobFileCreationReason::kFlush, seqno_to_time_mapping_, event_logger_,
-          job_context_->job_id, io_priority, &table_properties_, write_hint,
-          full_history_ts_low, blob_callback_, base_, &num_input_entries,
-          &memtable_payload_bytes, &memtable_garbage_bytes);
+      // 判断本次 flush 是否启用 Delta partition-aware flush。
+      //
+      // 启用条件：
+      // 1. 当前 Column Family 是 Delta Column Family；
+      // 2. Delta L0 partition directory 已经初始化；
+      // 3. 本次 flush 不包含 range deletion iterator。
+      //
+      // range_del_iters 为空才启用，是因为 partitioned flush 会把一个 memtable
+      // 按 partition 拆成多个 SST；range deletion 的边界和可见性处理更复杂，
+      // 当前仍走普通 flush 路径，避免错误拆分 range deletion。
+      const bool use_delta_partitioned_flush =
+          cfd_->IsDeltaColumnFamily() && cfd_->delta_l0_partition_directory() &&
+          range_del_iters.empty();
+      if (use_delta_partitioned_flush) {
+        // 用 DeltaPartitionedFlushIterator 包装原始 memtable iterator。
+        //
+        // 该 iterator 会按 Delta L0 partition 边界控制 Valid()：
+        // 当前 partition 内的数据返回 valid；
+        // 一旦遇到下一个 partition 的 key，就停止当前 BuildTable，
+        // 让外层循环创建下一个 SST 文件。
+        DeltaPartitionedFlushIterator partitioned_iter(
+            iter.get(), cfd_->delta_l0_partition_directory());
+
+        // 汇总所有 partition 输出文件的输入条数和 memtable 字节统计。
+        // 最终会写回 num_input_entries / memtable_payload_bytes /
+        // memtable_garbage_bytes，以保持后续校验和统计逻辑不变。
+        uint64_t total_input_entries = 0;
+        uint64_t total_payload_bytes = 0;
+        uint64_t total_garbage_bytes = 0;
+
+        // 第一个输出文件沿用 FlushJob 原本分配好的 meta_ 和 file number。
+        // 如果同一次 flush 需要生成更多 partition 文件，后续文件再申请新 file number。
+        bool first_output = true;
+
+        // 循环构建多个 SST 文件。
+        // 每次 BuildTable 只消费 partitioned_iter 当前 partition 范围内的数据。
+        // 如果底层 iterator 仍有未处理数据，则继续下一轮，为下一个 partition 建文件。
+        while (s.ok()) {
+          FileMetaData file_meta;
+          if (first_output) {
+            file_meta = meta_;
+          } else {
+            file_meta.fd = FileDescriptor(versions_->NewFileNumber(), 0, 0);
+            file_meta.epoch_number = cfd_->NewEpochNumber();
+          }
+          file_meta.oldest_ancester_time = oldest_ancester_time;
+          file_meta.file_creation_time = current_time;
+
+          TableProperties file_table_properties;
+          uint64_t file_input_entries = 0;
+          uint64_t file_payload_bytes = 0;
+          uint64_t file_garbage_bytes = 0;
+
+          // 为当前 partition 输出文件构造 TableBuilderOptions。
+          // level 固定为 0，因为 flush 产生的文件总是进入 L0。
+          // file_meta.fd.GetNumber() 对应当前输出 SST 的文件号。
+          TableBuilderOptions tboptions(
+              *cfd_->ioptions(), mutable_cf_options_,
+              cfd_->internal_comparator(),
+              cfd_->int_tbl_prop_collector_factories(), output_compression_,
+              mutable_cf_options_.compression_opts, cfd_->GetID(),
+              cfd_->GetName(), 0 /* level */, false /* is_bottommost */,
+              TableFileCreationReason::kFlush, oldest_key_time, current_time,
+              db_id_, db_session_id_, 0 /* target_file_size */,
+              file_meta.fd.GetNumber());
+
+          // 构建当前 partition 对应的 L0 SST 文件。
+          //
+          // 这里传入的是 partitioned_iter，而不是原始 iter。
+          // 因此 BuildTable 只会读取当前 Delta L0 partition 范围内的数据；
+          // 当 iterator 跨到下一个 partition 时，当前 BuildTable 会自然结束。
+          s = BuildTable(
+              dbname_, versions_, db_options_, tboptions, file_options_,
+              cfd_->table_cache(), &partitioned_iter,
+              {} /* range_del_iters */, &file_meta, &blob_file_additions,
+              existing_snapshots_, earliest_write_conflict_snapshot_,
+              job_snapshot_seq, snapshot_checker_,
+              mutable_cf_options_.paranoid_file_checks, cfd_->internal_stats(),
+              &io_s, io_tracer_, BlobFileCreationReason::kFlush,
+              seqno_to_time_mapping_, event_logger_, job_context_->job_id,
+              io_priority, &file_table_properties, write_hint,
+              full_history_ts_low, blob_callback_, base_, &file_input_entries,
+              &file_payload_bytes, &file_garbage_bytes);
+          assert(!s.ok() || io_s.ok());
+          io_s.PermitUncheckedError();
+          if (!s.ok()) {
+            break;
+          }
+          
+          // 汇总当前输出文件的条目数和 memtable 字节统计。
+          total_input_entries += file_input_entries;
+          total_payload_bytes += file_payload_bytes;
+          total_garbage_bytes += file_garbage_bytes;
+
+          if (file_meta.fd.GetFileSize() > 0) {
+            // 为当前输出 L0 文件填充 Delta L0 tableid 范围元信息。
+            // 该函数会根据文件 smallest/largest key 解析 tableid_min/tableid_max。
+            MaybePopulateDeltaL0FileMeta(cfd_->GetName(), 0, &file_meta);
+            if (file_meta.delta_l0_meta.valid) {
+              // 将当前 SST 绑定到 partitioned_iter 当前处理的 Delta L0 partition。
+              //
+              // 这样文件元信息不仅包含 tableid_min/tableid_max，
+              // 还包含 partition_id 和 partition_generation，
+              // 后续读路径剪枝、Intra-L0 compaction、reopen 恢复都可以使用该身份信息。
+              file_meta.delta_l0_meta.partition_id =
+                  partitioned_iter.current_partition().partition_id;
+              file_meta.delta_l0_meta.partition_generation =
+                  partitioned_iter.current_partition().generation;
+            }
+            // 收集当前输出文件，最后统一 AddFile 到 VersionEdit。
+            output_metas.emplace_back(file_meta);
+            if (first_output) {
+              // 兼容原有 flush 逻辑：
+              // meta_ 和 table_properties_ 仍表示第一个输出文件，
+              // 供后续日志、统计以及已有流程使用。
+              meta_ = file_meta;
+              table_properties_ = file_table_properties;
+            }
+            first_output = false;
+          }
+
+          // 如果底层 iterator 已经没有更多数据，说明所有 partition 都处理完毕。
+          // 否则继续 while 循环，为下一个 partition 创建新的 SST。
+          if (!partitioned_iter.HasPendingData()) {
+            break;
+          }
+        }
+
+        // 将多个 partition 输出文件的累计统计写回原有变量，
+        // 保证后续 memtable 条数校验和统计记录仍然覆盖整个 flush。
+        num_input_entries = total_input_entries;
+        memtable_payload_bytes = total_payload_bytes;
+        memtable_garbage_bytes = total_garbage_bytes;
+      } else {
+        // 普通 flush 路径。
+        //
+        // 非 Delta Column Family、没有 Delta L0 partition directory、
+        // 或包含 range deletion 的 flush，仍然使用原始 iterator 一次性构建单个 L0 SST。
+        TableBuilderOptions tboptions(
+            *cfd_->ioptions(), mutable_cf_options_,
+            cfd_->internal_comparator(),
+            cfd_->int_tbl_prop_collector_factories(), output_compression_,
+            mutable_cf_options_.compression_opts, cfd_->GetID(),
+            cfd_->GetName(), 0 /* level */, false /* is_bottommost */,
+            TableFileCreationReason::kFlush, oldest_key_time, current_time,
+            db_id_, db_session_id_, 0 /* target_file_size */,
+            meta_.fd.GetNumber());
+        s = BuildTable(
+            dbname_, versions_, db_options_, tboptions, file_options_,
+            cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
+            &blob_file_additions, existing_snapshots_,
+            earliest_write_conflict_snapshot_, job_snapshot_seq,
+            snapshot_checker_, mutable_cf_options_.paranoid_file_checks,
+            cfd_->internal_stats(), &io_s, io_tracer_,
+            BlobFileCreationReason::kFlush, seqno_to_time_mapping_,
+            event_logger_, job_context_->job_id, io_priority,
+            &table_properties_, write_hint, full_history_ts_low, blob_callback_,
+            base_, &num_input_entries, &memtable_payload_bytes,
+            &memtable_garbage_bytes);
+          assert(!s.ok() || io_s.ok());
+          io_s.PermitUncheckedError();
+          if (s.ok() && meta_.fd.GetFileSize() > 0) {
+            output_metas.emplace_back(meta_);
+          }
+      }
       // TODO: Cleanup io_status in BuildTable and table builders
-      assert(!s.ok() || io_s.ok());
-      io_s.PermitUncheckedError();
       if (num_input_entries != total_num_entries && s.ok()) {
         std::string msg = "Expected " + std::to_string(total_num_entries) +
                           " entries in memtables, but read " +
@@ -955,7 +1322,7 @@ Status FlushJob::WriteLevel0Table() {
           s = Status::Corruption(msg);
         }
       }
-      if (tboptions.reason == TableFileCreationReason::kFlush) {
+      if (s.ok()) {
         TEST_SYNC_POINT("DBImpl::FlushJob:Flush");
         RecordTick(stats_, MEMTABLE_PAYLOAD_BYTES_AT_FLUSH,
                    memtable_payload_bytes);
@@ -963,6 +1330,32 @@ Status FlushJob::WriteLevel0Table() {
                    memtable_garbage_bytes);
       }
       LogFlush(db_options_.info_log);
+
+      if (s.ok() && !output_metas.empty()) {
+        // 将本次 flush 产生的所有 L0 文件写入 VersionEdit。
+        //
+        // 普通 flush 通常只有一个 output_meta；
+        // Delta partitioned flush 可能有多个 output_meta，
+        // 每个文件都需要单独 AddFile，并携带各自的 delta_l0_meta。
+        for (const auto& output_meta : output_metas) {
+          edit_->AddFile(
+              0 /* level */, output_meta.fd.GetNumber(),
+              output_meta.fd.GetPathId(), output_meta.fd.GetFileSize(),
+              output_meta.smallest, output_meta.largest,
+              output_meta.fd.smallest_seqno, output_meta.fd.largest_seqno,
+              output_meta.marked_for_compaction, output_meta.temperature,
+              output_meta.oldest_blob_file_number,
+              output_meta.oldest_ancester_time, output_meta.file_creation_time,
+              output_meta.epoch_number, output_meta.file_checksum,
+              output_meta.file_checksum_func_name, output_meta.unique_id,
+              output_meta.compensated_range_deletion_size,
+              output_meta.delta_l0_meta);
+        }
+        if (use_delta_partitioned_flush) {
+          edit_->SetDeltaL0PartitionSnapshot(
+              cfd_->delta_l0_partition_directory()->EncodeSnapshot());
+        }
+      }
     }
     ROCKS_LOG_BUFFER(log_buffer_,
                      "[%s] [JOB %d] Level-0 flush table #%" PRIu64 ": %" PRIu64
@@ -989,19 +1382,6 @@ Status FlushJob::WriteLevel0Table() {
 
   if (s.ok() && has_output) {
     TEST_SYNC_POINT("DBImpl::FlushJob:SSTFileCreated");
-    // if we have more than 1 background thread, then we cannot
-    // insert files directly into higher levels because some other
-    // threads could be concurrently producing compacted files for
-    // that key range.
-    // Add file to L0
-    edit_->AddFile(0 /* level */, meta_.fd.GetNumber(), meta_.fd.GetPathId(),
-                   meta_.fd.GetFileSize(), meta_.smallest, meta_.largest,
-                   meta_.fd.smallest_seqno, meta_.fd.largest_seqno,
-                   meta_.marked_for_compaction, meta_.temperature,
-                   meta_.oldest_blob_file_number, meta_.oldest_ancester_time,
-                   meta_.file_creation_time, meta_.epoch_number,
-                   meta_.file_checksum, meta_.file_checksum_func_name,
-                   meta_.unique_id, meta_.compensated_range_deletion_size);
     edit_->SetBlobFileAdditions(std::move(blob_file_additions));
   }
   // Piggyback FlushJobInfo on the first first flushed memtable.

@@ -91,6 +91,8 @@ void VersionEdit::Clear() {
   is_in_atomic_group_ = false;
   remaining_entries_ = 0;
   full_history_ts_low_.clear();
+  has_delta_l0_partition_snapshot_ = false;
+  delta_l0_partition_snapshot_.clear();
 }
 
 bool VersionEdit::EncodeTo(std::string* dst) const {
@@ -238,6 +240,28 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
                   f.compensated_range_deletion_size);
       PutLengthPrefixedSlice(dst, Slice(compensated_range_deletion_size));
     }
+    if (f.delta_l0_meta.valid) {
+      PutVarint32(dst, NewFileCustomTag::kDeltaL0PartitionId);
+      std::string partition_id;
+      PutVarint64(&partition_id, f.delta_l0_meta.partition_id);
+      PutLengthPrefixedSlice(dst, Slice(partition_id));
+
+      PutVarint32(dst, NewFileCustomTag::kDeltaL0PartitionGeneration);
+      std::string partition_generation;
+      PutVarint64(&partition_generation,
+                  f.delta_l0_meta.partition_generation);
+      PutLengthPrefixedSlice(dst, Slice(partition_generation));
+
+      PutVarint32(dst, NewFileCustomTag::kDeltaL0TableIdMin);
+      std::string tableid_min;
+      PutVarint64(&tableid_min, f.delta_l0_meta.tableid_min);
+      PutLengthPrefixedSlice(dst, Slice(tableid_min));
+
+      PutVarint32(dst, NewFileCustomTag::kDeltaL0TableIdMax);
+      std::string tableid_max;
+      PutVarint64(&tableid_max, f.delta_l0_meta.tableid_max);
+      PutLengthPrefixedSlice(dst, Slice(tableid_max));
+    }
 
     TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                              dst);
@@ -292,6 +316,10 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
     PutVarint32(dst, kFullHistoryTsLow);
     PutLengthPrefixedSlice(dst, full_history_ts_low_);
   }
+  if (HasDeltaL0PartitionSnapshot()) {
+    PutVarint32(dst, kDeltaL0PartitionSnapshot);
+    PutLengthPrefixedSlice(dst, delta_l0_partition_snapshot_);
+  }
   return true;
 }
 
@@ -327,6 +355,9 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
   uint64_t file_size = 0;
   SequenceNumber smallest_seqno = 0;
   SequenceNumber largest_seqno = kMaxSequenceNumber;
+  bool saw_delta_l0_meta = false;
+  bool saw_delta_l0_tableid_min = false;
+  bool saw_delta_l0_tableid_max = false;
   if (GetLevel(input, &level, &msg) && GetVarint64(input, &number) &&
       GetVarint64(input, &file_size) && GetInternalKey(input, &f.smallest) &&
       GetInternalKey(input, &f.largest) &&
@@ -416,6 +447,32 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
             return "Invalid compensated range deletion size";
           }
           break;
+        case kDeltaL0PartitionId:
+          saw_delta_l0_meta = true;
+          if (!GetVarint64(&field, &f.delta_l0_meta.partition_id)) {
+            return "invalid delta l0 partition id";
+          }
+          break;
+        case kDeltaL0PartitionGeneration:
+          saw_delta_l0_meta = true;
+          if (!GetVarint64(&field, &f.delta_l0_meta.partition_generation)) {
+            return "invalid delta l0 partition generation";
+          }
+          break;
+        case kDeltaL0TableIdMin:
+          saw_delta_l0_meta = true;
+          saw_delta_l0_tableid_min = true;
+          if (!GetVarint64(&field, &f.delta_l0_meta.tableid_min)) {
+            return "invalid delta l0 tableid min";
+          }
+          break;
+        case kDeltaL0TableIdMax:
+          saw_delta_l0_meta = true;
+          saw_delta_l0_tableid_max = true;
+          if (!GetVarint64(&field, &f.delta_l0_meta.tableid_max)) {
+            return "invalid delta l0 tableid max";
+          }
+          break;
         default:
           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
             // Should not proceed if cannot understand it
@@ -427,6 +484,13 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
   } else {
     return "new-file4 entry";
   }
+  if (saw_delta_l0_meta) {
+    if (!saw_delta_l0_tableid_min || !saw_delta_l0_tableid_max) {
+      return "incomplete delta l0 metadata";
+    }
+    f.delta_l0_meta.valid = true;
+  }
+  SanitizeDeltaL0MetaForLevel(level, &f);
   f.fd =
       FileDescriptor(number, path_id, file_size, smallest_seqno, largest_seqno);
   new_files_.push_back(std::make_pair(level, f));
@@ -553,6 +617,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetInternalKey(&input, &f.smallest) &&
             GetInternalKey(&input, &f.largest)) {
           f.fd = FileDescriptor(number, 0, file_size);
+          SanitizeDeltaL0MetaForLevel(level, &f);
           new_files_.push_back(std::make_pair(level, f));
         } else {
           if (!msg) {
@@ -574,6 +639,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetVarint64(&input, &largest_seqno)) {
           f.fd = FileDescriptor(number, 0, file_size, smallest_seqno,
                                 largest_seqno);
+          SanitizeDeltaL0MetaForLevel(level, &f);
           new_files_.push_back(std::make_pair(level, f));
         } else {
           if (!msg) {
@@ -597,6 +663,7 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetVarint64(&input, &largest_seqno)) {
           f.fd = FileDescriptor(number, path_id, file_size, smallest_seqno,
                                 largest_seqno);
+          SanitizeDeltaL0MetaForLevel(level, &f);
           new_files_.push_back(std::make_pair(level, f));
         } else {
           if (!msg) {
@@ -730,6 +797,17 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
           msg = "full_history_ts_low: empty";
         } else {
           full_history_ts_low_.assign(str.data(), str.size());
+        }
+        break;
+
+      case kDeltaL0PartitionSnapshot:
+        if (!GetLengthPrefixedSlice(&input, &str)) {
+          msg = "delta_l0_partition_snapshot";
+        } else if (str.empty()) {
+          msg = "delta_l0_partition_snapshot: empty";
+        } else {
+          has_delta_l0_partition_snapshot_ = true;
+          delta_l0_partition_snapshot_.assign(str.data(), str.size());
         }
         break;
 
@@ -891,6 +969,10 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     r.append("\n FullHistoryTsLow: ");
     r.append(Slice(full_history_ts_low_).ToString(hex_key));
   }
+  if (HasDeltaL0PartitionSnapshot()) {
+    r.append("\n DeltaL0PartitionSnapshotBytes: ");
+    AppendNumberTo(&r, delta_l0_partition_snapshot_.size());
+  }
   r.append("\n}\n");
   return r;
 }
@@ -1035,6 +1117,10 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
 
   if (HasFullHistoryTsLow()) {
     jw << "FullHistoryTsLow" << Slice(full_history_ts_low_).ToString(hex_key);
+  }
+  if (HasDeltaL0PartitionSnapshot()) {
+    jw << "DeltaL0PartitionSnapshotBytes"
+       << static_cast<uint64_t>(delta_l0_partition_snapshot_.size());
   }
 
   jw.EndObject();

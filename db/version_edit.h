@@ -70,6 +70,7 @@ enum Tag : uint32_t {
   kFullHistoryTsLow,
   kWalAddition2,
   kWalDeletion2,
+  kDeltaL0PartitionSnapshot,
 };
 
 enum NewFileCustomTag : uint32_t {
@@ -90,6 +91,10 @@ enum NewFileCustomTag : uint32_t {
   kUniqueId = 12,
   kEpochNumber = 13,
   kCompensatedRangeDeletionSize = 14,
+  kDeltaL0PartitionId = 15,
+  kDeltaL0PartitionGeneration = 16,
+  kDeltaL0TableIdMin = 17,
+  kDeltaL0TableIdMax = 18,
 
   // If this bit for the custom tag is set, opening DB should fail if
   // we don't know this field.
@@ -170,6 +175,14 @@ struct FileSampledStats {
   mutable std::atomic<uint64_t> num_reads_sampled;
 };
 
+struct DeltaL0FileMeta {
+  bool valid = false;
+  uint64_t partition_id = 0;
+  uint64_t partition_generation = 0;
+  uint64_t tableid_min = 0;
+  uint64_t tableid_max = 0;
+};
+
 struct FileMetaData {
   FileDescriptor fd;
   InternalKey smallest;  // Smallest internal key served by table
@@ -238,6 +251,9 @@ struct FileMetaData {
   // SST unique id
   UniqueId64x2 unique_id{};
 
+  // Only meaningful for level-0 files in the Delta column family.
+  DeltaL0FileMeta delta_l0_meta;
+
   FileMetaData() = default;
 
   FileMetaData(uint64_t file, uint32_t file_path_id, uint64_t file_size,
@@ -249,7 +265,8 @@ struct FileMetaData {
                uint64_t _epoch_number, const std::string& _file_checksum,
                const std::string& _file_checksum_func_name,
                UniqueId64x2 _unique_id,
-               const uint64_t _compensated_range_deletion_size)
+               const uint64_t _compensated_range_deletion_size,
+               const DeltaL0FileMeta& _delta_l0_meta = DeltaL0FileMeta())
       : fd(file, file_path_id, file_size, smallest_seq, largest_seq),
         smallest(smallest_key),
         largest(largest_key),
@@ -262,7 +279,8 @@ struct FileMetaData {
         epoch_number(_epoch_number),
         file_checksum(_file_checksum),
         file_checksum_func_name(_file_checksum_func_name),
-        unique_id(std::move(_unique_id)) {
+        unique_id(std::move(_unique_id)),
+        delta_l0_meta(_delta_l0_meta) {
     TEST_SYNC_POINT_CALLBACK("FileMetaData::FileMetaData", this);
   }
 
@@ -446,16 +464,17 @@ class VersionEdit {
                uint64_t epoch_number, const std::string& file_checksum,
                const std::string& file_checksum_func_name,
                const UniqueId64x2& unique_id,
-               const uint64_t compensated_range_deletion_size) {
+               const uint64_t compensated_range_deletion_size,
+               const DeltaL0FileMeta& delta_l0_meta = DeltaL0FileMeta()) {
     assert(smallest_seqno <= largest_seqno);
-    new_files_.emplace_back(
-        level,
-        FileMetaData(file, file_path_id, file_size, smallest, largest,
-                     smallest_seqno, largest_seqno, marked_for_compaction,
-                     temperature, oldest_blob_file_number, oldest_ancester_time,
-                     file_creation_time, epoch_number, file_checksum,
-                     file_checksum_func_name, unique_id,
-                     compensated_range_deletion_size));
+    FileMetaData meta(file, file_path_id, file_size, smallest, largest,
+                      smallest_seqno, largest_seqno, marked_for_compaction,
+                      temperature, oldest_blob_file_number,
+                      oldest_ancester_time, file_creation_time, epoch_number,
+                      file_checksum, file_checksum_func_name, unique_id,
+                      compensated_range_deletion_size, delta_l0_meta);
+    SanitizeDeltaL0MetaForLevel(level, &meta);
+    new_files_.emplace_back(level, std::move(meta));
     if (!HasLastSequence() || largest_seqno > GetLastSequence()) {
       SetLastSequence(largest_seqno);
     }
@@ -463,9 +482,12 @@ class VersionEdit {
 
   void AddFile(int level, const FileMetaData& f) {
     assert(f.fd.smallest_seqno <= f.fd.largest_seqno);
-    new_files_.emplace_back(level, f);
-    if (!HasLastSequence() || f.fd.largest_seqno > GetLastSequence()) {
-      SetLastSequence(f.fd.largest_seqno);
+    const SequenceNumber largest_seqno = f.fd.largest_seqno;
+    FileMetaData meta = f;
+    SanitizeDeltaL0MetaForLevel(level, &meta);
+    new_files_.emplace_back(level, std::move(meta));
+    if (!HasLastSequence() || largest_seqno > GetLastSequence()) {
+      SetLastSequence(largest_seqno);
     }
   }
 
@@ -622,6 +644,18 @@ class VersionEdit {
     full_history_ts_low_ = std::move(full_history_ts_low);
   }
 
+  bool HasDeltaL0PartitionSnapshot() const {
+    return has_delta_l0_partition_snapshot_;
+  }
+  const std::string& GetDeltaL0PartitionSnapshot() const {
+    assert(has_delta_l0_partition_snapshot_);
+    return delta_l0_partition_snapshot_;
+  }
+  void SetDeltaL0PartitionSnapshot(std::string delta_l0_partition_snapshot) {
+    has_delta_l0_partition_snapshot_ = true;
+    delta_l0_partition_snapshot_ = std::move(delta_l0_partition_snapshot);
+  }
+
   // return true on success.
   bool EncodeTo(std::string* dst) const;
   Status DecodeFrom(const Slice& src);
@@ -643,6 +677,12 @@ class VersionEdit {
   bool GetLevel(Slice* input, int* level, const char** msg);
 
   const char* DecodeNewFile4From(Slice* input);
+
+  static void SanitizeDeltaL0MetaForLevel(int level, FileMetaData* meta) {
+    if (level != 0) {
+      meta->delta_l0_meta = {};
+    }
+  }
 
   int max_level_ = 0;
   std::string db_id_;
@@ -689,6 +729,8 @@ class VersionEdit {
   uint32_t remaining_entries_ = 0;
 
   std::string full_history_ts_low_;
+  bool has_delta_l0_partition_snapshot_ = false;
+  std::string delta_l0_partition_snapshot_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

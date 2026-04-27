@@ -96,3 +96,9 @@ fuzz/crash-*
 
 cmake-build-*
 third-party/folly/
+
+build-debug
+.codex
+doc/plan.md
+doc/delta_l0_partition_report.md
+db_perf_test/*

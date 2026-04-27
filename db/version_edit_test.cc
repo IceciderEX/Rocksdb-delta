@@ -10,6 +10,7 @@
 #include "db/version_edit.h"
 
 #include "db/blob/blob_index.h"
+#include "db/delta_l0.h"
 #include "rocksdb/advanced_options.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
@@ -29,6 +30,32 @@ static void TestEncodeDecode(const VersionEdit& edit) {
   parsed.EncodeTo(&encoded2);
   ASSERT_EQ(encoded, encoded2);
 }
+
+namespace {
+void AppendDeltaTestBigEndian32(std::string* dst, uint32_t value) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    dst->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+void AppendDeltaTestBigEndian64(std::string* dst, uint64_t value) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    dst->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+std::string DeltaBinaryTestKey(uint64_t tableid, uint64_t rowid,
+                               uint64_t event_seq = 1, uint64_t cuid = 1) {
+  std::string key;
+  key.reserve(kDeltaBinaryKeySize);
+  AppendDeltaTestBigEndian32(&key, 1);
+  AppendDeltaTestBigEndian32(&key, static_cast<uint32_t>(tableid));
+  AppendDeltaTestBigEndian64(&key, cuid);
+  AppendDeltaTestBigEndian32(&key, static_cast<uint32_t>(rowid));
+  AppendDeltaTestBigEndian64(&key, event_seq);
+  return key;
+}
+}  // namespace
 
 class VersionEditTest : public testing::Test {};
 
@@ -113,6 +140,238 @@ TEST_F(VersionEditTest, EncodeDecodeNewFile4) {
   ASSERT_EQ(kInvalidBlobFileNumber,
             new_files[2].second.oldest_blob_file_number);
   ASSERT_EQ(1001, new_files[3].second.oldest_blob_file_number);
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: removable Delta feature
+// verification coverage.
+TEST_F(VersionEditTest, EncodeDecodeDeltaL0Meta) {
+  static const uint64_t kBig = 1ull << 50;
+
+  DeltaL0FileMeta delta_l0_meta;
+  delta_l0_meta.valid = true;
+  delta_l0_meta.partition_id = 7;
+  delta_l0_meta.partition_generation = 11;
+  delta_l0_meta.tableid_min = 100;
+  delta_l0_meta.tableid_max = 199;
+
+  VersionEdit edit;
+  edit.AddFile(0, 300, 0, 100,
+               InternalKey("1_100_9_1_1", kBig + 500, kTypeValue),
+               InternalKey("1_199_9_9_9", kBig + 600, kTypeDeletion),
+               kBig + 500, kBig + 600, true, Temperature::kUnknown,
+               kInvalidBlobFileNumber, kUnknownOldestAncesterTime,
+               kUnknownFileCreationTime, 300 /* epoch_number */,
+               kUnknownFileChecksum, kUnknownFileChecksumFuncName,
+               kNullUniqueId64x2, 0, delta_l0_meta);
+
+  std::string encoded;
+  edit.EncodeTo(&encoded);
+
+  VersionEdit parsed;
+  ASSERT_OK(parsed.DecodeFrom(encoded));
+  const auto& new_files = parsed.GetNewFiles();
+  ASSERT_EQ(1U, new_files.size());
+  const auto& decoded_meta = new_files[0].second.delta_l0_meta;
+  ASSERT_TRUE(decoded_meta.valid);
+  ASSERT_EQ(delta_l0_meta.partition_id, decoded_meta.partition_id);
+  ASSERT_EQ(delta_l0_meta.partition_generation,
+            decoded_meta.partition_generation);
+  ASSERT_EQ(delta_l0_meta.tableid_min, decoded_meta.tableid_min);
+  ASSERT_EQ(delta_l0_meta.tableid_max, decoded_meta.tableid_max);
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: verification coverage for
+// fixed-width binary Delta user keys.
+TEST_F(VersionEditTest, ParseDeltaBinaryKeyRelid) {
+  uint64_t tableid = 0;
+  ASSERT_TRUE(TryParseDeltaTableIdFromUserKey(
+      Slice(DeltaBinaryTestKey(1234, 88)), &tableid));
+  ASSERT_EQ(1234U, tableid);
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: verification coverage for an
+// example fixed-width binary Delta key captured from production-like input.
+TEST_F(VersionEditTest, ParseDeltaBinaryExampleKeyRelid) {
+  std::string key;
+  ASSERT_TRUE(Slice(
+      "800002030323518c7ffffffffffaafff800000027fffffffffffffc8")
+                  .DecodeHex(&key));
+  uint64_t tableid = 0;
+  ASSERT_TRUE(TryParseDeltaTableIdFromUserKey(Slice(key), &tableid));
+  ASSERT_EQ(0x0323518cU, tableid);
+}
+
+TEST_F(VersionEditTest, ParseDeltaBinaryExampleKeyPrefixFields) {
+  std::string key;
+  ASSERT_TRUE(Slice(
+      "800002030323518c7ffffffffffaafff800000027fffffffffffffc8")
+                  .DecodeHex(&key));
+
+  uint32_t dbid = 0;
+  uint32_t relid = 0;
+  uint64_t cuid = 0;
+  ASSERT_TRUE(TryParseDeltaBinaryKeyPrefix(Slice(key), &dbid, &relid, &cuid));
+  ASSERT_EQ(0x80000203U, dbid);
+  ASSERT_EQ(0x0323518cU, relid);
+  ASSERT_EQ(0x7ffffffffffaafffULL, cuid);
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: removable Delta feature
+// verification coverage.
+TEST_F(VersionEditTest, EncodeDecodeDeltaL0PartitionSnapshot) {
+  DeltaL0PartitionDirectory directory;
+  for (uint64_t tableid = 1; tableid <= 32; ++tableid) {
+    directory.Observe(tableid);
+  }
+  for (uint64_t tableid = 1000; tableid <= 1032; ++tableid) {
+    directory.Observe(tableid);
+  }
+
+  VersionEdit edit;
+  edit.SetDeltaL0PartitionSnapshot(directory.EncodeSnapshot());
+
+  std::string encoded;
+  edit.EncodeTo(&encoded);
+
+  VersionEdit parsed;
+  ASSERT_OK(parsed.DecodeFrom(encoded));
+  ASSERT_TRUE(parsed.HasDeltaL0PartitionSnapshot());
+
+  DeltaL0PartitionDirectory restored;
+  ASSERT_TRUE(restored.RestoreFromSnapshot(
+      Slice(parsed.GetDeltaL0PartitionSnapshot())));
+  ASSERT_EQ(2U, restored.PartitionCount());
+  ASSERT_EQ(1U, restored.SplitCount());
+  ASSERT_EQ(999U, restored.Lookup(1).tableid_end);
+  ASSERT_EQ(1000U, restored.Lookup(1000).tableid_begin);
+  ASSERT_EQ(directory.GetPartitionsSnapshot()[0].observed_tableids,
+            restored.GetPartitionsSnapshot()[0].observed_tableids);
+  ASSERT_EQ(directory.GetPartitionsSnapshot()[1].observed_tableids,
+            restored.GetPartitionsSnapshot()[1].observed_tableids);
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: removable Delta feature
+// verification coverage.
+TEST_F(VersionEditTest, NonL0DeltaL0MetaIsIgnored) {
+  FileMetaData meta(
+      300, 0, 100, InternalKey("1_100_9_1_1", 500, kTypeValue),
+      InternalKey("1_199_9_9_9", 600, kTypeDeletion), 500, 600, false,
+      Temperature::kUnknown, kInvalidBlobFileNumber,
+      kUnknownOldestAncesterTime, kUnknownFileCreationTime, 0,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+  meta.delta_l0_meta.valid = true;
+  meta.delta_l0_meta.tableid_min = 100;
+  meta.delta_l0_meta.tableid_max = 199;
+
+  VersionEdit edit;
+  edit.AddFile(1, meta);
+  ASSERT_EQ(1U, edit.GetNewFiles().size());
+  ASSERT_FALSE(edit.GetNewFiles()[0].second.delta_l0_meta.valid);
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: removable Delta feature
+// verification coverage.
+TEST_F(VersionEditTest, DeltaPartitionDirectorySplitsByObservedMedian) {
+  DeltaL0PartitionDirectory directory;
+  for (uint64_t tableid = 1; tableid <= 32; ++tableid) {
+    directory.Observe(tableid);
+  }
+  for (uint64_t tableid = 1000; tableid <= 1032; ++tableid) {
+    directory.Observe(tableid);
+  }
+
+  ASSERT_EQ(2U, directory.PartitionCount());
+  ASSERT_EQ(1U, directory.SplitCount());
+
+  const DeltaL0Partition& left = directory.Lookup(1);
+  const DeltaL0Partition& right = directory.Lookup(1000);
+  ASSERT_EQ(0U, left.tableid_begin);
+  ASSERT_EQ(999U, left.tableid_end);
+  ASSERT_EQ(1000U, right.tableid_begin);
+  ASSERT_EQ(std::numeric_limits<uint64_t>::max(), right.tableid_end);
+  ASSERT_EQ(1U, left.generation);
+  ASSERT_EQ(1U, right.generation);
+  ASSERT_TRUE(left.Contains(32));
+  ASSERT_FALSE(left.Contains(1000));
+  ASSERT_TRUE(right.Contains(1000));
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: removable Delta feature
+// verification coverage.
+TEST_F(VersionEditTest, DeltaPartitionDirectoryRoutesAfterSplit) {
+  DeltaL0PartitionDirectory directory;
+  for (uint64_t tableid = 1; tableid <= 32; ++tableid) {
+    directory.Observe(tableid);
+  }
+  for (uint64_t tableid = 1000; tableid <= 1032; ++tableid) {
+    directory.Observe(tableid);
+  }
+
+  const DeltaL0Partition low_partition = directory.LookupAndRegister(8);
+  const DeltaL0Partition high_partition = directory.LookupAndRegister(1008);
+
+  ASSERT_EQ(2U, directory.PartitionCount());
+  ASSERT_NE(low_partition.partition_id, high_partition.partition_id);
+  ASSERT_EQ(0U, low_partition.tableid_begin);
+  ASSERT_EQ(999U, low_partition.tableid_end);
+  ASSERT_EQ(1000U, high_partition.tableid_begin);
+  ASSERT_EQ(std::numeric_limits<uint64_t>::max(), high_partition.tableid_end);
+  ASSERT_EQ(1U, low_partition.generation);
+  ASSERT_EQ(1U, high_partition.generation);
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: removable Delta feature
+// verification coverage.
+TEST_F(VersionEditTest, DeltaPartitionDirectoryRebuildsFromL0Files) {
+  FileMetaData parent_file(
+      100, 0, 100, InternalKey("1_0001_9_1_1", 500, kTypeValue),
+      InternalKey("1_1032_9_9_9", 600, kTypeValue), 500, 600, false,
+      Temperature::kUnknown, kInvalidBlobFileNumber,
+      kUnknownOldestAncesterTime, kUnknownFileCreationTime, 100,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2,
+      0);
+  parent_file.delta_l0_meta.valid = true;
+  parent_file.delta_l0_meta.partition_id = 1;
+  parent_file.delta_l0_meta.partition_generation = 0;
+  parent_file.delta_l0_meta.tableid_min = 1;
+  parent_file.delta_l0_meta.tableid_max = 1032;
+
+  FileMetaData low_child_file(
+      101, 0, 100, InternalKey("1_0001_9_1_1", 700, kTypeValue),
+      InternalKey("1_0032_9_9_9", 800, kTypeValue), 700, 800, false,
+      Temperature::kUnknown, kInvalidBlobFileNumber,
+      kUnknownOldestAncesterTime, kUnknownFileCreationTime, 101,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2,
+      0);
+  low_child_file.delta_l0_meta.valid = true;
+  low_child_file.delta_l0_meta.partition_id = 2;
+  low_child_file.delta_l0_meta.partition_generation = 1;
+  low_child_file.delta_l0_meta.tableid_min = 1;
+  low_child_file.delta_l0_meta.tableid_max = 32;
+
+  FileMetaData high_child_file(
+      102, 0, 100, InternalKey("1_1000_9_1_1", 900, kTypeValue),
+      InternalKey("1_1032_9_9_9", 1000, kTypeValue), 900, 1000, false,
+      Temperature::kUnknown, kInvalidBlobFileNumber,
+      kUnknownOldestAncesterTime, kUnknownFileCreationTime, 102,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2,
+      0);
+  high_child_file.delta_l0_meta.valid = true;
+  high_child_file.delta_l0_meta.partition_id = 3;
+  high_child_file.delta_l0_meta.partition_generation = 1;
+  high_child_file.delta_l0_meta.tableid_min = 1000;
+  high_child_file.delta_l0_meta.tableid_max = 1032;
+
+  DeltaL0PartitionDirectory directory;
+  directory.RestoreFromL0Files(
+      {&parent_file, &low_child_file, &high_child_file});
+
+  ASSERT_EQ(2U, directory.PartitionCount());
+  ASSERT_EQ(1U, directory.SplitCount());
+  ASSERT_EQ(999U, directory.Lookup(1).tableid_end);
+  ASSERT_EQ(1000U, directory.Lookup(1000).tableid_begin);
+  ASSERT_EQ(1U, directory.Lookup(1).generation);
+  ASSERT_EQ(1U, directory.Lookup(1000).generation);
 }
 
 TEST_F(VersionEditTest, ForwardCompatibleNewFile4) {

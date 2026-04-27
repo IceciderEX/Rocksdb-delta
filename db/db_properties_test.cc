@@ -10,8 +10,11 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <limits>
 #include <string>
 
+#include "db/column_family.h"
+#include "db/delta_l0.h"
 #include "db/db_test_util.h"
 #include "db/write_stall_stats.h"
 #include "options/cf_options.h"
@@ -188,6 +191,30 @@ TEST_F(DBPropertiesTest, GetAggregatedIntPropertyTest) {
 }
 
 namespace {
+void AppendDeltaTestBigEndian32(std::string* dst, uint32_t value) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    dst->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+void AppendDeltaTestBigEndian64(std::string* dst, uint64_t value) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    dst->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+std::string DeltaTestKey(uint64_t tableid, uint64_t rowid,
+                         uint64_t event_seq = 1, uint64_t cuid = 1) {
+  std::string key;
+  key.reserve(kDeltaBinaryKeySize);
+  AppendDeltaTestBigEndian32(&key, 1);
+  AppendDeltaTestBigEndian32(&key, static_cast<uint32_t>(tableid));
+  AppendDeltaTestBigEndian64(&key, cuid);
+  AppendDeltaTestBigEndian32(&key, static_cast<uint32_t>(rowid));
+  AppendDeltaTestBigEndian64(&key, event_seq);
+  return key;
+}
+
 void ResetTableProperties(TableProperties* tp) {
   tp->data_size = 0;
   tp->index_size = 0;
@@ -2074,6 +2101,189 @@ TEST_F(DBPropertiesTest, GetMapPropertyDbStats) {
   }
 
   Close();
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: verification for removable
+// Delta-specific observability plumbing.
+// 测试 Delta L0 stats property 是否能正确暴露 Delta L0 partition 相关统计信息。
+// 覆盖内容包括：
+// 1. partition_count / split_count；
+// 2. directory snapshot 大小；
+// 3. Get 和 Iterator scan 的 L0 文件剪枝统计；
+// 4. legacy 文件数量、old parent 文件数量；
+// 5. 每个 partition 的 observed table 数量和 L0 文件数量；
+// 6. map property 和 text property 两种读取方式。
+TEST_F(DBPropertiesTest, DeltaL0StatsProperty) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.level0_file_num_compaction_trigger = 4;
+  CreateAndReopenWithCF({"Delta"}, options);
+
+  VersionSet* const versions = dbfull()->GetVersionSet();
+  ASSERT_NE(nullptr, versions);
+  ColumnFamilyData* const delta_cfd =
+      versions->GetColumnFamilySet()->GetColumnFamily("Delta");
+  ASSERT_NE(nullptr, delta_cfd);
+  ASSERT_TRUE(delta_cfd->IsDeltaColumnFamily());
+  DeltaL0PartitionDirectory* const directory =
+      delta_cfd->delta_l0_partition_directory();
+  ASSERT_NE(nullptr, directory);
+
+  for (uint64_t tableid = 1; tableid <= 32; ++tableid) {
+    directory->Observe(tableid);
+    ASSERT_OK(Put(1, DeltaTestKey(tableid, 1), "low"));
+  }
+  ASSERT_OK(Flush(1));
+  for (uint64_t tableid = 1000; tableid <= 1032; ++tableid) {
+    directory->Observe(tableid);
+    ASSERT_OK(Put(1, DeltaTestKey(tableid, 2), "high"));
+  }
+  ASSERT_OK(Flush(1));
+  ASSERT_EQ(2U, directory->PartitionCount());
+
+  PinnableSlice value;
+  ASSERT_OK(db_->Get(ReadOptions(), handles_[1], DeltaTestKey(1, 1), &value));
+  ASSERT_EQ("low", value.ToString());
+
+  ReadOptions read_options;
+  const std::string lower = DeltaTestKey(1, 0, 0);
+  const std::string upper =
+      DeltaTestKey(32, std::numeric_limits<uint32_t>::max(),
+                   std::numeric_limits<uint64_t>::max());
+  const Slice lower_slice(lower);
+  const Slice upper_slice(upper);
+  read_options.iterate_lower_bound = &lower_slice;
+  read_options.iterate_upper_bound = &upper_slice;
+  std::unique_ptr<Iterator> iter(db_->NewIterator(read_options, handles_[1]));
+  iter->Seek(lower);
+  ASSERT_TRUE(iter->Valid());
+
+  std::map<std::string, std::string> delta_stats;
+  ASSERT_TRUE(
+      db_->GetMapProperty(handles_[1], DB::Properties::kDeltaL0Stats, &delta_stats));
+  ASSERT_EQ("2", delta_stats.at("partition_count"));
+  ASSERT_EQ("1", delta_stats.at("split_count"));
+  ASSERT_GT(std::stoull(delta_stats.at("directory_snapshot_bytes")), 0U);
+  ASSERT_EQ("2", delta_stats.at("get_l0_candidate_files_before_prune"));
+  ASSERT_EQ("1", delta_stats.at("get_l0_candidate_files_after_prune"));
+  ASSERT_EQ("2", delta_stats.at("scan_l0_candidate_files_before_prune"));
+  ASSERT_EQ("1", delta_stats.at("scan_l0_candidate_files_after_prune"));
+  ASSERT_EQ("0", delta_stats.at("legacy_l0_file_count_without_meta"));
+  ASSERT_EQ("1", delta_stats.at("old_parent_l0_file_count"));
+  ASSERT_EQ("32", delta_stats.at("partition.0.observed_table_count"));
+  ASSERT_EQ("1", delta_stats.at("partition.0.l0_file_count"));
+  ASSERT_EQ("33", delta_stats.at("partition.1.observed_table_count"));
+  ASSERT_EQ("1", delta_stats.at("partition.1.l0_file_count"));
+
+  std::string delta_stats_text;
+  ASSERT_TRUE(
+      db_->GetProperty(handles_[1], DB::Properties::kDeltaL0Stats, &delta_stats_text));
+  ASSERT_NE(std::string::npos,
+            delta_stats_text.find("get_l0_candidate_files_after_prune=1"));
+}
+
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: verification for removable
+// Delta L0 partition persistence and restart recovery.
+// 测试 Delta L0 partition directory 的状态是否能跨 reopen 正确恢复。
+// 覆盖内容包括：
+// 1. Delta L0 partition split 后 directory 状态是否正确；
+// 2. reopen 后 partition_count / split_count 是否保持；
+// 3. L0 文件上的 delta_l0_meta 是否仍然有效；
+// 4. generation=1 的子 partition 文件是否跨 reopen 保留；
+// 5. reopen 后 Get 和 Delta L0 stats 是否正常。
+TEST_F(DBPropertiesTest, DeltaL0ReopenRestoresDirectoryState) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.level0_file_num_compaction_trigger = 8;
+  CreateAndReopenWithCF({"Delta"}, options);
+  auto get_delta_cfd = [&]() -> ColumnFamilyData* {
+    VersionSet* const versions = dbfull()->GetVersionSet();
+    EXPECT_NE(nullptr, versions);
+    if (versions == nullptr) {
+      return nullptr;
+    }
+    ColumnFamilyData* const delta_cfd =
+        versions->GetColumnFamilySet()->GetColumnFamily("Delta");
+    EXPECT_NE(nullptr, delta_cfd);
+    if (delta_cfd != nullptr) {
+      EXPECT_TRUE(delta_cfd->IsDeltaColumnFamily());
+    }
+    return delta_cfd;
+  };
+
+  for (uint64_t tableid = 1; tableid <= 32; ++tableid) {
+    ASSERT_OK(Put(1, DeltaTestKey(tableid, 1), "low-before-reopen"));
+  }
+  ASSERT_OK(Flush(1));
+
+  for (uint64_t tableid = 1000; tableid <= 1032; ++tableid) {
+    ASSERT_OK(Put(1, DeltaTestKey(tableid, 2), "high-before-reopen"));
+  }
+  ASSERT_OK(Flush(1));
+
+  ColumnFamilyData* delta_cfd = get_delta_cfd();
+  ASSERT_NE(nullptr, delta_cfd);
+  DeltaL0PartitionDirectory* directory =
+      delta_cfd->delta_l0_partition_directory();
+  ASSERT_NE(nullptr, directory);
+  ASSERT_EQ(2U, directory->PartitionCount());
+
+  for (uint64_t tableid = 1; tableid <= 32; ++tableid) {
+    ASSERT_OK(Put(1, DeltaTestKey(tableid, 3), "low-after-split"));
+  }
+  for (uint64_t tableid = 1000; tableid <= 1032; ++tableid) {
+    ASSERT_OK(Put(1, DeltaTestKey(tableid, 4), "high-after-split"));
+  }
+  ASSERT_OK(Flush(1));
+  ASSERT_EQ(4, NumTableFilesAtLevel(0, 1));
+
+  bool saw_low_child_before_reopen = false;
+  bool saw_high_child_before_reopen = false;
+  for (FileMetaData* file_meta : delta_cfd->current()->storage_info()->LevelFiles(0)) {
+    ASSERT_TRUE(file_meta->delta_l0_meta.valid);
+    if (file_meta->delta_l0_meta.partition_generation == 1) {
+      if (file_meta->delta_l0_meta.tableid_max < 1000) {
+        saw_low_child_before_reopen = true;
+      } else {
+        saw_high_child_before_reopen = true;
+      }
+    }
+  }
+  ASSERT_TRUE(saw_low_child_before_reopen);
+  ASSERT_TRUE(saw_high_child_before_reopen);
+
+  ReopenWithColumnFamilies({"default", "Delta"}, options);
+
+  delta_cfd = get_delta_cfd();
+  ASSERT_NE(nullptr, delta_cfd);
+  directory = delta_cfd->delta_l0_partition_directory();
+  ASSERT_NE(nullptr, directory);
+  ASSERT_EQ(2U, directory->PartitionCount());
+  ASSERT_EQ(4, NumTableFilesAtLevel(0, 1));
+
+  bool saw_generation_one_file_after_reopen = false;
+  for (FileMetaData* file_meta : delta_cfd->current()->storage_info()->LevelFiles(0)) {
+    ASSERT_TRUE(file_meta->delta_l0_meta.valid);
+    saw_generation_one_file_after_reopen =
+        saw_generation_one_file_after_reopen ||
+        file_meta->delta_l0_meta.partition_generation == 1;
+  }
+  ASSERT_TRUE(saw_generation_one_file_after_reopen);
+
+  PinnableSlice value;
+  ASSERT_OK(
+      db_->Get(ReadOptions(), handles_[1], DeltaTestKey(1, 1), &value));
+  ASSERT_EQ("low-before-reopen", value.ToString());
+
+  std::map<std::string, std::string> delta_stats;
+  ASSERT_TRUE(
+      db_->GetMapProperty(handles_[1], DB::Properties::kDeltaL0Stats, &delta_stats));
+  ASSERT_EQ("2", delta_stats.at("partition_count"));
+  ASSERT_EQ("1", delta_stats.at("split_count"));
+  ASSERT_GT(std::stoull(delta_stats.at("directory_snapshot_bytes")), 0U);
+  ASSERT_EQ("4", delta_stats.at("get_l0_candidate_files_before_prune"));
+  ASSERT_EQ("2", delta_stats.at("get_l0_candidate_files_after_prune"));
+  ASSERT_EQ("2", delta_stats.at("old_parent_l0_file_count"));
 }
 
 TEST_F(DBPropertiesTest, GetMapPropertyBlockCacheEntryStats) {

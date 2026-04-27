@@ -11,8 +11,67 @@
 #include "db/compaction/compaction_outputs.h"
 
 #include "db/builder.h"
+#include "db/delta_l0.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// 判断当前 compaction 是否为 Delta Column Family 的 L0 内部 compaction。
+// 条件包括：
+// 1. 当前输出不是 penultimate level；
+// 2. compaction 输入层为 L0；
+// 3. compaction 输出层仍为 L0；
+// 4. 当前 Column Family 是 Delta Column Family；
+// 5. Delta L0 分区目录已经初始化。
+// 只有满足这些条件时，后续才需要按 Delta L0 partition 维度切分输出文件。
+bool CompactionOutputs::IsDeltaIntraL0Compaction() const {
+  auto* cfd = compaction_->column_family_data();
+  return !is_penultimate_level_ && compaction_->start_level() == 0 &&
+         compaction_->output_level() == 0 && cfd->IsDeltaColumnFamily() &&
+         cfd->delta_l0_partition_directory() != nullptr;
+}
+
+// 根据 user key 查找其所属的 Delta L0 partition。
+// 如果当前不是 Delta L0 内部 compaction，或者 key 中无法解析出 tableid，
+// 则返回 false。
+// 成功时会：
+// 1. 从 user key 中解析 tableid；
+// 2. 在 Delta L0 分区目录中查找该 tableid 所在分区；
+// 3. 同时注册/观察该 tableid，使分区目录可根据访问到的 tableid 动态 split；
+// 4. 将查找到的分区信息写入 partition。
+bool CompactionOutputs::LookupDeltaL0PartitionForKey(
+    const Slice& user_key, DeltaL0Partition* partition) {
+  if (!IsDeltaIntraL0Compaction()) {
+    return false;
+  }
+
+  uint64_t tableid = 0;
+  if (!TryParseDeltaTableIdFromUserKey(user_key, &tableid)) {
+    return false;
+  }
+
+  *partition = compaction_->column_family_data()
+                   ->delta_l0_partition_directory()
+                   ->LookupAndRegister(tableid);
+  return true;
+}
+
+// 判断在写入当前 user key 前，是否需要因为 Delta L0 partition 变化而停止当前输出文件。
+// 当前输出文件应该只包含同一个 Delta L0 partition/generation 的数据。
+// 如果新 key 属于不同 partition，或者属于同一 partition 的不同 generation，
+// 则返回 true，表示应该结束当前文件并切换到新的输出文件。
+// 如果当前不是 Delta L0 内部 compaction，无法解析 key 的 partition，
+// 或者当前输出文件还没有有效的 partition 信息，则不触发停止。
+bool CompactionOutputs::ShouldStopBeforeForDeltaL0Partition(
+    const Slice& user_key) {
+  DeltaL0Partition key_partition;
+  if (!LookupDeltaL0PartitionForKey(user_key, &key_partition) ||
+      !delta_l0_partition_valid_) {
+    return false;
+  }
+
+  return key_partition.partition_id != delta_l0_partition_.partition_id ||
+         key_partition.generation != delta_l0_partition_.generation;
+}
 
 void CompactionOutputs::NewBuilder(const TableBuilderOptions& tboptions) {
   builder_.reset(NewTableBuilder(tboptions, file_writer_.get()));
@@ -44,6 +103,32 @@ Status CompactionOutputs::Finish(const Status& intput_status,
   if (s.ok()) {
     meta->fd.file_size = current_bytes;
     meta->marked_for_compaction = builder_->NeedCompact();
+    // 为输出文件填充 Delta L0 文件元信息。
+    // 对 Delta Column Family 的 L0 文件，会根据文件 smallest/largest key
+    // 解析 tableid 范围，并写入 meta->delta_l0_meta。
+    // 非 Delta CF 或非 L0 输出文件会清空 delta_l0_meta。
+    MaybePopulateDeltaL0FileMeta(
+        compaction_->column_family_data()->GetName(),
+        is_penultimate_level_ ? compaction_->GetPenultimateLevel()
+                              : compaction_->output_level(),
+        meta);
+    // 对 Delta L0 内部 compaction 生成的输出文件，额外记录其所属的
+    // Delta L0 partition_id 和 partition_generation。
+    //
+    // 这样后续恢复、读路径剪枝、以及再次 compaction 时，可以知道该 L0 文件
+    // 是由哪个 Delta L0 partition 产生的，避免只依赖 tableid_min/tableid_max
+    // 而丢失分区身份信息。
+    //
+    // 只有在以下条件同时满足时才写入：
+    // 1. 当前是 Delta CF 的 L0 -> L0 compaction；
+    // 2. 输出文件已经成功解析出有效的 Delta L0 tableid 范围；
+    // 3. 当前 CompactionOutputs 已经记录了有效的输出 partition。
+    if (IsDeltaIntraL0Compaction() && meta->delta_l0_meta.valid &&
+        delta_l0_partition_valid_) {
+      meta->delta_l0_meta.partition_id = delta_l0_partition_.partition_id;
+      meta->delta_l0_meta.partition_generation =
+          delta_l0_partition_.generation;
+    }
   }
   current_output().finished = true;
   stats_.bytes_written += current_bytes;
@@ -265,6 +350,11 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
     return true;
   }
 
+  // 分区切换
+  if (ShouldStopBeforeForDeltaL0Partition(c_iter.user_key())) {
+    return true;
+  }
+
   // files output to Level 0 won't be split
   if (compaction_->output_level() == 0) {
     return false;
@@ -384,6 +474,24 @@ Status CompactionOutputs::AddToOutput(
 
   // Open output file if necessary
   if (!HasBuilder()) {
+    DeltaL0Partition partition;
+    // 尝试根据当前 key 查找其所属的 Delta L0 partition。
+    // 成功时，将该 partition 记录到当前 CompactionOutputs 中，
+    // 后续 Finish() 会把 partition_id 和 generation 写入输出文件的
+    // FileMetaData::delta_l0_meta。
+    //
+    // 如果后续遇到属于不同 partition/generation 的 key，
+    // ShouldStopBeforeForDeltaL0Partition() 会触发切换输出文件，
+    // 避免一个 L0 输出文件跨多个 Delta L0 partition。
+    if (LookupDeltaL0PartitionForKey(c_iter.user_key(), &partition)) {
+      delta_l0_partition_ = partition;
+      delta_l0_partition_valid_ = true;
+    } else {
+      // 当前不是 Delta L0 内部 compaction，或者当前 key 无法解析 tableid。
+      // 此时不为输出文件绑定 Delta L0 partition，后续也不会写入
+      // partition_id / partition_generation。
+      delta_l0_partition_valid_ = false;
+    }
     s = open_file_func(*this);
     if (!s.ok()) {
       return s;

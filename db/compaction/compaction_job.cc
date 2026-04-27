@@ -24,6 +24,7 @@
 #include "db/builder.h"
 #include "db/compaction/clipping_iterator.h"
 #include "db/compaction/compaction_state.h"
+#include "db/delta_l0.h"
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
 #include "db/error_handler.h"
@@ -1724,6 +1725,16 @@ Status CompactionJob::InstallCompactionResults(
       edit->AddCompactCursor(start_level,
                              vstorage->GetNextCompactCursor(
                                  start_level, compaction->num_input_files(0)));
+    }
+  }
+
+  // 将当前 Delta L0 分区目录编码成快照并写入 version edit，用于保证 L0 分区元数据随版本变更一起记录和恢复
+  if (compaction->start_level() == 0 && compaction->output_level() == 0 &&
+      compaction->column_family_data()->IsDeltaColumnFamily()) {
+    DeltaL0PartitionDirectory* const directory =
+        compaction->column_family_data()->delta_l0_partition_directory();
+    if (directory != nullptr) {
+      edit->SetDeltaL0PartitionSnapshot(directory->EncodeSnapshot());
     }
   }
 

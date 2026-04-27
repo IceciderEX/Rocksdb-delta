@@ -765,6 +765,9 @@ class InternalStats {
   bool HandleCFStats(std::string* value, Slice suffix);
   bool HandleCFStatsNoFileHistogram(std::string* value, Slice suffix);
   bool HandleCFFileHistogram(std::string* value, Slice suffix);
+  bool HandleDeltaL0Stats(std::string* value, Slice suffix);
+  bool HandleDeltaL0StatsMap(std::map<std::string, std::string>* values,
+                             Slice suffix);
   bool HandleCFStatsPeriodic(std::string* value, Slice suffix);
   bool HandleCFWriteStallStats(std::string* value, Slice suffix);
   bool HandleCFWriteStallStatsMap(std::map<std::string, std::string>* values,

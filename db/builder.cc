@@ -203,6 +203,8 @@ Status BuildTable(
         ioptions.enforce_single_del_contracts,
         /*manual_compaction_canceled=*/kManualCompactionCanceledFalse,
         /*compaction=*/nullptr, compaction_filter.get(),
+        /*hotspot_manager=*/nullptr,
+        /*oldest_active_read_epoch=*/0,
         /*shutting_down=*/nullptr, db_options.info_log, full_history_ts_low);
 
     c_iter.SeekToFirst();

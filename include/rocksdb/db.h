@@ -953,6 +953,11 @@ class DB {
     //      level, as well as the histogram of latency of single requests.
     static const std::string kCFFileHistogram;
 
+    // DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY:
+    //  "rocksdb.delta-l0-stats" - returns Delta CF specific L0 partition
+    //      observability as a multi-line string or a map property.
+    static const std::string kDeltaL0Stats;
+
     // "rocksdb.cf-write-stall-stats" - returns a multi-line string or
     //      map with statistics on CF-scope write stalls for a given CF
     // See`WriteStallStatsMapKeys` for structured representation of keys

@@ -22,6 +22,7 @@
 #include "db/compaction/compaction_picker_fifo.h"
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/compaction_picker_universal.h"
+#include "db/delta_l0.h"
 #include "db/db_impl/db_impl.h"
 #include "db/internal_stats.h"
 #include "db/job_context.h"
@@ -556,7 +557,13 @@ ColumnFamilyData::ColumnFamilyData(
       last_memtable_id_(0),
       db_paths_registered_(false),
       mempurge_used_(false),
-      next_epoch_number_(1) {
+      next_epoch_number_(1),
+      // 初始化 Delta L0 partition directory。
+      // 只有名为 "Delta" 的 Column Family 才需要维护 Delta L0 分区目录；
+      // 普通 Column Family 不启用该功能，因此保持为 nullptr。
+      delta_l0_partition_directory_(
+          IsDeltaColumnFamilyName(name) ? new DeltaL0PartitionDirectory()
+                                        : nullptr) {
   if (id_ != kDummyColumnFamilyDataId) {
     // TODO(cc): RegisterDbPaths can be expensive, considering moving it
     // outside of this constructor which might be called with db mutex held.
@@ -1511,6 +1518,55 @@ void ColumnFamilyData::RecoverEpochNumbers() {
   auto* vstorage = current_->storage_info();
   assert(vstorage);
   vstorage->RecoverEpochNumbers(this);
+}
+
+// 恢复当前 Column Family 的 Delta L0 partition directory。
+// 该函数通常在 Version/VersionStorageInfo 恢复完成后调用，
+// 用于重建 Delta Column Family 的 L0 分区目录状态。
+//
+// 恢复优先级：
+// 1. 如果 VersionStorageInfo 中保存了 Delta L0 partition snapshot，
+//    优先从 snapshot 恢复；
+// 2. 如果没有 snapshot，或者 snapshot 恢复失败，
+//    则退化为根据当前 L0 文件的 delta_l0_meta 信息重建分区目录。
+//
+// 普通 Column Family 不需要维护 Delta L0 partition directory，
+// 因此会直接返回。
+void ColumnFamilyData::RecoverDeltaL0PartitionDirectory() {
+  if (!IsDeltaColumnFamily() || delta_l0_partition_directory_ == nullptr ||
+      current_ == nullptr) {
+    return;
+  }
+
+  // 从当前 Version 中获取 VersionStorageInfo。
+  // L0 文件列表以及可能持久化的 Delta L0 partition snapshot 都在这里读取。
+  auto* vstorage = current_->storage_info();
+  assert(vstorage != nullptr);
+
+  bool restored = false;
+
+  // 优先使用 manifest/version edit 中记录的 Delta L0 partition snapshot 恢复。
+  // snapshot 能保留完整的 partition 边界、partition_id、generation、
+  // observed_tableids 等信息，比仅从 L0 文件推断更准确。
+  if (vstorage->HasDeltaL0PartitionSnapshot()) {
+    restored = delta_l0_partition_directory_->RestoreFromSnapshot(
+        Slice(vstorage->GetDeltaL0PartitionSnapshot()));
+  }
+
+  // 如果没有 snapshot，或者 snapshot 格式不合法/校验失败，
+  // 则根据当前 L0 文件的 delta_l0_meta 信息尽力重建分区目录。
+  // 这是兼容旧版本 manifest 或异常恢复场景的 fallback。
+  if (!restored) {
+    delta_l0_partition_directory_->RestoreFromL0Files(vstorage->LevelFiles(0));
+  }
+}
+
+// 判断当前 Column Family 是否为 Delta Column Family。
+// 目前通过 Column Family 名称是否等于 "Delta" 来识别。
+// Delta Column Family 会启用 L0 partition directory、
+// Delta L0 文件元信息、partition-aware compaction 等特殊逻辑。
+bool ColumnFamilyData::IsDeltaColumnFamily() const {
+  return IsDeltaColumnFamilyName(name_);
 }
 
 ColumnFamilySet::ColumnFamilySet(const std::string& dbname,

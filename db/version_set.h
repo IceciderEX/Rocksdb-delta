@@ -337,6 +337,25 @@ class VersionStorageInfo {
   }
   void RecoverEpochNumbers(ColumnFamilyData* cfd);
 
+  bool HasDeltaL0PartitionSnapshot() const {
+    return has_delta_l0_partition_snapshot_;
+  }
+
+  const std::string& GetDeltaL0PartitionSnapshot() const {
+    assert(has_delta_l0_partition_snapshot_);
+    return delta_l0_partition_snapshot_;
+  }
+
+  void SetDeltaL0PartitionSnapshot(std::string delta_l0_partition_snapshot) {
+    has_delta_l0_partition_snapshot_ = true;
+    delta_l0_partition_snapshot_ = std::move(delta_l0_partition_snapshot);
+  }
+
+  void ClearDeltaL0PartitionSnapshot() {
+    has_delta_l0_partition_snapshot_ = false;
+    delta_l0_partition_snapshot_.clear();
+  }
+
   class FileLocation {
    public:
     FileLocation() = default;
@@ -718,6 +737,9 @@ class VersionStorageInfo {
 
   // Compact cursors for round-robin compactions in each level
   std::vector<InternalKey> compact_cursor_;
+
+  bool has_delta_l0_partition_snapshot_ = false;
+  std::string delta_l0_partition_snapshot_;
 
   // the following are the sampled temporary stats.
   // the current accumulated size of sampled files.
@@ -1226,6 +1248,7 @@ class VersionSet {
   // Recover the next epoch number of each CFs and epoch number
   // of their files (if missing)
   void RecoverEpochNumbers();
+  void RecoverDeltaL0PartitionDirectories();
 
   // Reads a manifest file and returns a list of column families in
   // column_families.

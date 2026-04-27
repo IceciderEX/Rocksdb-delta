@@ -22,6 +22,7 @@
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_entry_stats.h"
 #include "db/column_family.h"
+#include "db/delta_l0.h"
 #include "db/db_impl/db_impl.h"
 #include "db/write_stall_stats.h"
 #include "port/port.h"
@@ -248,6 +249,10 @@ static const std::string cfstats = "cfstats";
 static const std::string cfstats_no_file_histogram =
     "cfstats-no-file-histogram";
 static const std::string cf_file_histogram = "cf-file-histogram";
+// Delta L0 统计属性的名称后缀。
+// 完整 property 名称会在前面拼接 rocksdb_prefix，
+// 最终形成 RocksDB 对外暴露的属性名。
+static const std::string delta_l0_stats = "delta-l0-stats";
 static const std::string cf_write_stall_stats = "cf-write-stall-stats";
 static const std::string dbstats = "dbstats";
 static const std::string db_write_stall_stats = "db-write-stall-stats";
@@ -330,6 +335,12 @@ const std::string DB::Properties::kCFStatsNoFileHistogram =
     rocksdb_prefix + cfstats_no_file_histogram;
 const std::string DB::Properties::kCFFileHistogram =
     rocksdb_prefix + cf_file_histogram;
+// Delta L0 统计属性的完整 property 名称。
+// 用户可以通过 GetProperty / GetMapProperty 读取该属性，
+// 用于观察 Delta L0 partition directory 状态、L0 文件分布、
+// 读路径 pruning 计数、legacy/old parent 文件数量等信息。
+const std::string DB::Properties::kDeltaL0Stats =
+    rocksdb_prefix + delta_l0_stats;
 const std::string DB::Properties::kCFWriteStallStats =
     rocksdb_prefix + cf_write_stall_stats;
 const std::string DB::Properties::kDBWriteStallStats =
@@ -461,6 +472,18 @@ const UnorderedMap<std::string, DBPropertyInfo>
         {DB::Properties::kCFFileHistogram,
          {false, &InternalStats::HandleCFFileHistogram, nullptr, nullptr,
           nullptr}},
+        // 注册 Delta L0 stats property 的处理函数。
+        //
+        // 该属性同时支持：
+        // 1. GetProperty 文本形式输出：HandleDeltaL0Stats；
+        // 2. GetMapProperty map 形式输出：HandleDeltaL0StatsMap。
+        //
+        // 该 property 主要用于 Delta L0 partition 功能的观测和测试验证，
+        // 例如查看 partition_count、split_count、directory snapshot 大小、
+        // Get/Scan 剪枝前后候选 L0 文件数量等。
+        {DB::Properties::kDeltaL0Stats,
+         {false, &InternalStats::HandleDeltaL0Stats, nullptr,
+          &InternalStats::HandleDeltaL0StatsMap, nullptr}},
         {DB::Properties::kCFWriteStallStats,
          {false, &InternalStats::HandleCFWriteStallStats, nullptr,
           &InternalStats::HandleCFWriteStallStatsMap, nullptr}},
@@ -1039,6 +1062,41 @@ bool InternalStats::HandleLevelStats(std::string* value, Slice /*suffix*/) {
   return true;
 }
 
+namespace {
+// Delta L0 stats property 使用的统计快照结构体前置声明。
+// 该结构用于临时保存 Delta L0 partition directory、L0 文件分布、
+// 读路径 pruning 计数等信息，后续会被转换成 property map 输出。
+struct DeltaL0PropertyStatsSnapshot;
+// 构建 Delta L0 stats property 的统计快照。
+// 输入为 ColumnFamilyData，输出写入 snapshot。
+//
+// 返回 true 表示当前 Column Family 是有效的 Delta CF，
+// 且成功收集到 Delta L0 partition directory 和 L0 文件统计信息；
+// 返回 false 表示当前 CF 不适用该属性，例如：
+// 1. cfd 为空；
+// 2. 不是 Delta Column Family；
+// 3. Delta L0 partition directory 不存在；
+// 4. 当前 Version 不存在。
+bool BuildDeltaL0PropertyStatsSnapshot(ColumnFamilyData* cfd,
+                                       DeltaL0PropertyStatsSnapshot* snapshot);
+// 将 Delta L0 stats 快照转换成 string map 形式的 property 输出。
+// values 中会写入类似：
+//   partition_count
+//   split_count
+//   directory_snapshot_bytes
+//   get_l0_candidate_files_before_prune
+//   get_l0_candidate_files_after_prune
+//   scan_l0_candidate_files_before_prune
+//   scan_l0_candidate_files_after_prune
+//   partition.N.partition_id
+//   partition.N.l0_file_count
+// 等 key-value 统计项。
+//
+// 该函数只负责格式化输出，不再重新扫描 L0 文件或访问 directory。
+void BuildDeltaL0PropertyMap(const DeltaL0PropertyStatsSnapshot& snapshot,
+                             std::map<std::string, std::string>* values);
+}  // namespace
+
 bool InternalStats::HandleStats(std::string* value, Slice suffix) {
   if (!HandleCFStats(value, suffix)) {
     return false;
@@ -1153,6 +1211,155 @@ bool InternalStats::HandleAggregatedTableProperties(std::string* value,
     return false;
   }
   *value = tp->ToString();
+  return true;
+}
+
+namespace {
+// DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: standalone Delta L0 property
+// plumbing that is safe to remove with related temporary observability.
+struct DeltaL0PartitionPropertyStats {
+  DeltaL0Partition partition;
+  uint64_t l0_file_count = 0;
+  uint64_t l0_bytes = 0;
+};
+
+struct DeltaL0PropertyStatsSnapshot {
+  uint64_t partition_count = 0;
+  uint64_t split_count = 0;
+  uint64_t directory_snapshot_bytes = 0;
+  uint64_t get_l0_candidate_files_before_prune = 0;
+  uint64_t get_l0_candidate_files_after_prune = 0;
+  uint64_t scan_l0_candidate_files_before_prune = 0;
+  uint64_t scan_l0_candidate_files_after_prune = 0;
+  uint64_t legacy_l0_file_count_without_meta = 0;
+  uint64_t old_parent_l0_file_count = 0;
+  std::vector<DeltaL0PartitionPropertyStats> partitions;
+};
+
+void AddDeltaL0Uint64Stat(std::map<std::string, std::string>* values,
+                          const std::string& key, uint64_t value) {
+  (*values)[key] = std::to_string(value);
+}
+
+bool BuildDeltaL0PropertyStatsSnapshot(ColumnFamilyData* cfd,
+                                       DeltaL0PropertyStatsSnapshot* snapshot) {
+  if (cfd == nullptr || !cfd->IsDeltaColumnFamily()) {
+    return false;
+  }
+  const DeltaL0PartitionDirectory* const directory =
+      cfd->delta_l0_partition_directory();
+  Version* const current = cfd->current();
+  if (directory == nullptr || current == nullptr) {
+    return false;
+  }
+
+  const auto partitions = directory->GetPartitionsSnapshot();
+  snapshot->partition_count = partitions.size();
+  snapshot->split_count = directory->SplitCount();
+  snapshot->directory_snapshot_bytes = directory->GetEncodedSnapshotSize();
+  const auto read_prune_counters = directory->GetReadPruneCountersSnapshot();
+  snapshot->get_l0_candidate_files_before_prune =
+      read_prune_counters.get_l0_candidate_files_before_prune;
+  snapshot->get_l0_candidate_files_after_prune =
+      read_prune_counters.get_l0_candidate_files_after_prune;
+  snapshot->scan_l0_candidate_files_before_prune =
+      read_prune_counters.scan_l0_candidate_files_before_prune;
+  snapshot->scan_l0_candidate_files_after_prune =
+      read_prune_counters.scan_l0_candidate_files_after_prune;
+
+  snapshot->partitions.reserve(partitions.size());
+  for (const DeltaL0Partition& partition : partitions) {
+    DeltaL0PartitionPropertyStats stats;
+    stats.partition = partition;
+    snapshot->partitions.push_back(std::move(stats));
+  }
+
+  const VersionStorageInfo* const storage_info = current->storage_info();
+  for (FileMetaData* file_meta : storage_info->LevelFiles(0)) {
+    if (DeltaL0FileIsLegacyWithoutMeta(*file_meta)) {
+      ++snapshot->legacy_l0_file_count_without_meta;
+      continue;
+    }
+    if (DeltaL0FileIsOldParent(*file_meta, *directory)) {
+      ++snapshot->old_parent_l0_file_count;
+    }
+    for (DeltaL0PartitionPropertyStats& partition_stats :
+         snapshot->partitions) {
+      if (DeltaL0FileMayOverlapTableIdRange(
+              *file_meta, partition_stats.partition.tableid_begin,
+              partition_stats.partition.tableid_end)) {
+        ++partition_stats.l0_file_count;
+        partition_stats.l0_bytes += file_meta->fd.GetFileSize();
+      }
+    }
+  }
+  return true;
+}
+
+void BuildDeltaL0PropertyMap(const DeltaL0PropertyStatsSnapshot& snapshot,
+                             std::map<std::string, std::string>* values) {
+  AddDeltaL0Uint64Stat(values, "partition_count", snapshot.partition_count);
+  AddDeltaL0Uint64Stat(values, "split_count", snapshot.split_count);
+  AddDeltaL0Uint64Stat(values, "directory_snapshot_bytes",
+                       snapshot.directory_snapshot_bytes);
+  AddDeltaL0Uint64Stat(values, "get_l0_candidate_files_before_prune",
+                       snapshot.get_l0_candidate_files_before_prune);
+  AddDeltaL0Uint64Stat(values, "get_l0_candidate_files_after_prune",
+                       snapshot.get_l0_candidate_files_after_prune);
+  AddDeltaL0Uint64Stat(values, "scan_l0_candidate_files_before_prune",
+                       snapshot.scan_l0_candidate_files_before_prune);
+  AddDeltaL0Uint64Stat(values, "scan_l0_candidate_files_after_prune",
+                       snapshot.scan_l0_candidate_files_after_prune);
+  AddDeltaL0Uint64Stat(values, "legacy_l0_file_count_without_meta",
+                       snapshot.legacy_l0_file_count_without_meta);
+  AddDeltaL0Uint64Stat(values, "old_parent_l0_file_count",
+                       snapshot.old_parent_l0_file_count);
+
+  for (size_t index = 0; index < snapshot.partitions.size(); ++index) {
+    const DeltaL0PartitionPropertyStats& partition_stats =
+        snapshot.partitions[index];
+    const std::string prefix = "partition." + std::to_string(index) + ".";
+    AddDeltaL0Uint64Stat(values, prefix + "partition_id",
+                         partition_stats.partition.partition_id);
+    AddDeltaL0Uint64Stat(values, prefix + "partition_generation",
+                         partition_stats.partition.generation);
+    AddDeltaL0Uint64Stat(values, prefix + "tableid_begin",
+                         partition_stats.partition.tableid_begin);
+    AddDeltaL0Uint64Stat(values, prefix + "tableid_end",
+                         partition_stats.partition.tableid_end);
+    AddDeltaL0Uint64Stat(values, prefix + "observed_table_count",
+                         partition_stats.partition.observed_tableids.size());
+    AddDeltaL0Uint64Stat(values, prefix + "l0_file_count",
+                         partition_stats.l0_file_count);
+    AddDeltaL0Uint64Stat(values, prefix + "l0_bytes",
+                         partition_stats.l0_bytes);
+  }
+}
+
+}  // namespace
+
+bool InternalStats::HandleDeltaL0Stats(std::string* value, Slice /*suffix*/) {
+  std::map<std::string, std::string> values;
+  if (!HandleDeltaL0StatsMap(&values, Slice())) {
+    return false;
+  }
+  std::ostringstream oss;
+  // DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: standalone property dump for
+  // temporary Delta feature inspection.
+  for (const auto& entry : values) {
+    oss << entry.first << "=" << entry.second << "\n";
+  }
+  *value = oss.str();
+  return true;
+}
+
+bool InternalStats::HandleDeltaL0StatsMap(
+    std::map<std::string, std::string>* values, Slice /*suffix*/) {
+  DeltaL0PropertyStatsSnapshot snapshot;
+  if (!BuildDeltaL0PropertyStatsSnapshot(cfd_, &snapshot)) {
+    return false;
+  }
+  BuildDeltaL0PropertyMap(snapshot, values);
   return true;
 }
 

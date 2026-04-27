@@ -48,6 +48,7 @@ class InstrumentedMutexLock;
 struct SuperVersionContext;
 class BlobFileCache;
 class BlobSource;
+class DeltaL0PartitionDirectory;
 
 extern const double kIncSlowdownRatio;
 // This file contains a list of data structures for managing column family
@@ -514,6 +515,26 @@ class ColumnFamilyData {
   }
 
   SequenceNumber GetFirstMemtableSequenceNumber() const;
+  // 判断当前 Column Family 是否为 Delta Column Family。
+  // Delta Column Family 会启用额外的 L0 partition 元信息维护、
+  // 读路径剪枝以及 partition-aware compaction 逻辑。
+  bool IsDeltaColumnFamily() const;
+
+  // 返回当前 Column Family 的 Delta L0 分区目录。
+  // 仅当 IsDeltaColumnFamily() 为 true 时通常非空；
+  // 普通 Column Family 返回 nullptr。
+  // 非 const 版本用于需要更新目录状态的场景，例如记录 tableid、动态 split、恢复快照等。
+  DeltaL0PartitionDirectory* delta_l0_partition_directory() {
+    return delta_l0_partition_directory_.get();
+  }
+
+  // 返回当前 Column Family 的 Delta L0 分区目录。
+  // const 版本用于只读访问目录状态的场景，例如查询 partition、
+  // 编码快照或读取统计信息。
+  // 普通 Column Family 返回 nullptr。
+  const DeltaL0PartitionDirectory* delta_l0_partition_directory() const {
+    return delta_l0_partition_directory_.get();
+  }
 
   static const uint32_t kDummyColumnFamilyDataId;
 
@@ -538,6 +559,7 @@ class ColumnFamilyData {
   // Recover the next epoch number of this CF and epoch number
   // of its files (if missing)
   void RecoverEpochNumbers();
+  void RecoverDeltaL0PartitionDirectory();
 
  private:
   friend class ColumnFamilySet;
@@ -640,6 +662,7 @@ class ColumnFamilyData {
   bool mempurge_used_;
 
   std::atomic<uint64_t> next_epoch_number_;
+  std::unique_ptr<DeltaL0PartitionDirectory> delta_l0_partition_directory_;
 };
 
 // ColumnFamilySet has interesting thread-safety requirements

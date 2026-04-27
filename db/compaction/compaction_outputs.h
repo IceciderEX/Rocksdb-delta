@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "db/delta_l0.h"
 #include "db/blob/blob_garbage_meter.h"
 #include "db/compaction/compaction.h"
 #include "db/compaction/compaction_iterator.h"
@@ -165,6 +166,7 @@ class CompactionOutputs {
   void ResetBuilder() {
     builder_.reset();
     current_output_file_size_ = 0;
+    delta_l0_partition_valid_ = false;
   }
 
   // Add range deletions from the range_del_agg_ to the current output file.
@@ -218,6 +220,10 @@ class CompactionOutputs {
   // Returns true iff we should stop building the current output
   // before processing the current key in compaction iterator.
   bool ShouldStopBefore(const CompactionIterator& c_iter);
+  bool IsDeltaIntraL0Compaction() const;
+  bool LookupDeltaL0PartitionForKey(const Slice& user_key,
+                                    DeltaL0Partition* partition);
+  bool ShouldStopBeforeForDeltaL0Partition(const Slice& user_key);
 
   void Cleanup() {
     if (builder_ != nullptr) {
@@ -225,6 +231,7 @@ class CompactionOutputs {
       builder_->Abandon();
       builder_.reset();
     }
+    delta_l0_partition_valid_ = false;
   }
 
   // Updates states related to file cutting for TTL.
@@ -356,6 +363,9 @@ class CompactionOutputs {
   // The smallest key of the current output file, this is set when current
   // output file's smallest key is a range tombstone start key.
   InternalKey range_tombstone_lower_bound_;
+
+  bool delta_l0_partition_valid_ = false;
+  DeltaL0Partition delta_l0_partition_;
 };
 
 // helper struct to concatenate the last level and penultimate level outputs

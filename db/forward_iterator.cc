@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "db/column_family.h"
+#include "db/delta_l0.h"
 #include "db/db_impl/db_impl.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -425,13 +426,76 @@ void ForwardIterator::SeekInternal(const Slice& internal_key,
     }
 
     Slice target_user_key;
+
+    // 从目标 user key 中解析出的 Delta tableid。
+    // 后续会用它判断哪些 L0 文件可能包含该 tableid。
+    uint64_t delta_l0_target_tableid = 0;
+
+    // 是否启用 Delta L0 文件剪枝。
+    // 只有以下条件同时满足时才启用：
+    // 1. 当前不是 SeekToFirst；
+    // 2. 当前 Column Family 是 Delta；
+    // 3. 能够从目标 user key 中成功解析出 tableid。
+    bool delta_l0_pruning_enabled = false;
     if (!seek_to_first) {
       target_user_key = ExtractUserKey(internal_key);
+      // 仅对 Delta Column Family 启用 L0 tableid 剪枝。
+      // 如果目标 key 不是合法 Delta key，解析失败时保持 pruning disabled，
+      // 后续会退回原始逻辑，扫描所有 L0 iter。
+      delta_l0_pruning_enabled =
+          IsDeltaColumnFamilyName(cfd_->GetName()) &&
+          TryParseDeltaTableIdFromUserKey(target_user_key,
+                                          &delta_l0_target_tableid);
     }
     const VersionStorageInfo* vstorage = sv_->current->storage_info();
     const std::vector<FileMetaData*>& l0 = vstorage->LevelFiles(0);
+    if (delta_l0_pruning_enabled) {
+      const DeltaL0PartitionDirectory* const directory =
+          cfd_->delta_l0_partition_directory();
+      if (directory != nullptr) {
+        // DELTA_PARTITION_OBSERVABILITY_OR_TEST_ONLY: candidate counting for
+        // temporary Delta L0 pruning introspection.
+
+        // 统计剪枝前参与 scan/seek 的 L0 iterator 数量。
+        // 只统计已经存在的 l0_iters_[i]。
+        uint64_t l0_candidates_before_prune = 0;
+
+        // 统计根据目标 tableid 剪枝后仍可能相关的 L0 iterator 数量。
+        uint64_t l0_candidates_after_prune = 0;
+        for (size_t i = 0; i < l0.size(); ++i) {
+          // 没有创建 iterator 的 L0 文件不参与本次统计。
+          if (!l0_iters_[i]) {
+            continue;
+          }
+          ++l0_candidates_before_prune;
+
+          // 根据文件的 delta_l0_meta.tableid_min/tableid_max 判断：
+          // 当前 L0 文件是否可能包含目标 tableid。
+          //
+          // 如果文件没有有效 delta_l0_meta，DeltaL0FileMayContainTableId()
+          // 会保守返回 true，避免错误剪掉 legacy 文件。
+          if (DeltaL0FileMayContainTableId(*l0[i], delta_l0_target_tableid)) {
+            ++l0_candidates_after_prune;
+          }
+        }
+        // 记录 scan/iterator 路径上的 L0 候选文件剪枝统计。
+        // 后续可通过 Delta L0 stats property 观察剪枝效果。
+        directory->RecordScanL0CandidateFiles(l0_candidates_before_prune,
+                                              l0_candidates_after_prune);
+      }
+    }
     for (size_t i = 0; i < l0.size(); ++i) {
       if (!l0_iters_[i]) {
+        continue;
+      }
+      // Delta L0 pruning：
+      // 如果当前 L0 文件的 tableid 范围不可能包含目标 tableid，
+      // 则跳过该文件的 iterator seek，减少 L0 fan-out 带来的读放大。
+      //
+      // 对没有有效 delta_l0_meta 的 legacy 文件，判断函数会保守返回 true，
+      // 因此不会被错误跳过。
+      if (delta_l0_pruning_enabled &&
+          !DeltaL0FileMayContainTableId(*l0[i], delta_l0_target_tableid)) {
         continue;
       }
       if (seek_after_async_io) {
@@ -1060,4 +1124,3 @@ void ForwardIterator::DeleteIterator(InternalIterator* iter, bool is_arena) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-
