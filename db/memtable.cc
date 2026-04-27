@@ -368,6 +368,7 @@ class MemTableIterator : public InternalIterator {
       : bloom_(nullptr),
         prefix_extractor_(mem.prefix_extractor_),
         comparator_(mem.comparator_),
+        mem_(&mem),
         valid_(false),
         arena_mode_(arena != nullptr),
         value_pinned_(
@@ -518,10 +519,17 @@ class MemTableIterator : public InternalIterator {
     return value_pinned_;
   }
 
+  // for delta, get fileid
+  uint64_t GetPhysicalId() override {
+    // memtable pointer
+    return reinterpret_cast<uint64_t>(mem_); 
+  }
+
  private:
   DynamicBloom* bloom_;
   const SliceTransform* const prefix_extractor_;
   const MemTable::KeyComparator comparator_;
+  const MemTable* mem_;
   MemTableRep::Iterator* iter_;
   bool valid_;
   bool arena_mode_;

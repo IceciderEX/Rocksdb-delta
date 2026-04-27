@@ -8,6 +8,7 @@
 #include <iterator>
 #include <limits>
 
+#include "delta/hotspot_manager.h"
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_builder.h"
 #include "db/blob/blob_index.h"
@@ -32,6 +33,7 @@ CompactionIterator::CompactionIterator(
     bool enforce_single_del_contracts,
     const std::atomic<bool>& manual_compaction_canceled,
     const Compaction* compaction, const CompactionFilter* compaction_filter,
+    HotspotManager* hotspot_manager, uint64_t oldest_active_read_epoch,
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
@@ -45,7 +47,8 @@ CompactionIterator::CompactionIterator(
           manual_compaction_canceled,
           std::unique_ptr<CompactionProxy>(
               compaction ? new RealCompaction(compaction) : nullptr),
-          compaction_filter, shutting_down, info_log, full_history_ts_low,
+          compaction_filter, hotspot_manager, oldest_active_read_epoch,
+          shutting_down, info_log, full_history_ts_low,
           preserve_time_min_seqno, preclude_last_level_min_seqno) {}
 
 CompactionIterator::CompactionIterator(
@@ -60,6 +63,7 @@ CompactionIterator::CompactionIterator(
     const std::atomic<bool>& manual_compaction_canceled,
     std::unique_ptr<CompactionProxy> compaction,
     const CompactionFilter* compaction_filter,
+    HotspotManager* hotspot_manager, uint64_t oldest_active_read_epoch,
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
@@ -81,6 +85,8 @@ CompactionIterator::CompactionIterator(
       blob_file_builder_(blob_file_builder),
       compaction_(std::move(compaction)),
       compaction_filter_(compaction_filter),
+      hotspot_manager_(hotspot_manager),
+      oldest_active_read_epoch_(oldest_active_read_epoch),
       shutting_down_(shutting_down),
       manual_compaction_canceled_(manual_compaction_canceled),
       bottommost_level_(!compaction_ ? false
@@ -454,6 +460,20 @@ bool CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
   return true;
 }
 
+// for delta
+bool CompactionIterator::ShouldDropForGDCTCompaction() const {
+  if (hotspot_manager_ == nullptr) {
+    return false;
+  }
+  // 只对 value、blob index、wide-column 数据做 filter
+  if (ikey_.type != kTypeValue && ikey_.type != kTypeBlobIndex &&
+      ikey_.type != kTypeWideColumnEntity) {
+    return false;
+  }
+  return hotspot_manager_->ShouldDropDuringCompaction(
+      ikey_.user_key, ikey_.sequence, oldest_active_read_epoch_);
+}
+
 void CompactionIterator::NextFromInput() {
   at_next_ = false;
   validity_info_.Invalidate();
@@ -614,6 +634,12 @@ void CompactionIterator::NextFromInput() {
 
     if (need_skip) {
       // This case is handled below.
+    } else if (ShouldDropForGDCTCompaction()) {
+      // for delta
+      ++iter_stats_.num_record_drop_hidden;
+      ++iter_stats_.num_record_drop_obsolete;
+      AdvanceInputIter();
+      continue;
     } else if (clear_and_output_next_key_) {
       // In the previous iteration we encountered a single delete that we could
       // not compact out.  We will keep this Put, but can drop it's data.

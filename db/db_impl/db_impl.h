@@ -73,6 +73,7 @@ class ArenaWrappedDBIter;
 class InMemoryStatsHistoryIterator;
 class MemTable;
 class PersistentStatsHistoryIterator;
+class HotspotManager;
 class TableCache;
 class TaskLimiterToken;
 class Version;
@@ -82,6 +83,7 @@ class WriteCallback;
 struct JobContext;
 struct ExternalSstFileInfo;
 struct MemTableInfo;
+struct ImmutableOptions;
 
 // Class to maintain directories for all database paths other than main one.
 class Directories {
@@ -602,6 +604,8 @@ class DBImpl : public DB {
 
   // ---- End of implementations of the DB interface ----
   SystemClock* GetSystemClock() const;
+  // for delta
+  HotspotManager* GetHotspotManager() const { return hotspot_manager_.get(); }
 
   struct GetImplOptions {
     ColumnFamilyHandle* column_family = nullptr;
@@ -609,6 +613,8 @@ class DBImpl : public DB {
     PinnableWideColumns* columns = nullptr;
     std::string* timestamp = nullptr;
     bool* value_found = nullptr;
+    // for delta
+    SequenceNumber* seq = nullptr;
     ReadCallback* callback = nullptr;
     bool* is_blob_index = nullptr;
     // If true return value associated with key via value pointer else return
@@ -2704,6 +2710,17 @@ class DBImpl : public DB {
   // The number of LockWAL called without matching UnlockWAL call.
   // See also lock_wal_write_token_
   uint32_t lock_wal_count_;
+
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+
+  // Delta background work [TO ROCKSDB Env]
+  int bg_delta_scheduled_ = 0;
+  static void BGWorkDelta(void* arg);
+  void BackgroundDeltaWork();
+  void MaybeScheduleDeltaWork();
+  void InitializeHotspotManager(const ImmutableOptions& options,
+                                const std::string& delta_cf_name);
 };
 
 class GetWithTimestampReadCallback : public ReadCallback {

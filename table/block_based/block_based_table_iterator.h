@@ -176,6 +176,14 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
 
   std::unique_ptr<InternalIteratorBase<IndexValue>> index_iter_;
 
+  // for delta, get fileid
+  uint64_t GetPhysicalId() override {
+    if (table_ && table_->get_rep()) {
+      return table_->get_rep()->sst_number_for_tracing();
+    }
+    return 0;
+  }
+
  private:
   enum class IterDirection {
     kForward,

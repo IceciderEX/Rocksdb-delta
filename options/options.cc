@@ -702,7 +702,10 @@ ReadOptions::ReadOptions()
       value_size_soft_limit(std::numeric_limits<uint64_t>::max()),
       adaptive_readahead(false),
       async_io(false),
-      optimize_multiget_for_io(true) {}
+      optimize_multiget_for_io(true),
+      delta_full_scan(false),
+      skip_hot_path(false),
+      enable_delta_diag_logging(false) {}
 
 ReadOptions::ReadOptions(bool cksum, bool cache)
     : snapshot(nullptr),
@@ -728,6 +731,9 @@ ReadOptions::ReadOptions(bool cksum, bool cache)
       value_size_soft_limit(std::numeric_limits<uint64_t>::max()),
       adaptive_readahead(false),
       async_io(false),
-      optimize_multiget_for_io(true) {}
+      optimize_multiget_for_io(true),
+      delta_full_scan(false),
+      skip_hot_path(false),
+      enable_delta_diag_logging(false) {}
 
 }  // namespace ROCKSDB_NAMESPACE

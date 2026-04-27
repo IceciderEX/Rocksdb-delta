@@ -53,6 +53,7 @@
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
 #include "db/write_callback.h"
+#include "delta/hotspot_manager.h"
 #include "env/unique_id_gen.h"
 #include "file/file_util.h"
 #include "file/filename.h"
@@ -149,6 +150,18 @@ void DumpSupportInfo(Logger* logger) {
 
   ROCKS_LOG_HEADER(logger, "DMutex implementation: %s", DMutex::kName());
 }
+
+// for delta, add a struct to manage the read epoch for delta visibility in DBIter
+struct ScopedDeltaReadEpoch {
+  HotspotManager* manager = nullptr;
+  uint64_t epoch = 0;
+
+  ~ScopedDeltaReadEpoch() {
+    if (manager != nullptr) {
+      manager->ReleaseReadEpoch(epoch);
+    }
+  }
+};
 }  // namespace
 
 DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
@@ -290,6 +303,64 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   if (write_buffer_manager_) {
     wbm_stall_.reset(new WBMStallInterface());
   }
+}
+
+void DBImpl::InitializeHotspotManager(const ImmutableOptions& options,
+                                      const std::string& delta_cf_name) {
+  if (hotspot_manager_) {
+    return;
+  }
+
+  auto* delta_cfd = versions_->GetColumnFamilySet()->GetColumnFamily(delta_cf_name);
+  assert(delta_cfd != nullptr);
+
+  std::string hotspot_dir = dbname_ + "/hotspot_data";
+  hotspot_manager_ = std::make_shared<HotspotManager>(
+      options, hotspot_dir, delta_cf_name,
+      &delta_cfd->internal_comparator());
+  immutable_db_options_.hotspot_manager = hotspot_manager_;
+
+  ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                 "[DBImpl] HotspotManager initialized at %s",
+                 hotspot_dir.c_str());
+
+  mutex_.AssertHeld();
+  MaybeScheduleDeltaWork();
+}
+
+void DBImpl::BGWorkDelta(void* arg) {
+  auto* db = reinterpret_cast<DBImpl*>(arg);
+  db->BackgroundDeltaWork();
+}
+
+void DBImpl::MaybeScheduleDeltaWork() {
+  mutex_.AssertHeld();
+
+  if (shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (bg_delta_scheduled_ > 0) {
+    return;
+  }
+  if (!hotspot_manager_ || !hotspot_manager_->HasPendingGDCTFlush()) {
+    return;
+  }
+
+  bg_delta_scheduled_ = 1;
+  env_->Schedule(&DBImpl::BGWorkDelta, this, Env::Priority::LOW, nullptr);
+}
+
+void DBImpl::BackgroundDeltaWork() {
+  TEST_SYNC_POINT("DBImpl::BackgroundDeltaWork:Start");
+
+  if (hotspot_manager_) {
+    hotspot_manager_->CompactAndFlushGDCTLogIfNeeded();
+  }
+
+  InstrumentedMutexLock l(&mutex_);
+  bg_delta_scheduled_ = 0;
+  bg_cv_.SignalAll();
+  MaybeScheduleDeltaWork();
 }
 
 Status DBImpl::Resume() {
@@ -479,7 +550,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context) {
 void DBImpl::WaitForBackgroundWork() {
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_) {
+         bg_flush_scheduled_ || bg_delta_scheduled_) {
     bg_cv_.Wait();
   }
 }
@@ -577,10 +648,9 @@ Status DBImpl::CloseHelper() {
   Status ret = Status::OK();
 
   // Wait for background work to finish
-  while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_ || bg_purge_scheduled_ ||
-         pending_purge_obsolete_files_ ||
-         error_handler_.IsRecoveryInProgress()) {
+    while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
+      bg_flush_scheduled_ || bg_delta_scheduled_ || bg_purge_scheduled_ ||
+      pending_purge_obsolete_files_ || error_handler_.IsRecoveryInProgress()) {
     TEST_SYNC_POINT("DBImpl::~DBImpl:WaitJob");
     bg_cv_.Wait();
   }
@@ -2010,6 +2080,10 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(
       get_impl_options.column_family);
   auto cfd = cfh->cfd();
+  ScopedDeltaReadEpoch delta_read_epoch_guard;
+  const bool use_delta_visibility =
+      get_impl_options.get_value && hotspot_manager_ != nullptr &&
+      hotspot_manager_->IsDeltaColumnFamily(cfd->GetName());
 
   if (tracer_) {
     // TODO: This mutex should be removed later, to improve performance when
@@ -2044,31 +2118,50 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
       snapshot =
           reinterpret_cast<const SnapshotImpl*>(read_options.snapshot)->number_;
     }
-  } else {
-    // Note that the snapshot is assigned AFTER referencing the super
-    // version because otherwise a flush happening in between may compact away
-    // data for the snapshot, so the reader would see neither data that was be
-    // visible to the snapshot before compaction nor the newer data inserted
-    // afterwards.
-    snapshot = GetLastPublishedSequence();
-    if (get_impl_options.callback) {
-      // The unprep_seqs are not published for write unprepared, so it could be
-      // that max_visible_seq is larger. Seek to the std::max of the two.
-      // However, we still want our callback to contain the actual snapshot so
-      // that it can do the correct visibility filtering.
-      get_impl_options.callback->Refresh(snapshot);
-
-      // Internally, WriteUnpreparedTxnReadCallback::Refresh would set
-      // max_visible_seq = max(max_visible_seq, snapshot)
-      //
-      // Currently, the commented out assert is broken by
-      // InvalidSnapshotReadCallback, but if write unprepared recovery followed
-      // the regular transaction flow, then this special read callback would not
-      // be needed.
-      //
-      // assert(callback->max_visible_seq() >= snapshot);
-      snapshot = get_impl_options.callback->max_visible_seq();
+    if (use_delta_visibility) {
+      delta_read_epoch_guard.epoch = hotspot_manager_->FreezeReadEpoch();
     }
+  } else {
+    while (true) {
+      const uint64_t barrier_before =
+          use_delta_visibility ? hotspot_manager_->GetPublishBarrier() : 0;
+      if (use_delta_visibility && (barrier_before & 1U) != 0) {
+        continue;
+      }
+
+      // Note that the snapshot is assigned AFTER referencing the super
+      // version because otherwise a flush happening in between may compact away
+      // data for the snapshot, so the reader would see neither data that was be
+      // visible to the snapshot before compaction nor the newer data inserted
+      // afterwards.
+      snapshot = GetLastPublishedSequence();
+      if (get_impl_options.callback) {
+        // The unprep_seqs are not published for write unprepared, so it could
+        // be that max_visible_seq is larger. Seek to the std::max of the two.
+        // However, we still want our callback to contain the actual snapshot so
+        // that it can do the correct visibility filtering.
+        get_impl_options.callback->Refresh(snapshot);
+
+        // Internally, WriteUnpreparedTxnReadCallback::Refresh would set
+        // max_visible_seq = max(max_visible_seq, snapshot)
+        snapshot = get_impl_options.callback->max_visible_seq();
+      }
+
+      if (!use_delta_visibility) {
+        break;
+      }
+
+      delta_read_epoch_guard.epoch = hotspot_manager_->CurrentEpoch();
+      const uint64_t barrier_after = hotspot_manager_->GetPublishBarrier();
+      if (barrier_before == barrier_after) {
+        break;
+      }
+    }
+  }
+
+  if (use_delta_visibility) {
+    delta_read_epoch_guard.manager = hotspot_manager_.get();
+    hotspot_manager_->AcquireReadEpoch(delta_read_epoch_guard.epoch);
   }
   // If timestamp is used, we use read callback to ensure <key,t,s> is returned
   // only if t <= read_opts.timestamp and s <= snapshot.
@@ -2088,6 +2181,12 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   // Prepare to store a list of merge operations if merge occurs.
   MergeContext merge_context;
   SequenceNumber max_covering_tombstone_seq = 0;
+  // for delta 
+  SequenceNumber found_seq = kMaxSequenceNumber;
+  SequenceNumber* lookup_seq =
+      get_impl_options.get_value
+          ? (get_impl_options.seq != nullptr ? get_impl_options.seq : &found_seq)
+          : nullptr;
 
   Status s;
   // First look in the memtable, then in the immutable memtable (if any).
@@ -2109,7 +2208,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
               get_impl_options.value ? get_impl_options.value->GetSelf()
                                      : nullptr,
               get_impl_options.columns, timestamp, &s, &merge_context,
-              &max_covering_tombstone_seq, read_options,
+              &max_covering_tombstone_seq, lookup_seq, read_options,
               false /* immutable_memtable */, get_impl_options.callback,
               get_impl_options.is_blob_index)) {
         done = true;
@@ -2125,7 +2224,8 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
                                   ? get_impl_options.value->GetSelf()
                                   : nullptr,
                               get_impl_options.columns, timestamp, &s,
-                              &merge_context, &max_covering_tombstone_seq,
+                        &merge_context, &max_covering_tombstone_seq,
+                        lookup_seq,
                               read_options, get_impl_options.callback,
                               get_impl_options.is_blob_index)) {
         done = true;
@@ -2169,7 +2269,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
         timestamp, &s, &merge_context, &max_covering_tombstone_seq,
         &pinned_iters_mgr,
         get_impl_options.get_value ? get_impl_options.value_found : nullptr,
-        nullptr, nullptr,
+      nullptr, lookup_seq,
         get_impl_options.get_value ? get_impl_options.callback : nullptr,
         get_impl_options.get_value ? get_impl_options.is_blob_index : nullptr,
         get_impl_options.get_value);
@@ -2258,6 +2358,29 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     }
 
     ReturnAndCleanupSuperVersion(cfd, sv);
+    //  在 delta CF 的点查开始时冻结一个 read epoch，
+    // 并在点查结束时释放。点查命中底层 KV 后，会拿到底层的 put_seq，
+    // 再调用 GDCT 可见性判断；如果这条记录对当前读视图不可见，
+    // 就把结果改成 NotFound
+    if (s.ok() && get_impl_options.get_value && hotspot_manager_ != nullptr &&
+        hotspot_manager_->IsDeltaColumnFamily(cfd->GetName()) &&
+        lookup_seq != nullptr && *lookup_seq != kMaxSequenceNumber &&
+        hotspot_manager_->ShouldHideForRead(
+          key, *lookup_seq, delta_read_epoch_guard.epoch)) {
+      if (get_impl_options.value != nullptr) {
+        get_impl_options.value->Reset();
+      }
+      if (get_impl_options.columns != nullptr) {
+        get_impl_options.columns->Reset();
+      }
+      if (get_impl_options.timestamp != nullptr) {
+        get_impl_options.timestamp->clear();
+      }
+      if (get_impl_options.value_found != nullptr) {
+        *get_impl_options.value_found = false;
+      }
+      s = Status::NotFound();
+    }
 
     RecordInHistogram(stats_, BYTES_PER_READ, size);
   }
@@ -3405,23 +3528,46 @@ ArenaWrappedDBIter* DBImpl::NewIteratorImpl(const ReadOptions& read_options,
                                             bool expose_blob_index,
                                             bool allow_refresh) {
   SuperVersion* sv = cfd->GetReferencedSuperVersion(this);
+  uint64_t frozen_delta_read_epoch = UINT64_MAX;
+  const bool use_delta_visibility = hotspot_manager_ != nullptr &&
+      hotspot_manager_->IsDeltaColumnFamily(cfd->GetName());
 
   TEST_SYNC_POINT("DBImpl::NewIterator:1");
   TEST_SYNC_POINT("DBImpl::NewIterator:2");
 
   if (snapshot == kMaxSequenceNumber) {
-    // Note that the snapshot is assigned AFTER referencing the super
-    // version because otherwise a flush happening in between may compact away
-    // data for the snapshot, so the reader would see neither data that was be
-    // visible to the snapshot before compaction nor the newer data inserted
-    // afterwards.
-    // Note that the super version might not contain all the data available
-    // to this snapshot, but in that case it can see all the data in the
-    // super version, which is a valid consistent state after the user
-    // calls NewIterator().
-    snapshot = versions_->LastSequence();
-    TEST_SYNC_POINT("DBImpl::NewIterator:3");
-    TEST_SYNC_POINT("DBImpl::NewIterator:4");
+    while (true) {
+      const uint64_t barrier_before =
+          use_delta_visibility ? hotspot_manager_->GetPublishBarrier() : 0;
+      if (use_delta_visibility && (barrier_before & 1U) != 0) {
+        continue;
+      }
+
+      // Note that the snapshot is assigned AFTER referencing the super
+      // version because otherwise a flush happening in between may compact away
+      // data for the snapshot, so the reader would see neither data that was be
+      // visible to the snapshot before compaction nor the newer data inserted
+      // afterwards.
+      // Note that the super version might not contain all the data available
+      // to this snapshot, but in that case it can see all the data in the
+      // super version, which is a valid consistent state after the user
+      // calls NewIterator().
+      snapshot = versions_->LastSequence();
+      TEST_SYNC_POINT("DBImpl::NewIterator:3");
+      TEST_SYNC_POINT("DBImpl::NewIterator:4");
+
+      if (!use_delta_visibility) {
+        break;
+      }
+
+      frozen_delta_read_epoch = hotspot_manager_->CurrentEpoch();
+      const uint64_t barrier_after = hotspot_manager_->GetPublishBarrier();
+      if (barrier_before == barrier_after) {
+        break;
+      }
+    }
+  } else if (use_delta_visibility) {
+    frozen_delta_read_epoch = hotspot_manager_->FreezeReadEpoch();
   }
 
   // Try to generate a DB iterator tree in continuous memory area to be
@@ -3470,7 +3616,8 @@ ArenaWrappedDBIter* DBImpl::NewIteratorImpl(const ReadOptions& read_options,
       env_, read_options, *cfd->ioptions(), sv->mutable_cf_options, sv->current,
       snapshot, sv->mutable_cf_options.max_sequential_skip_in_iterations,
       sv->version_number, read_callback, this, cfd, expose_blob_index,
-      read_options.snapshot != nullptr ? false : allow_refresh);
+      read_options.snapshot != nullptr ? false : allow_refresh,
+      frozen_delta_read_epoch);
 
   InternalIterator* internal_iter = NewInternalIterator(
       db_iter->GetReadOptions(), cfd, sv, db_iter->GetArena(), snapshot,

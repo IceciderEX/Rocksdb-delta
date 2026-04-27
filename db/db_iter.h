@@ -119,22 +119,14 @@ class DBIter final : public Iterator {
          InternalIterator* iter, const Version* version, SequenceNumber s,
          bool arena_mode, uint64_t max_sequential_skip_in_iterations,
          ReadCallback* read_callback, DBImpl* db_impl, ColumnFamilyData* cfd,
-         bool expose_blob_index);
+      bool expose_blob_index,
+      uint64_t frozen_delta_read_epoch = UINT64_MAX);
 
   // No copying allowed
   DBIter(const DBIter&) = delete;
   void operator=(const DBIter&) = delete;
 
-  ~DBIter() override {
-    // Release pinned data if any
-    if (pinned_iters_mgr_.PinningEnabled()) {
-      pinned_iters_mgr_.ReleasePinnedData();
-    }
-    RecordTick(statistics_, NO_ITERATOR_DELETED);
-    ResetInternalKeysSkippedCounter();
-    local_stats_.BumpGlobalStatistics(statistics_);
-    iter_.DeleteIter(arena_mode_);
-  }
+  ~DBIter() override;
   void SetIter(InternalIterator* iter) {
     assert(iter_.iter() == nullptr);
     iter_.Set(iter);
@@ -239,12 +231,17 @@ class DBIter final : public Iterator {
   bool FindNextUserEntryInternal(bool skipping_saved_key, const Slice* prefix);
   bool ParseKey(ParsedInternalKey* key);
   bool MergeValuesNewToOld();
+  bool IsDeltaVisible(const Slice& user_key_without_ts,
+                      SequenceNumber sequence) const;
 
   // If prefix is not null, we need to set the iterator to invalid if no more
   // entry can be found within the prefix.
   void PrevInternal(const Slice* prefix);
   bool TooManyInternalKeysSkipped(bool increment = true);
-  bool IsVisible(SequenceNumber sequence, const Slice& ts,
+  
+  // for delta CF, we need to check if the record is visible by GDCT. 
+  bool IsVisible(const Slice& user_key_without_ts, SequenceNumber sequence,
+                 const Slice& ts,
                  bool* more_recent = nullptr);
 
   // Temporarily pin the blocks that we encounter until ReleaseTempPinnedData()
@@ -384,6 +381,10 @@ class DBIter final : public Iterator {
   bool expose_blob_index_;
   bool is_blob_;
   bool arena_mode_;
+  // for delta
+  HotspotManager* hotspot_manager_;
+  uint64_t delta_read_epoch_;
+  bool delta_visibility_enabled_;
   // List of operands for merge operator.
   MergeContext merge_context_;
   LocalStatistics local_stats_;
@@ -406,6 +407,7 @@ extern Iterator* NewDBIterator(
     const Version* version, const SequenceNumber& sequence,
     uint64_t max_sequential_skip_in_iterations, ReadCallback* read_callback,
     DBImpl* db_impl = nullptr, ColumnFamilyData* cfd = nullptr,
-    bool expose_blob_index = false);
+  bool expose_blob_index = false,
+  uint64_t frozen_delta_read_epoch = UINT64_MAX);
 
 }  // namespace ROCKSDB_NAMESPACE

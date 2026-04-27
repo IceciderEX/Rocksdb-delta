@@ -24,6 +24,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class BlobFileBuilder;
 class BlobFetcher;
+class HotspotManager;
 class PrefetchBufferCollection;
 
 // A wrapper of internal iterator whose purpose is to count how
@@ -201,6 +202,8 @@ class CompactionIterator {
       const std::atomic<bool>& manual_compaction_canceled,
       const Compaction* compaction = nullptr,
       const CompactionFilter* compaction_filter = nullptr,
+      HotspotManager* hotspot_manager = nullptr,
+      uint64_t oldest_active_read_epoch = 0,
       const std::atomic<bool>* shutting_down = nullptr,
       const std::shared_ptr<Logger> info_log = nullptr,
       const std::string* full_history_ts_low = nullptr,
@@ -220,6 +223,8 @@ class CompactionIterator {
       const std::atomic<bool>& manual_compaction_canceled,
       std::unique_ptr<CompactionProxy> compaction,
       const CompactionFilter* compaction_filter = nullptr,
+      HotspotManager* hotspot_manager = nullptr,
+      uint64_t oldest_active_read_epoch = 0,
       const std::atomic<bool>* shutting_down = nullptr,
       const std::shared_ptr<Logger> info_log = nullptr,
       const std::string* full_history_ts_low = nullptr,
@@ -299,6 +304,8 @@ class CompactionIterator {
   // Return true on success, false on failures (e.g.: kIOError).
   bool InvokeFilterIfNeeded(bool* need_skip, Slice* skip_until);
 
+  bool ShouldDropForGDCTCompaction() const;
+
   // Given a sequence number, return the sequence number of the
   // earliest snapshot that this sequence number is visible in.
   // The snapshots themselves are arranged in ascending order of
@@ -360,6 +367,8 @@ class CompactionIterator {
   BlobFileBuilder* blob_file_builder_;
   std::unique_ptr<CompactionProxy> compaction_;
   const CompactionFilter* compaction_filter_;
+  HotspotManager* hotspot_manager_;
+  const uint64_t oldest_active_read_epoch_;
   const std::atomic<bool>* shutting_down_;
   const std::atomic<bool>& manual_compaction_canceled_;
   const bool bottommost_level_;

@@ -86,6 +86,8 @@ struct ImmutableCFOptions {
   std::shared_ptr<SstPartitionerFactory> sst_partitioner_factory;
 
   std::shared_ptr<Cache> blob_cache;
+
+    DeltaOptions delta_options;
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {

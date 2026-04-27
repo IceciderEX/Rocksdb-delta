@@ -164,6 +164,11 @@ class IteratorWrapperBase {
     return iter_->IsDeleteRangeSentinelKey();
   }
 
+  // for delta, get fileid
+  uint64_t GetPhysicalId() {
+    return iter_->GetPhysicalId();
+  }
+
  private:
   void Update() {
     valid_ = iter_->Valid();

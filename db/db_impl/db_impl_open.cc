@@ -19,6 +19,7 @@
 #include "file/writable_file_writer.h"
 #include "logging/logging.h"
 #include "monitoring/persistent_stats_history.h"
+#include "options/cf_options.h"
 #include "options/options_helper.h"
 #include "rocksdb/table.h"
 #include "rocksdb/wal_filter.h"
@@ -1831,6 +1832,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   s = impl->Recover(column_families, false, false, false, &recovered_seq,
                     &recovery_ctx);
   if (s.ok()) {
+    ImmutableOptions hotspot_options(db_options, column_families[0].options);
+    impl->InitializeHotspotManager(hotspot_options, column_families[0].name);
+
     uint64_t new_log_number = impl->versions_->NewFileNumber();
     log::Writer* new_log = nullptr;
     const size_t preallocate_block_size =

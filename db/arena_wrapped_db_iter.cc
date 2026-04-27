@@ -36,13 +36,15 @@ void ArenaWrappedDBIter::Init(
     const MutableCFOptions& mutable_cf_options, const Version* version,
     const SequenceNumber& sequence, uint64_t max_sequential_skip_in_iteration,
     uint64_t version_number, ReadCallback* read_callback, DBImpl* db_impl,
-    ColumnFamilyData* cfd, bool expose_blob_index, bool allow_refresh) {
+  ColumnFamilyData* cfd, bool expose_blob_index, bool allow_refresh,
+  uint64_t frozen_delta_read_epoch) {
   auto mem = arena_.AllocateAligned(sizeof(DBIter));
   db_iter_ =
       new (mem) DBIter(env, read_options, ioptions, mutable_cf_options,
                        ioptions.user_comparator, /* iter */ nullptr, version,
                        sequence, true, max_sequential_skip_in_iteration,
-                       read_callback, db_impl, cfd, expose_blob_index);
+             read_callback, db_impl, cfd, expose_blob_index,
+             frozen_delta_read_epoch);
   sv_number_ = version_number;
   read_options_ = read_options;
   allow_refresh_ = allow_refresh;
@@ -148,11 +150,13 @@ ArenaWrappedDBIter* NewArenaWrappedDbIterator(
     const MutableCFOptions& mutable_cf_options, const Version* version,
     const SequenceNumber& sequence, uint64_t max_sequential_skip_in_iterations,
     uint64_t version_number, ReadCallback* read_callback, DBImpl* db_impl,
-    ColumnFamilyData* cfd, bool expose_blob_index, bool allow_refresh) {
+    ColumnFamilyData* cfd, bool expose_blob_index, bool allow_refresh,
+    uint64_t frozen_delta_read_epoch) {
   ArenaWrappedDBIter* iter = new ArenaWrappedDBIter();
   iter->Init(env, read_options, ioptions, mutable_cf_options, version, sequence,
              max_sequential_skip_in_iterations, version_number, read_callback,
-             db_impl, cfd, expose_blob_index, allow_refresh);
+             db_impl, cfd, expose_blob_index, allow_refresh,
+             frozen_delta_read_epoch);
   if (db_impl != nullptr && cfd != nullptr && allow_refresh) {
     iter->StoreRefreshInfo(db_impl, cfd, read_callback, expose_blob_index);
   }

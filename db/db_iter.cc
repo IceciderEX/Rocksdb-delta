@@ -13,6 +13,7 @@
 #include <limits>
 #include <string>
 
+#include "delta/hotspot_manager.h"
 #include "db/dbformat.h"
 #include "db/merge_context.h"
 #include "db/merge_helper.h"
@@ -43,7 +44,8 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
                const Version* version, SequenceNumber s, bool arena_mode,
                uint64_t max_sequential_skip_in_iterations,
                ReadCallback* read_callback, DBImpl* db_impl,
-               ColumnFamilyData* cfd, bool expose_blob_index)
+               ColumnFamilyData* cfd, bool expose_blob_index,
+               uint64_t frozen_delta_read_epoch)
     : prefix_extractor_(mutable_cf_options.prefix_extractor.get()),
       env_(_env),
       clock_(ioptions.clock),
@@ -77,6 +79,9 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       expose_blob_index_(expose_blob_index),
       is_blob_(false),
       arena_mode_(arena_mode),
+      hotspot_manager_(nullptr),
+      delta_read_epoch_(0),
+      delta_visibility_enabled_(false),
       db_impl_(db_impl),
       cfd_(cfd),
       timestamp_ub_(read_options.timestamp),
@@ -92,6 +97,21 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
   status_.PermitUncheckedError();
   assert(timestamp_size_ ==
          user_comparator_.user_comparator()->timestamp_size());
+  
+  // for delta
+  if (db_impl_ != nullptr && cfd_ != nullptr) {
+    hotspot_manager_ = db_impl_->GetHotspotManager();
+    if (hotspot_manager_ != nullptr &&
+        hotspot_manager_->IsDeltaColumnFamily(cfd_->GetName())) {
+      delta_visibility_enabled_ = true;
+      if (frozen_delta_read_epoch != UINT64_MAX) {
+        delta_read_epoch_ = frozen_delta_read_epoch;
+        hotspot_manager_->AcquireReadEpoch(delta_read_epoch_);
+      } else {
+        delta_read_epoch_ = hotspot_manager_->AcquireReadEpoch();
+      }
+    }
+  }
 }
 
 Status DBIter::GetProperty(std::string prop_name, std::string* prop) {
@@ -236,6 +256,12 @@ bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
   return true;
 }
 
+// for delta, get fileid
+uint64_t GetCurrentPhysUnitId(InternalIterator* internal_iter) {
+  if (internal_iter == nullptr) return 0;
+  return internal_iter->GetPhysicalId();
+}
+
 // PRE: saved_key_ has the current user key if skipping_saved_key
 // POST: saved_key_ should have the next user key if valid_,
 //       if the current entry is a result of merge
@@ -243,6 +269,21 @@ bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
 //           saved_value_             => the merged value
 //
 // NOTE: In between, saved_key_ can point to a user key that has
+
+DBIter::~DBIter() {
+  // for delta
+  if (hotspot_manager_ != nullptr && delta_visibility_enabled_) {
+    hotspot_manager_->ReleaseReadEpoch(delta_read_epoch_);
+  }
+  // Initial Rocksdb implementation of DBIter::~DBIter()
+  if (pinned_iters_mgr_.PinningEnabled()) {
+    pinned_iters_mgr_.ReleasePinnedData();
+  }
+  RecordTick(statistics_, NO_ITERATOR_DELETED);
+  ResetInternalKeysSkippedCounter();
+  local_stats_.BumpGlobalStatistics(statistics_);
+  iter_.DeleteIter(arena_mode_);
+}
 //       a delete marker or a sequence number higher than sequence_
 //       saved_key_ MUST have a proper user_key before calling this function
 //
@@ -325,7 +366,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                                          ikey_.user_key, timestamp_size_)
                                    : Slice();
     bool more_recent = false;
-    if (IsVisible(ikey_.sequence, ts, &more_recent)) {
+    if (IsVisible(user_key_without_ts, ikey_.sequence, ts, &more_recent)) {
       // If the previous entry is of seqnum 0, the current entry will not
       // possibly be skipped. This condition can potentially be relaxed to
       // prev_key.seq <= ikey_.sequence. We are cautious because it will be more
@@ -846,7 +887,9 @@ bool DBIter::FindValueForCurrentKey() {
                  timestamp_size_);
     }
 
-    bool visible = IsVisible(ikey.sequence, ts);
+    Slice user_key_without_ts =
+      StripTimestampFromUserKey(ikey.user_key, timestamp_size_);
+    bool visible = IsVisible(user_key_without_ts, ikey.sequence, ts);
     if (!visible &&
         (timestamp_lb_ == nullptr ||
          user_comparator_.CompareTimestamp(ts, *timestamp_ub_) > 0)) {
@@ -1101,7 +1144,9 @@ bool DBIter::FindValueForCurrentKeyUsingSeek() {
       return true;
     }
 
-    if (IsVisible(ikey.sequence, ts)) {
+    Slice user_key_without_ts =
+      StripTimestampFromUserKey(ikey.user_key, timestamp_size_);
+    if (IsVisible(user_key_without_ts, ikey.sequence, ts)) {
       break;
     }
 
@@ -1324,7 +1369,9 @@ bool DBIter::FindUserKeyBeforeSavedKey() {
       ts = Slice(ikey.user_key.data() + ikey.user_key.size() - timestamp_size_,
                  timestamp_size_);
     }
-    if (!IsVisible(ikey.sequence, ts)) {
+    Slice user_key_without_ts =
+        StripTimestampFromUserKey(ikey.user_key, timestamp_size_);
+    if (!IsVisible(user_key_without_ts, ikey.sequence, ts)) {
       PERF_COUNTER_ADD(internal_recent_skipped_count, 1);
     } else {
       PERF_COUNTER_ADD(internal_key_skipped_count, 1);
@@ -1375,7 +1422,19 @@ bool DBIter::TooManyInternalKeysSkipped(bool increment) {
   return false;
 }
 
-bool DBIter::IsVisible(SequenceNumber sequence, const Slice& ts,
+// for delta
+bool DBIter::IsDeltaVisible(const Slice& user_key_without_ts,
+                            SequenceNumber sequence) const {
+  if (!delta_visibility_enabled_ || hotspot_manager_ == nullptr) {
+    return true;
+  }
+  return !hotspot_manager_->ShouldHideForRead(user_key_without_ts, sequence,
+                                              delta_read_epoch_);
+}
+
+// for delta, add user_key_without_ts
+bool DBIter::IsVisible(const Slice& user_key_without_ts,
+                       SequenceNumber sequence, const Slice& ts,
                        bool* more_recent) {
   // Remember that comparator orders preceding timestamp as larger.
   // TODO(yanqin): support timestamp in read_callback_.
@@ -1392,7 +1451,11 @@ bool DBIter::IsVisible(SequenceNumber sequence, const Slice& ts,
   if (more_recent) {
     *more_recent = !visible_by_seq;
   }
-  return visible_by_seq && visible_by_ts;
+  if (!(visible_by_seq && visible_by_ts)) {
+    return false;
+  }
+  // for delta 
+  return IsDeltaVisible(user_key_without_ts, sequence);
 }
 
 void DBIter::SetSavedKeyToSeekTarget(const Slice& target) {
@@ -1697,12 +1760,13 @@ Iterator* NewDBIterator(Env* env, const ReadOptions& read_options,
                         const SequenceNumber& sequence,
                         uint64_t max_sequential_skip_in_iterations,
                         ReadCallback* read_callback, DBImpl* db_impl,
-                        ColumnFamilyData* cfd, bool expose_blob_index) {
+                        ColumnFamilyData* cfd, bool expose_blob_index,
+                        uint64_t frozen_delta_read_epoch) {
   DBIter* db_iter =
       new DBIter(env, read_options, ioptions, mutable_cf_options,
                  user_key_comparator, internal_iter, version, sequence, false,
                  max_sequential_skip_in_iterations, read_callback, db_impl, cfd,
-                 expose_blob_index);
+                 expose_blob_index, frozen_delta_read_epoch);
   return db_iter;
 }
 

@@ -464,6 +464,8 @@ class MergingIterator : public InternalIterator {
            current_->IsValuePinned();
   }
 
+
+
  private:
   // Represents an element in the min/max heap. Each HeapItem corresponds to a
   // point iterator or a range tombstone iterator, differentiated by
@@ -654,6 +656,14 @@ class MergingIterator : public InternalIterator {
   // Switch the direction from forward to backward without changing the
   // position. Iterator should still be valid.
   void SwitchToBackward();
+
+  // for delta, get fileid
+  uint64_t GetPhysicalId() override {
+    if (current_ && current_->iter()) {
+      return current_->iter()->GetPhysicalId();
+    }
+    return 0;
+  }
 
   IteratorWrapper* CurrentForward() const {
     assert(direction_ == kForward);

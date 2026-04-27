@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "delta/hotspot_manager.h"
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_builder.h"
@@ -1242,6 +1243,15 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   const SequenceNumber job_snapshot_seq =
       job_context_ ? job_context_->GetJobSnapshotSequence()
                    : kMaxSequenceNumber;
+  // for delta
+  HotspotManager* hotspot_manager = db_options_.hotspot_manager.get();
+  const bool enable_gdct_compaction_drop =
+      hotspot_manager != nullptr &&
+      hotspot_manager->IsDeltaColumnFamily(cfd->GetName());
+  const uint64_t oldest_active_read_epoch =
+      enable_gdct_compaction_drop
+          ? hotspot_manager->GetOldestActiveReadEpoch()
+          : 0;
 
   auto c_iter = std::make_unique<CompactionIterator>(
       input, cfd->user_comparator(), &merge, versions_->LastSequence(),
@@ -1250,7 +1260,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       /*expect_valid_internal_key=*/true, range_del_agg.get(),
       blob_file_builder.get(), db_options_.allow_data_in_errors,
       db_options_.enforce_single_del_contracts, manual_compaction_canceled_,
-      sub_compact->compaction, compaction_filter, shutting_down_,
+      sub_compact->compaction, compaction_filter, hotspot_manager,
+      oldest_active_read_epoch, shutting_down_,
       db_options_.info_log, full_history_ts_low, preserve_time_min_seqno_,
       preclude_last_level_min_seqno_);
   c_iter->SeekToFirst();

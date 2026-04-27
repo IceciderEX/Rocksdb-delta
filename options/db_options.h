@@ -12,6 +12,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 class SystemClock;
+class HotspotManager;
 
 struct ImmutableDBOptions {
   static const char* kName() { return "ImmutableDBOptions"; }
@@ -103,6 +104,7 @@ struct ImmutableDBOptions {
   Statistics* stats;
   Logger* logger;
   std::shared_ptr<CompactionService> compaction_service;
+  mutable std::shared_ptr<HotspotManager> hotspot_manager;
   bool enforce_single_del_contracts;
 
   bool IsWalDirSameAsDBPath() const;

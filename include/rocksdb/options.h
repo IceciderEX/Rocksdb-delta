@@ -57,6 +57,28 @@ class InternalKeyComparator;
 class WalFilter;
 class FileSystem;
 
+struct DeltaOptions {
+  uint64_t gdct_log_compact_size = 33554432;
+  uint32_t gdct_flush_threshold_records = 15;
+  uint64_t gdct_flush_interval_us = 30000000;
+  uint64_t gdct_compact_interval_us = 600000000;
+
+  uint32_t sharding_count = 128;
+
+  bool operator==(const DeltaOptions& other) const {
+  return gdct_log_compact_size == other.gdct_log_compact_size &&
+           gdct_flush_threshold_records ==
+               other.gdct_flush_threshold_records &&
+           gdct_flush_interval_us == other.gdct_flush_interval_us &&
+           gdct_compact_interval_us == other.gdct_compact_interval_us &&
+       sharding_count == other.sharding_count;
+  }
+
+  bool operator!=(const DeltaOptions& other) const {
+    return !(*this == other);
+  }
+};
+
 struct Options;
 struct DbPath;
 
@@ -332,6 +354,8 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   std::shared_ptr<SstPartitionerFactory> sst_partitioner_factory = nullptr;
 
   // Create ColumnFamilyOptions with default values for all fields
+  DeltaOptions delta_options;
+
   ColumnFamilyOptions();
   // Create ColumnFamilyOptions from Options
   explicit ColumnFamilyOptions(const Options& options);
@@ -1695,6 +1719,10 @@ struct ReadOptions {
   //
   // Default: true
   bool optimize_multiget_for_io;
+
+  bool delta_full_scan = false;
+  bool skip_hot_path = false;
+  bool enable_delta_diag_logging = false;
 
   ReadOptions();
   ReadOptions(bool cksum, bool cache);

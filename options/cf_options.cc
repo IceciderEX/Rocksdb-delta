@@ -172,6 +172,30 @@ static std::unordered_map<std::string, OptionTypeInfo>
 };
 
 static std::unordered_map<std::string, OptionTypeInfo>
+    delta_options_type_info = {
+        {"gdct_log_compact_size",
+         {offsetof(struct DeltaOptions, gdct_log_compact_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"gdct_flush_threshold_records",
+         {offsetof(struct DeltaOptions, gdct_flush_threshold_records),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"gdct_flush_interval_us",
+         {offsetof(struct DeltaOptions, gdct_flush_interval_us),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"gdct_compact_interval_us",
+         {offsetof(struct DeltaOptions, gdct_compact_interval_us),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"sharding_count",
+         {offsetof(struct DeltaOptions, sharding_count),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+};
+
+static std::unordered_map<std::string, OptionTypeInfo>
     fifo_compaction_options_type_info = {
         {"max_table_files_size",
          {offsetof(struct CompactionOptionsFIFO, max_table_files_size),
@@ -775,6 +799,12 @@ static std::unordered_map<std::string, OptionTypeInfo>
             auto* cache = static_cast<std::shared_ptr<Cache>*>(addr);
             return Cache::CreateFromString(opts, value, cache);
           }}},
+        {"delta_options",
+         OptionTypeInfo::Struct("delta_options", &delta_options_type_info,
+                                offsetof(struct ImmutableCFOptions,
+                                         delta_options),
+                                OptionVerificationType::kNormal,
+                                OptionTypeFlags::kNone)},
 };
 
 const std::string OptionsHelper::kCFOptionsName = "ColumnFamilyOptions";
@@ -918,7 +948,8 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       cf_paths(cf_options.cf_paths),
       compaction_thread_limiter(cf_options.compaction_thread_limiter),
       sst_partitioner_factory(cf_options.sst_partitioner_factory),
-      blob_cache(cf_options.blob_cache) {}
+      blob_cache(cf_options.blob_cache),
+      delta_options(cf_options.delta_options) {}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 
