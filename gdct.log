@@ -1,0 +1,666 @@
+Config: cuid_count=10240 rows_per_cuid=60000 workload_model=table_active table_assignment=contiguous table_count=512 active_table_count=4 writer_threads_per_table=8 update_rows_per_merge=5000 late_writer_rows_per_merge=0 update_percent=80 rounds=5 active_cuid_percent=50 concurrent_writer_percent=5 writers=32 max_background_jobs=8 max_subcompactions=1 l0_target_tables_per_partition=32 l0_split_factor=1 l0_min_tables_to_split=16 l0_max_partition_count=256 scanners=32 scan_interval_ms=100 scans_per_cuid=200 scan_range_rows=1000 compact_after_write=false enable_partition_override=-1 enable_gdct_override=-1 enable_gdct_delete_fast_path_override=1 enable_gdct_delete_fast_path_skip_duplicate_locks_override=1 archive_log_dir=/ssd2/wx1485003/rocksdb-hust/a_test_tmp/bench_runs/short_20260530_002858 wbs67108864 mode=gdct
+[gdct] opening db at /ssd2/wx1485003/rocksdb-hust/a_test_tmp/bench_runs/short_20260530_002858/db/gdct
+[gdct] db opened
+[gdct] 1/512 tableids done tableid=4 cuid=61-80 completed_cuids=73/10240
+[gdct] 2/512 tableids done tableid=3 cuid=41-60 completed_cuids=76/10240
+[gdct] 3/512 tableids done tableid=2 cuid=21-40 completed_cuids=78/10240
+[gdct] 4/512 tableids done tableid=1 cuid=1-20 completed_cuids=80/10240
+[gdct] 5/512 tableids done tableid=5 cuid=81-100 completed_cuids=151/10240
+[gdct] 6/512 tableids done tableid=6 cuid=101-120 completed_cuids=156/10240
+[gdct] 7/512 tableids done tableid=8 cuid=141-160 completed_cuids=159/10240
+[gdct] 8/512 tableids done tableid=7 cuid=121-140 completed_cuids=160/10240
+[gdct] 9/512 tableids done tableid=9 cuid=161-180 completed_cuids=232/10240
+[gdct] 10/512 tableids done tableid=12 cuid=221-240 completed_cuids=238/10240
+[gdct] 11/512 tableids done tableid=10 cuid=181-200 completed_cuids=239/10240
+[gdct] 12/512 tableids done tableid=11 cuid=201-220 completed_cuids=240/10240
+[gdct] 13/512 tableids done tableid=13 cuid=241-260 completed_cuids=308/10240
+[gdct] 14/512 tableids done tableid=14 cuid=261-280 completed_cuids=317/10240
+[gdct] 15/512 tableids done tableid=15 cuid=281-300 completed_cuids=318/10240
+[gdct] 16/512 tableids done tableid=16 cuid=301-320 completed_cuids=320/10240
+[gdct] 17/512 tableids done tableid=17 cuid=321-340 completed_cuids=388/10240
+[gdct] 18/512 tableids done tableid=19 cuid=361-380 completed_cuids=395/10240
+[gdct] 19/512 tableids done tableid=18 cuid=341-360 completed_cuids=398/10240
+[gdct] 20/512 tableids done tableid=20 cuid=381-400 completed_cuids=400/10240
+[gdct] 21/512 tableids done tableid=21 cuid=401-420 completed_cuids=470/10240
+[gdct] 22/512 tableids done tableid=22 cuid=421-440 completed_cuids=472/10240
+[gdct] 23/512 tableids done tableid=23 cuid=441-460 completed_cuids=477/10240
+[gdct] 24/512 tableids done tableid=24 cuid=461-480 completed_cuids=481/10240
+[gdct] 25/512 tableids done tableid=25 cuid=481-500 completed_cuids=549/10240
+[gdct] 26/512 tableids done tableid=26 cuid=501-520 completed_cuids=555/10240
+[gdct] 27/512 tableids done tableid=27 cuid=521-540 completed_cuids=556/10240
+[gdct] 28/512 tableids done tableid=28 cuid=541-560 completed_cuids=567/10240
+[gdct] 29/512 tableids done tableid=30 cuid=581-600 completed_cuids=626/10240
+[gdct] 30/512 tableids done tableid=29 cuid=561-580 completed_cuids=627/10240
+[gdct] 31/512 tableids done tableid=31 cuid=601-620 completed_cuids=636/10240
+[gdct] 32/512 tableids done tableid=32 cuid=621-640 completed_cuids=653/10240
+[gdct] 33/512 tableids done tableid=33 cuid=641-660 completed_cuids=706/10240
+[gdct] 34/512 tableids done tableid=34 cuid=661-680 completed_cuids=710/10240
+[gdct] 35/512 tableids done tableid=35 cuid=681-700 completed_cuids=716/10240
+[gdct] 36/512 tableids done tableid=36 cuid=701-720 completed_cuids=732/10240
+[gdct] 37/512 tableids done tableid=38 cuid=741-760 completed_cuids=791/10240
+[gdct] 38/512 tableids done tableid=37 cuid=721-740 completed_cuids=792/10240
+[gdct] 39/512 tableids done tableid=39 cuid=761-780 completed_cuids=797/10240
+[gdct] 40/512 tableids done tableid=40 cuid=781-800 completed_cuids=800/10240
+[gdct] 41/512 tableids done tableid=41 cuid=801-820 completed_cuids=869/10240
+[gdct] 42/512 tableids done tableid=43 cuid=841-860 completed_cuids=875/10240
+[gdct] 43/512 tableids done tableid=42 cuid=821-840 completed_cuids=876/10240
+[gdct] 44/512 tableids done tableid=44 cuid=861-880 completed_cuids=880/10240
+[gdct] 45/512 tableids done tableid=45 cuid=881-900 completed_cuids=948/10240
+[gdct] 46/512 tableids done tableid=46 cuid=901-920 completed_cuids=955/10240
+[gdct] 47/512 tableids done tableid=48 cuid=941-960 completed_cuids=958/10240
+[gdct] 48/512 tableids done tableid=47 cuid=921-940 completed_cuids=960/10240
+[gdct] 49/512 tableids done tableid=49 cuid=961-980 completed_cuids=1028/10240
+[gdct] 50/512 tableids done tableid=50 cuid=981-1000 completed_cuids=1039/10240
+[gdct] 51/512 tableids done tableid=51 cuid=1001-1020 completed_cuids=1040/10240
+[gdct] 52/512 tableids done tableid=52 cuid=1021-1040 completed_cuids=1041/10240
+[gdct] 53/512 tableids done tableid=53 cuid=1041-1060 completed_cuids=1105/10240
+[gdct] 54/512 tableids done tableid=55 cuid=1081-1100 completed_cuids=1117/10240
+[gdct] 55/512 tableids done tableid=54 cuid=1061-1080 completed_cuids=1119/10240
+[gdct] 56/512 tableids done tableid=56 cuid=1101-1120 completed_cuids=1120/10240
+[gdct] 57/512 tableids done tableid=57 cuid=1121-1140 completed_cuids=1188/10240
+[gdct] 58/512 tableids done tableid=60 cuid=1181-1200 completed_cuids=1195/10240
+[gdct] 59/512 tableids done tableid=58 cuid=1141-1160 completed_cuids=1196/10240
+[gdct] 60/512 tableids done tableid=59 cuid=1161-1180 completed_cuids=1200/10240
+[gdct] 61/512 tableids done tableid=61 cuid=1201-1220 completed_cuids=1268/10240
+[gdct] 62/512 tableids done tableid=63 cuid=1241-1260 completed_cuids=1273/10240
+[gdct] 63/512 tableids done tableid=64 cuid=1261-1280 completed_cuids=1279/10240
+[gdct] 64/512 tableids done tableid=62 cuid=1221-1240 completed_cuids=1280/10240
+[gdct] 65/512 tableids done tableid=65 cuid=1281-1300 completed_cuids=1348/10240
+[gdct] 66/512 tableids done tableid=66 cuid=1301-1320 completed_cuids=1352/10240
+[gdct] 67/512 tableids done tableid=68 cuid=1341-1360 completed_cuids=1358/10240
+[gdct] 68/512 tableids done tableid=67 cuid=1321-1340 completed_cuids=1362/10240
+[gdct] 69/512 tableids done tableid=69 cuid=1361-1380 completed_cuids=1427/10240
+[gdct] 70/512 tableids done tableid=70 cuid=1381-1400 completed_cuids=1432/10240
+[gdct] 71/512 tableids done tableid=71 cuid=1401-1420 completed_cuids=1436/10240
+[gdct] 72/512 tableids done tableid=72 cuid=1421-1440 completed_cuids=1441/10240
+[gdct] 73/512 tableids done tableid=73 cuid=1441-1460 completed_cuids=1508/10240
+[gdct] 74/512 tableids done tableid=74 cuid=1461-1480 completed_cuids=1511/10240
+[gdct] 75/512 tableids done tableid=75 cuid=1481-1500 completed_cuids=1517/10240
+[gdct] 76/512 tableids done tableid=76 cuid=1501-1520 completed_cuids=1521/10240
+[gdct] 77/512 tableids done tableid=77 cuid=1521-1540 completed_cuids=1588/10240
+[gdct] 78/512 tableids done tableid=78 cuid=1541-1560 completed_cuids=1592/10240
+[gdct] 79/512 tableids done tableid=79 cuid=1561-1580 completed_cuids=1599/10240
+[gdct] 80/512 tableids done tableid=80 cuid=1581-1600 completed_cuids=1600/10240
+[gdct] 81/512 tableids done tableid=82 cuid=1621-1640 completed_cuids=1652/10240
+[gdct] 82/512 tableids done tableid=81 cuid=1601-1620 completed_cuids=1672/10240
+[gdct] 83/512 tableids done tableid=83 cuid=1641-1660 completed_cuids=1686/10240
+[gdct] 84/512 tableids done tableid=84 cuid=1661-1680 completed_cuids=1688/10240
+[gdct] 85/512 tableids done tableid=85 cuid=1681-1700 completed_cuids=1708/10240
+[gdct] 86/512 tableids done tableid=86 cuid=1701-1720 completed_cuids=1760/10240
+[gdct] 87/512 tableids done tableid=88 cuid=1741-1760 completed_cuids=1775/10240
+[gdct] 88/512 tableids done tableid=87 cuid=1721-1740 completed_cuids=1776/10240
+[gdct] 89/512 tableids done tableid=89 cuid=1761-1780 completed_cuids=1788/10240
+[gdct] 90/512 tableids done tableid=90 cuid=1781-1800 completed_cuids=1848/10240
+[gdct] 91/512 tableids done tableid=93 cuid=1841-1860 completed_cuids=1852/10240
+[gdct] 92/512 tableids done tableid=91 cuid=1801-1820 completed_cuids=1864/10240
+[gdct] 93/512 tableids done tableid=92 cuid=1821-1840 completed_cuids=1865/10240
+[gdct] 94/512 tableids done tableid=94 cuid=1861-1880 completed_cuids=1918/10240
+[gdct] 95/512 tableids done tableid=95 cuid=1881-1900 completed_cuids=1932/10240
+[gdct] 96/512 tableids done tableid=96 cuid=1901-1920 completed_cuids=1939/10240
+[gdct] 97/512 tableids done tableid=97 cuid=1921-1940 completed_cuids=1948/10240
+[gdct] 98/512 tableids done tableid=99 cuid=1961-1980 completed_cuids=1992/10240
+[gdct] 99/512 tableids done tableid=98 cuid=1941-1960 completed_cuids=2006/10240
+[gdct] 100/512 tableids done tableid=100 cuid=1981-2000 completed_cuids=2024/10240
+[gdct] 101/512 tableids done tableid=101 cuid=2001-2020 completed_cuids=2032/10240
+[gdct] 102/512 tableids done tableid=102 cuid=2021-2040 completed_cuids=2049/10240
+[gdct] 103/512 tableids done tableid=103 cuid=2041-2060 completed_cuids=2099/10240
+[gdct] 104/512 tableids done tableid=104 cuid=2061-2080 completed_cuids=2116/10240
+[gdct] 105/512 tableids done tableid=105 cuid=2081-2100 completed_cuids=2118/10240
+[gdct] 106/512 tableids done tableid=106 cuid=2101-2120 completed_cuids=2128/10240
+[gdct] 107/512 tableids done tableid=107 cuid=2121-2140 completed_cuids=2186/10240
+[gdct] 108/512 tableids done tableid=110 cuid=2181-2200 completed_cuids=2192/10240
+[gdct] 109/512 tableids done tableid=108 cuid=2141-2160 completed_cuids=2198/10240
+[gdct] 110/512 tableids done tableid=109 cuid=2161-2180 completed_cuids=2203/10240
+[gdct] 111/512 tableids done tableid=111 cuid=2201-2220 completed_cuids=2263/10240
+[gdct] 112/512 tableids done tableid=112 cuid=2221-2240 completed_cuids=2272/10240
+[gdct] 113/512 tableids done tableid=114 cuid=2261-2280 completed_cuids=2280/10240
+[gdct] 114/512 tableids done tableid=113 cuid=2241-2260 completed_cuids=2287/10240
+[gdct] 115/512 tableids done tableid=116 cuid=2301-2320 completed_cuids=2314/10240
+[gdct] 116/512 tableids done tableid=115 cuid=2281-2300 completed_cuids=2356/10240
+[gdct] 117/512 tableids done tableid=117 cuid=2321-2340 completed_cuids=2375/10240
+[gdct] 118/512 tableids done tableid=118 cuid=2341-2360 completed_cuids=2381/10240
+[gdct] 119/512 tableids done tableid=119 cuid=2361-2380 completed_cuids=2404/10240
+[gdct] 120/512 tableids done tableid=120 cuid=2381-2400 completed_cuids=2430/10240
+[gdct] 121/512 tableids done tableid=122 cuid=2421-2440 completed_cuids=2451/10240
+[gdct] 122/512 tableids done tableid=121 cuid=2401-2420 completed_cuids=2452/10240
+[gdct] 123/512 tableids done tableid=123 cuid=2441-2460 completed_cuids=2487/10240
+[gdct] 124/512 tableids done tableid=124 cuid=2461-2480 completed_cuids=2520/10240
+[gdct] 125/512 tableids done tableid=126 cuid=2501-2520 completed_cuids=2529/10240
+[gdct] 126/512 tableids done tableid=125 cuid=2481-2500 completed_cuids=2530/10240
+[gdct] 127/512 tableids done tableid=127 cuid=2521-2540 completed_cuids=2552/10240
+[gdct] 128/512 tableids done tableid=128 cuid=2541-2560 completed_cuids=2598/10240
+[gdct] 129/512 tableids done tableid=129 cuid=2561-2580 completed_cuids=2613/10240
+[gdct] 130/512 tableids done tableid=130 cuid=2581-2600 completed_cuids=2615/10240
+[gdct] 131/512 tableids done tableid=131 cuid=2601-2620 completed_cuids=2628/10240
+[gdct] 132/512 tableids done tableid=132 cuid=2621-2640 completed_cuids=2680/10240
+[gdct] 133/512 tableids done tableid=134 cuid=2661-2680 completed_cuids=2696/10240
+[gdct] 134/512 tableids done tableid=133 cuid=2641-2660 completed_cuids=2697/10240
+[gdct] 135/512 tableids done tableid=135 cuid=2681-2700 completed_cuids=2708/10240
+[gdct] 136/512 tableids done tableid=136 cuid=2701-2720 completed_cuids=2764/10240
+[gdct] 137/512 tableids done tableid=139 cuid=2761-2780 completed_cuids=2785/10240
+[gdct] 138/512 tableids done tableid=137 cuid=2721-2740 completed_cuids=2786/10240
+[gdct] 139/512 tableids done tableid=138 cuid=2741-2760 completed_cuids=2788/10240
+[gdct] 140/512 tableids done tableid=140 cuid=2781-2800 completed_cuids=2831/10240
+[gdct] 141/512 tableids done tableid=142 cuid=2821-2840 completed_cuids=2859/10240
+[gdct] 142/512 tableids done tableid=141 cuid=2801-2820 completed_cuids=2867/10240
+[gdct] 143/512 tableids done tableid=143 cuid=2841-2860 completed_cuids=2868/10240
+[gdct] 144/512 tableids done tableid=144 cuid=2861-2880 completed_cuids=2916/10240
+[gdct] 145/512 tableids done tableid=145 cuid=2881-2900 completed_cuids=2933/10240
+[gdct] 146/512 tableids done tableid=146 cuid=2901-2920 completed_cuids=2940/10240
+[gdct] 147/512 tableids done tableid=147 cuid=2921-2940 completed_cuids=2948/10240
+[gdct] 148/512 tableids done tableid=148 cuid=2941-2960 completed_cuids=2994/10240
+[gdct] 149/512 tableids done tableid=149 cuid=2961-2980 completed_cuids=3012/10240
+[gdct] 150/512 tableids done tableid=151 cuid=3001-3020 completed_cuids=3027/10240
+[gdct] 151/512 tableids done tableid=150 cuid=2981-3000 completed_cuids=3028/10240
+[gdct] 152/512 tableids done tableid=153 cuid=3041-3060 completed_cuids=3072/10240
+[gdct] 153/512 tableids done tableid=152 cuid=3021-3040 completed_cuids=3078/10240
+[gdct] 154/512 tableids done tableid=154 cuid=3061-3080 completed_cuids=3114/10240
+[gdct] 155/512 tableids done tableid=155 cuid=3081-3100 completed_cuids=3116/10240
+[gdct] 156/512 tableids done tableid=156 cuid=3101-3120 completed_cuids=3152/10240
+[gdct] 157/512 tableids done tableid=157 cuid=3121-3140 completed_cuids=3158/10240
+[gdct] 158/512 tableids done tableid=159 cuid=3161-3180 completed_cuids=3191/10240
+[gdct] 159/512 tableids done tableid=158 cuid=3141-3160 completed_cuids=3195/10240
+[gdct] 160/512 tableids done tableid=160 cuid=3181-3200 completed_cuids=3232/10240
+[gdct] 161/512 tableids done tableid=161 cuid=3201-3220 completed_cuids=3245/10240
+[gdct] 162/512 tableids done tableid=163 cuid=3241-3260 completed_cuids=3268/10240
+[gdct] 163/512 tableids done tableid=162 cuid=3221-3240 completed_cuids=3271/10240
+[gdct] 164/512 tableids done tableid=164 cuid=3261-3280 completed_cuids=3312/10240
+[gdct] 165/512 tableids done tableid=166 cuid=3301-3320 completed_cuids=3331/10240
+[gdct] 166/512 tableids done tableid=165 cuid=3281-3300 completed_cuids=3336/10240
+[gdct] 167/512 tableids done tableid=167 cuid=3321-3340 completed_cuids=3350/10240
+[gdct] 168/512 tableids done tableid=168 cuid=3341-3360 completed_cuids=3396/10240
+[gdct] 169/512 tableids done tableid=169 cuid=3361-3380 completed_cuids=3413/10240
+[gdct] 170/512 tableids done tableid=170 cuid=3381-3400 completed_cuids=3420/10240
+[gdct] 171/512 tableids done tableid=171 cuid=3401-3420 completed_cuids=3428/10240
+[gdct] 172/512 tableids done tableid=172 cuid=3421-3440 completed_cuids=3474/10240
+[gdct] 173/512 tableids done tableid=173 cuid=3441-3460 completed_cuids=3492/10240
+[gdct] 174/512 tableids done tableid=174 cuid=3461-3480 completed_cuids=3504/10240
+[gdct] 175/512 tableids done tableid=175 cuid=3481-3500 completed_cuids=3508/10240
+[gdct] 176/512 tableids done tableid=176 cuid=3501-3520 completed_cuids=3559/10240
+[gdct] 177/512 tableids done tableid=177 cuid=3521-3540 completed_cuids=3572/10240
+[gdct] 178/512 tableids done tableid=178 cuid=3541-3560 completed_cuids=3579/10240
+[gdct] 179/512 tableids done tableid=179 cuid=3561-3580 completed_cuids=3587/10240
+[gdct] 180/512 tableids done tableid=180 cuid=3581-3600 completed_cuids=3646/10240
+[gdct] 181/512 tableids done tableid=181 cuid=3601-3620 completed_cuids=3652/10240
+[gdct] 182/512 tableids done tableid=183 cuid=3641-3660 completed_cuids=3657/10240
+[gdct] 183/512 tableids done tableid=182 cuid=3621-3640 completed_cuids=3664/10240
+[gdct] 184/512 tableids done tableid=184 cuid=3661-3680 completed_cuids=3727/10240
+[gdct] 185/512 tableids done tableid=185 cuid=3681-3700 completed_cuids=3734/10240
+[gdct] 186/512 tableids done tableid=186 cuid=3701-3720 completed_cuids=3736/10240
+[gdct] 187/512 tableids done tableid=187 cuid=3721-3740 completed_cuids=3744/10240
+[gdct] 188/512 tableids done tableid=188 cuid=3741-3760 completed_cuids=3796/10240
+[gdct] 189/512 tableids done tableid=191 cuid=3801-3820 completed_cuids=3812/10240
+[gdct] 190/512 tableids done tableid=189 cuid=3761-3780 completed_cuids=3823/10240
+[gdct] 191/512 tableids done tableid=190 cuid=3781-3800 completed_cuids=3828/10240
+[gdct] 192/512 tableids done tableid=192 cuid=3821-3840 completed_cuids=3877/10240
+[gdct] 193/512 tableids done tableid=193 cuid=3841-3860 completed_cuids=3892/10240
+[gdct] 194/512 tableids done tableid=194 cuid=3861-3880 completed_cuids=3902/10240
+[gdct] 195/512 tableids done tableid=195 cuid=3881-3900 completed_cuids=3907/10240
+[gdct] 196/512 tableids done tableid=197 cuid=3921-3940 completed_cuids=3952/10240
+[gdct] 197/512 tableids done tableid=196 cuid=3901-3920 completed_cuids=3965/10240
+[gdct] 198/512 tableids done tableid=198 cuid=3941-3960 completed_cuids=3994/10240
+[gdct] 199/512 tableids done tableid=199 cuid=3961-3980 completed_cuids=3996/10240
+[gdct] 200/512 tableids done tableid=200 cuid=3981-4000 completed_cuids=4008/10240
+[gdct] 201/512 tableids done tableid=201 cuid=4001-4020 completed_cuids=4054/10240
+[gdct] 202/512 tableids done tableid=202 cuid=4021-4040 completed_cuids=4080/10240
+[gdct] 203/512 tableids done tableid=203 cuid=4041-4060 completed_cuids=4081/10240
+[gdct] 204/512 tableids done tableid=204 cuid=4061-4080 completed_cuids=4088/10240
+[gdct] 205/512 tableids done tableid=205 cuid=4081-4100 completed_cuids=4146/10240
+[gdct] 206/512 tableids done tableid=208 cuid=4141-4160 completed_cuids=4152/10240
+[gdct] 207/512 tableids done tableid=206 cuid=4101-4120 completed_cuids=4159/10240
+[gdct] 208/512 tableids done tableid=207 cuid=4121-4140 completed_cuids=4165/10240
+[gdct] 209/512 tableids done tableid=209 cuid=4161-4180 completed_cuids=4226/10240
+[gdct] 210/512 tableids done tableid=210 cuid=4181-4200 completed_cuids=4232/10240
+[gdct] 211/512 tableids done tableid=212 cuid=4221-4240 completed_cuids=4239/10240
+[gdct] 212/512 tableids done tableid=211 cuid=4201-4220 completed_cuids=4240/10240
+[gdct] 213/512 tableids done tableid=214 cuid=4261-4280 completed_cuids=4292/10240
+[gdct] 214/512 tableids done tableid=213 cuid=4241-4260 completed_cuids=4308/10240
+[gdct] 215/512 tableids done tableid=216 cuid=4301-4320 completed_cuids=4325/10240
+[gdct] 216/512 tableids done tableid=215 cuid=4281-4300 completed_cuids=4334/10240
+[gdct] 217/512 tableids done tableid=217 cuid=4321-4340 completed_cuids=4370/10240
+[gdct] 218/512 tableids done tableid=218 cuid=4341-4360 completed_cuids=4393/10240
+[gdct] 219/512 tableids done tableid=220 cuid=4381-4400 completed_cuids=4405/10240
+[gdct] 220/512 tableids done tableid=219 cuid=4361-4380 completed_cuids=4418/10240
+[gdct] 221/512 tableids done tableid=221 cuid=4401-4420 completed_cuids=4448/10240
+[gdct] 222/512 tableids done tableid=222 cuid=4421-4440 completed_cuids=4471/10240
+[gdct] 223/512 tableids done tableid=223 cuid=4441-4460 completed_cuids=4484/10240
+[gdct] 224/512 tableids done tableid=224 cuid=4461-4480 completed_cuids=4496/10240
+[gdct] 225/512 tableids done tableid=225 cuid=4481-4500 completed_cuids=4535/10240
+[gdct] 226/512 tableids done tableid=226 cuid=4501-4520 completed_cuids=4558/10240
+[gdct] 227/512 tableids done tableid=227 cuid=4521-4540 completed_cuids=4559/10240
+[gdct] 228/512 tableids done tableid=228 cuid=4541-4560 completed_cuids=4568/10240
+[gdct] 229/512 tableids done tableid=229 cuid=4561-4580 completed_cuids=4623/10240
+[gdct] 230/512 tableids done tableid=231 cuid=4601-4620 completed_cuids=4641/10240
+[gdct] 231/512 tableids done tableid=230 cuid=4581-4600 completed_cuids=4646/10240
+[gdct] 232/512 tableids done tableid=232 cuid=4621-4640 completed_cuids=4648/10240
+[gdct] 233/512 tableids done tableid=233 cuid=4641-4660 completed_cuids=4692/10240
+[gdct] 234/512 tableids done tableid=234 cuid=4661-4680 completed_cuids=4719/10240
+[gdct] 235/512 tableids done tableid=236 cuid=4701-4720 completed_cuids=4727/10240
+[gdct] 236/512 tableids done tableid=235 cuid=4681-4700 completed_cuids=4728/10240
+[gdct] 237/512 tableids done tableid=237 cuid=4721-4740 completed_cuids=4766/10240
+[gdct] 238/512 tableids done tableid=238 cuid=4741-4760 completed_cuids=4803/10240
+[gdct] 239/512 tableids done tableid=239 cuid=4761-4780 completed_cuids=4804/10240
+[gdct] 240/512 tableids done tableid=240 cuid=4781-4800 completed_cuids=4808/10240
+[gdct] 241/512 tableids done tableid=241 cuid=4801-4820 completed_cuids=4844/10240
+[gdct] 242/512 tableids done tableid=242 cuid=4821-4840 completed_cuids=4882/10240
+[gdct] 243/512 tableids done tableid=243 cuid=4841-4860 completed_cuids=4884/10240
+[gdct] 244/512 tableids done tableid=244 cuid=4861-4880 completed_cuids=4888/10240
+[gdct] 245/512 tableids done tableid=245 cuid=4881-4900 completed_cuids=4924/10240
+[gdct] 246/512 tableids done tableid=246 cuid=4901-4920 completed_cuids=4964/10240
+[gdct] 247/512 tableids done tableid=248 cuid=4941-4960 completed_cuids=4966/10240
+[gdct] 248/512 tableids done tableid=247 cuid=4921-4940 completed_cuids=4968/10240
+[gdct] 249/512 tableids done tableid=249 cuid=4961-4980 completed_cuids=5004/10240
+[gdct] 250/512 tableids done tableid=250 cuid=4981-5000 completed_cuids=5043/10240
+[gdct] 251/512 tableids done tableid=251 cuid=5001-5020 completed_cuids=5045/10240
+[gdct] 252/512 tableids done tableid=252 cuid=5021-5040 completed_cuids=5048/10240
+[gdct] 253/512 tableids done tableid=253 cuid=5041-5060 completed_cuids=5084/10240
+[gdct] 254/512 tableids done tableid=254 cuid=5061-5080 completed_cuids=5125/10240
+[gdct] 255/512 tableids done tableid=255 cuid=5081-5100 completed_cuids=5126/10240
+[gdct] 256/512 tableids done tableid=256 cuid=5101-5120 completed_cuids=5128/10240
+[gdct] 257/512 tableids done tableid=257 cuid=5121-5140 completed_cuids=5164/10240
+[gdct] 258/512 tableids done tableid=260 cuid=5181-5200 completed_cuids=5205/10240
+[gdct] 259/512 tableids done tableid=258 cuid=5141-5160 completed_cuids=5208/10240
+[gdct] 260/512 tableids done tableid=259 cuid=5161-5180 completed_cuids=5208/10240
+[gdct] 261/512 tableids done tableid=261 cuid=5201-5220 completed_cuids=5244/10240
+[gdct] 262/512 tableids done tableid=263 cuid=5241-5260 completed_cuids=5285/10240
+[gdct] 263/512 tableids done tableid=262 cuid=5221-5240 completed_cuids=5286/10240
+[gdct] 264/512 tableids done tableid=264 cuid=5261-5280 completed_cuids=5288/10240
+[gdct] 265/512 tableids done tableid=265 cuid=5281-5300 completed_cuids=5324/10240
+[gdct] 266/512 tableids done tableid=268 cuid=5341-5360 completed_cuids=5361/10240
+[gdct] 267/512 tableids done tableid=266 cuid=5301-5320 completed_cuids=5369/10240
+[gdct] 268/512 tableids done tableid=267 cuid=5321-5340 completed_cuids=5370/10240
+[gdct] 269/512 tableids done tableid=269 cuid=5361-5380 completed_cuids=5404/10240
+[gdct] 270/512 tableids done tableid=270 cuid=5381-5400 completed_cuids=5440/10240
+[gdct] 271/512 tableids done tableid=272 cuid=5421-5440 completed_cuids=5448/10240
+[gdct] 272/512 tableids done tableid=271 cuid=5401-5420 completed_cuids=5449/10240
+[gdct] 273/512 tableids done tableid=273 cuid=5441-5460 completed_cuids=5484/10240
+[gdct] 274/512 tableids done tableid=274 cuid=5461-5480 completed_cuids=5520/10240
+[gdct] 275/512 tableids done tableid=275 cuid=5481-5500 completed_cuids=5527/10240
+[gdct] 276/512 tableids done tableid=276 cuid=5501-5520 completed_cuids=5528/10240
+[gdct] 277/512 tableids done tableid=278 cuid=5541-5560 completed_cuids=5573/10240
+[gdct] 278/512 tableids done tableid=277 cuid=5521-5540 completed_cuids=5574/10240
+[gdct] 279/512 tableids done tableid=280 cuid=5581-5600 completed_cuids=5617/10240
+[gdct] 280/512 tableids done tableid=279 cuid=5561-5580 completed_cuids=5618/10240
+[gdct] 281/512 tableids done tableid=281 cuid=5601-5620 completed_cuids=5639/10240
+[gdct] 282/512 tableids done tableid=282 cuid=5621-5640 completed_cuids=5640/10240
+[gdct] 283/512 tableids done tableid=283 cuid=5641-5660 completed_cuids=5698/10240
+[gdct] 284/512 tableids done tableid=284 cuid=5661-5680 completed_cuids=5710/10240
+[gdct] 285/512 tableids done tableid=286 cuid=5701-5720 completed_cuids=5725/10240
+[gdct] 286/512 tableids done tableid=285 cuid=5681-5700 completed_cuids=5729/10240
+[gdct] 287/512 tableids done tableid=288 cuid=5741-5760 completed_cuids=5782/10240
+[gdct] 288/512 tableids done tableid=287 cuid=5721-5740 completed_cuids=5783/10240
+[gdct] 289/512 tableids done tableid=289 cuid=5761-5780 completed_cuids=5801/10240
+[gdct] 290/512 tableids done tableid=290 cuid=5781-5800 completed_cuids=5813/10240
+[gdct] 291/512 tableids done tableid=292 cuid=5821-5840 completed_cuids=5864/10240
+[gdct] 292/512 tableids done tableid=291 cuid=5801-5820 completed_cuids=5867/10240
+[gdct] 293/512 tableids done tableid=293 cuid=5841-5860 completed_cuids=5877/10240
+[gdct] 294/512 tableids done tableid=294 cuid=5861-5880 completed_cuids=5887/10240
+[gdct] 295/512 tableids done tableid=295 cuid=5881-5900 completed_cuids=5948/10240
+[gdct] 296/512 tableids done tableid=296 cuid=5901-5920 completed_cuids=5949/10240
+[gdct] 297/512 tableids done tableid=297 cuid=5921-5940 completed_cuids=5956/10240
+[gdct] 298/512 tableids done tableid=298 cuid=5941-5960 completed_cuids=5971/10240
+[gdct] 299/512 tableids done tableid=299 cuid=5961-5980 completed_cuids=6021/10240
+[gdct] 300/512 tableids done tableid=300 cuid=5981-6000 completed_cuids=6027/10240
+[gdct] 301/512 tableids done tableid=301 cuid=6001-6020 completed_cuids=6036/10240
+[gdct] 302/512 tableids done tableid=302 cuid=6021-6040 completed_cuids=6055/10240
+[gdct] 303/512 tableids done tableid=303 cuid=6041-6060 completed_cuids=6095/10240
+[gdct] 304/512 tableids done tableid=304 cuid=6061-6080 completed_cuids=6104/10240
+[gdct] 305/512 tableids done tableid=305 cuid=6081-6100 completed_cuids=6124/10240
+[gdct] 306/512 tableids done tableid=306 cuid=6101-6120 completed_cuids=6137/10240
+[gdct] 307/512 tableids done tableid=307 cuid=6121-6140 completed_cuids=6175/10240
+[gdct] 308/512 tableids done tableid=308 cuid=6141-6160 completed_cuids=6184/10240
+[gdct] 309/512 tableids done tableid=309 cuid=6161-6180 completed_cuids=6200/10240
+[gdct] 310/512 tableids done tableid=310 cuid=6181-6200 completed_cuids=6225/10240
+[gdct] 311/512 tableids done tableid=311 cuid=6201-6220 completed_cuids=6248/10240
+[gdct] 312/512 tableids done tableid=312 cuid=6221-6240 completed_cuids=6264/10240
+[gdct] 313/512 tableids done tableid=313 cuid=6241-6260 completed_cuids=6281/10240
+[gdct] 314/512 tableids done tableid=314 cuid=6261-6280 completed_cuids=6309/10240
+[gdct] 315/512 tableids done tableid=315 cuid=6281-6300 completed_cuids=6324/10240
+[gdct] 316/512 tableids done tableid=316 cuid=6301-6320 completed_cuids=6342/10240
+[gdct] 317/512 tableids done tableid=317 cuid=6321-6340 completed_cuids=6357/10240
+[gdct] 318/512 tableids done tableid=318 cuid=6341-6360 completed_cuids=6392/10240
+[gdct] 319/512 tableids done tableid=319 cuid=6361-6380 completed_cuids=6408/10240
+[gdct] 320/512 tableids done tableid=320 cuid=6381-6400 completed_cuids=6425/10240
+[gdct] 321/512 tableids done tableid=321 cuid=6401-6420 completed_cuids=6430/10240
+[gdct] 322/512 tableids done tableid=322 cuid=6421-6440 completed_cuids=6472/10240
+[gdct] 323/512 tableids done tableid=323 cuid=6441-6460 completed_cuids=6492/10240
+[gdct] 324/512 tableids done tableid=324 cuid=6461-6480 completed_cuids=6509/10240
+[gdct] 325/512 tableids done tableid=325 cuid=6481-6500 completed_cuids=6512/10240
+[gdct] 326/512 tableids done tableid=326 cuid=6501-6520 completed_cuids=6552/10240
+[gdct] 327/512 tableids done tableid=327 cuid=6521-6540 completed_cuids=6569/10240
+[gdct] 328/512 tableids done tableid=329 cuid=6561-6580 completed_cuids=6594/10240
+[gdct] 329/512 tableids done tableid=328 cuid=6541-6560 completed_cuids=6596/10240
+[gdct] 330/512 tableids done tableid=330 cuid=6581-6600 completed_cuids=6632/10240
+[gdct] 331/512 tableids done tableid=331 cuid=6601-6620 completed_cuids=6640/10240
+[gdct] 332/512 tableids done tableid=332 cuid=6621-6640 completed_cuids=6666/10240
+[gdct] 333/512 tableids done tableid=333 cuid=6641-6660 completed_cuids=6676/10240
+[gdct] 334/512 tableids done tableid=334 cuid=6661-6680 completed_cuids=6712/10240
+[gdct] 335/512 tableids done tableid=335 cuid=6681-6700 completed_cuids=6728/10240
+[gdct] 336/512 tableids done tableid=337 cuid=6721-6740 completed_cuids=6756/10240
+[gdct] 337/512 tableids done tableid=336 cuid=6701-6720 completed_cuids=6757/10240
+[gdct] 338/512 tableids done tableid=338 cuid=6741-6760 completed_cuids=6770/10240
+[gdct] 339/512 tableids done tableid=339 cuid=6761-6780 completed_cuids=6818/10240
+[gdct] 340/512 tableids done tableid=341 cuid=6801-6820 completed_cuids=6836/10240
+[gdct] 341/512 tableids done tableid=340 cuid=6781-6800 completed_cuids=6844/10240
+[gdct] 342/512 tableids done tableid=342 cuid=6821-6840 completed_cuids=6848/10240
+[gdct] 343/512 tableids done tableid=343 cuid=6841-6860 completed_cuids=6894/10240
+[gdct] 344/512 tableids done tableid=344 cuid=6861-6880 completed_cuids=6913/10240
+[gdct] 345/512 tableids done tableid=346 cuid=6901-6920 completed_cuids=6925/10240
+[gdct] 346/512 tableids done tableid=345 cuid=6881-6900 completed_cuids=6927/10240
+[gdct] 347/512 tableids done tableid=347 cuid=6921-6940 completed_cuids=6976/10240
+[gdct] 348/512 tableids done tableid=348 cuid=6941-6960 completed_cuids=6992/10240
+[gdct] 349/512 tableids done tableid=350 cuid=6981-7000 completed_cuids=7003/10240
+[gdct] 350/512 tableids done tableid=349 cuid=6961-6980 completed_cuids=7008/10240
+[gdct] 351/512 tableids done tableid=351 cuid=7001-7020 completed_cuids=7058/10240
+[gdct] 352/512 tableids done tableid=352 cuid=7021-7040 completed_cuids=7073/10240
+[gdct] 353/512 tableids done tableid=353 cuid=7041-7060 completed_cuids=7083/10240
+[gdct] 354/512 tableids done tableid=354 cuid=7061-7080 completed_cuids=7087/10240
+[gdct] 355/512 tableids done tableid=355 cuid=7081-7100 completed_cuids=7142/10240
+[gdct] 356/512 tableids done tableid=356 cuid=7101-7120 completed_cuids=7152/10240
+[gdct] 357/512 tableids done tableid=357 cuid=7121-7140 completed_cuids=7160/10240
+[gdct] 358/512 tableids done tableid=358 cuid=7141-7160 completed_cuids=7162/10240
+[gdct] 359/512 tableids done tableid=360 cuid=7181-7200 completed_cuids=7229/10240
+[gdct] 360/512 tableids done tableid=359 cuid=7161-7180 completed_cuids=7230/10240
+[gdct] 361/512 tableids done tableid=362 cuid=7221-7240 completed_cuids=7239/10240
+[gdct] 362/512 tableids done tableid=361 cuid=7201-7220 completed_cuids=7240/10240
+[gdct] 363/512 tableids done tableid=363 cuid=7241-7260 completed_cuids=7309/10240
+[gdct] 364/512 tableids done tableid=364 cuid=7261-7280 completed_cuids=7312/10240
+[gdct] 365/512 tableids done tableid=366 cuid=7301-7320 completed_cuids=7317/10240
+[gdct] 366/512 tableids done tableid=365 cuid=7281-7300 completed_cuids=7320/10240
+[gdct] 367/512 tableids done tableid=367 cuid=7321-7340 completed_cuids=7379/10240
+[gdct] 368/512 tableids done tableid=368 cuid=7341-7360 completed_cuids=7392/10240
+[gdct] 369/512 tableids done tableid=369 cuid=7361-7380 completed_cuids=7399/10240
+[gdct] 370/512 tableids done tableid=370 cuid=7381-7400 completed_cuids=7408/10240
+[gdct] 371/512 tableids done tableid=371 cuid=7401-7420 completed_cuids=7469/10240
+[gdct] 372/512 tableids done tableid=372 cuid=7421-7440 completed_cuids=7472/10240
+[gdct] 373/512 tableids done tableid=373 cuid=7441-7460 completed_cuids=7479/10240
+[gdct] 374/512 tableids done tableid=374 cuid=7461-7480 completed_cuids=7480/10240
+[gdct] 375/512 tableids done tableid=376 cuid=7501-7520 completed_cuids=7532/10240
+[gdct] 376/512 tableids done tableid=375 cuid=7481-7500 completed_cuids=7552/10240
+[gdct] 377/512 tableids done tableid=378 cuid=7541-7560 completed_cuids=7567/10240
+[gdct] 378/512 tableids done tableid=377 cuid=7521-7540 completed_cuids=7568/10240
+[gdct] 379/512 tableids done tableid=379 cuid=7561-7580 completed_cuids=7612/10240
+[gdct] 380/512 tableids done tableid=380 cuid=7581-7600 completed_cuids=7633/10240
+[gdct] 381/512 tableids done tableid=381 cuid=7601-7620 completed_cuids=7647/10240
+[gdct] 382/512 tableids done tableid=382 cuid=7621-7640 completed_cuids=7650/10240
+[gdct] 383/512 tableids done tableid=383 cuid=7641-7660 completed_cuids=7689/10240
+[gdct] 384/512 tableids done tableid=384 cuid=7661-7680 completed_cuids=7722/10240
+[gdct] 385/512 tableids done tableid=385 cuid=7681-7700 completed_cuids=7724/10240
+[gdct] 386/512 tableids done tableid=386 cuid=7701-7720 completed_cuids=7729/10240
+[gdct] 387/512 tableids done tableid=387 cuid=7721-7740 completed_cuids=7761/10240
+[gdct] 388/512 tableids done tableid=388 cuid=7741-7760 completed_cuids=7802/10240
+[gdct] 389/512 tableids done tableid=389 cuid=7761-7780 completed_cuids=7804/10240
+[gdct] 390/512 tableids done tableid=390 cuid=7781-7800 completed_cuids=7812/10240
+[gdct] 391/512 tableids done tableid=391 cuid=7801-7820 completed_cuids=7847/10240
+[gdct] 392/512 tableids done tableid=392 cuid=7821-7840 completed_cuids=7868/10240
+[gdct] 393/512 tableids done tableid=393 cuid=7841-7860 completed_cuids=7885/10240
+[gdct] 394/512 tableids done tableid=394 cuid=7861-7880 completed_cuids=7895/10240
+[gdct] 395/512 tableids done tableid=395 cuid=7881-7900 completed_cuids=7931/10240
+[gdct] 396/512 tableids done tableid=396 cuid=7901-7920 completed_cuids=7946/10240
+[gdct] 397/512 tableids done tableid=397 cuid=7921-7940 completed_cuids=7963/10240
+[gdct] 398/512 tableids done tableid=398 cuid=7941-7960 completed_cuids=7976/10240
+[gdct] 399/512 tableids done tableid=399 cuid=7961-7980 completed_cuids=8013/10240
+[gdct] 400/512 tableids done tableid=400 cuid=7981-8000 completed_cuids=8025/10240
+[gdct] 401/512 tableids done tableid=401 cuid=8001-8020 completed_cuids=8043/10240
+[gdct] 402/512 tableids done tableid=402 cuid=8021-8040 completed_cuids=8054/10240
+[gdct] 403/512 tableids done tableid=403 cuid=8041-8060 completed_cuids=8097/10240
+[gdct] 404/512 tableids done tableid=404 cuid=8061-8080 completed_cuids=8105/10240
+[gdct] 405/512 tableids done tableid=405 cuid=8081-8100 completed_cuids=8118/10240
+[gdct] 406/512 tableids done tableid=406 cuid=8101-8120 completed_cuids=8133/10240
+[gdct] 407/512 tableids done tableid=407 cuid=8121-8140 completed_cuids=8179/10240
+[gdct] 408/512 tableids done tableid=408 cuid=8141-8160 completed_cuids=8191/10240
+[gdct] 409/512 tableids done tableid=409 cuid=8161-8180 completed_cuids=8199/10240
+[gdct] 410/512 tableids done tableid=410 cuid=8181-8200 completed_cuids=8208/10240
+[gdct] 411/512 tableids done tableid=411 cuid=8201-8220 completed_cuids=8259/10240
+[gdct] 412/512 tableids done tableid=412 cuid=8221-8240 completed_cuids=8272/10240
+[gdct] 413/512 tableids done tableid=413 cuid=8241-8260 completed_cuids=8276/10240
+[gdct] 414/512 tableids done tableid=414 cuid=8261-8280 completed_cuids=8288/10240
+[gdct] 415/512 tableids done tableid=415 cuid=8281-8300 completed_cuids=8344/10240
+[gdct] 416/512 tableids done tableid=416 cuid=8301-8320 completed_cuids=8352/10240
+[gdct] 417/512 tableids done tableid=417 cuid=8321-8340 completed_cuids=8356/10240
+[gdct] 418/512 tableids done tableid=418 cuid=8341-8360 completed_cuids=8363/10240
+[gdct] 419/512 tableids done tableid=419 cuid=8361-8380 completed_cuids=8429/10240
+[gdct] 420/512 tableids done tableid=420 cuid=8381-8400 completed_cuids=8432/10240
+[gdct] 421/512 tableids done tableid=421 cuid=8401-8420 completed_cuids=8436/10240
+[gdct] 422/512 tableids done tableid=422 cuid=8421-8440 completed_cuids=8440/10240
+[gdct] 423/512 tableids done tableid=423 cuid=8441-8460 completed_cuids=8504/10240
+[gdct] 424/512 tableids done tableid=424 cuid=8461-8480 completed_cuids=8510/10240
+[gdct] 425/512 tableids done tableid=425 cuid=8481-8500 completed_cuids=8516/10240
+[gdct] 426/512 tableids done tableid=426 cuid=8501-8520 completed_cuids=8530/10240
+[gdct] 427/512 tableids done tableid=427 cuid=8521-8540 completed_cuids=8582/10240
+[gdct] 428/512 tableids done tableid=428 cuid=8541-8560 completed_cuids=8589/10240
+[gdct] 429/512 tableids done tableid=429 cuid=8561-8580 completed_cuids=8596/10240
+[gdct] 430/512 tableids done tableid=430 cuid=8581-8600 completed_cuids=8611/10240
+[gdct] 431/512 tableids done tableid=431 cuid=8601-8620 completed_cuids=8660/10240
+[gdct] 432/512 tableids done tableid=432 cuid=8621-8640 completed_cuids=8671/10240
+[gdct] 433/512 tableids done tableid=433 cuid=8641-8660 completed_cuids=8676/10240
+[gdct] 434/512 tableids done tableid=434 cuid=8661-8680 completed_cuids=8688/10240
+[gdct] 435/512 tableids done tableid=435 cuid=8681-8700 completed_cuids=8742/10240
+[gdct] 436/512 tableids done tableid=436 cuid=8701-8720 completed_cuids=8753/10240
+[gdct] 437/512 tableids done tableid=437 cuid=8721-8740 completed_cuids=8756/10240
+[gdct] 438/512 tableids done tableid=438 cuid=8741-8760 completed_cuids=8768/10240
+[gdct] 439/512 tableids done tableid=439 cuid=8761-8780 completed_cuids=8822/10240
+[gdct] 440/512 tableids done tableid=440 cuid=8781-8800 completed_cuids=8835/10240
+[gdct] 441/512 tableids done tableid=441 cuid=8801-8820 completed_cuids=8836/10240
+[gdct] 442/512 tableids done tableid=442 cuid=8821-8840 completed_cuids=8848/10240
+[gdct] 443/512 tableids done tableid=443 cuid=8841-8860 completed_cuids=8901/10240
+[gdct] 444/512 tableids done tableid=444 cuid=8861-8880 completed_cuids=8914/10240
+[gdct] 445/512 tableids done tableid=445 cuid=8881-8900 completed_cuids=8916/10240
+[gdct] 446/512 tableids done tableid=446 cuid=8901-8920 completed_cuids=8928/10240
+[gdct] 447/512 tableids done tableid=447 cuid=8921-8940 completed_cuids=8975/10240
+[gdct] 448/512 tableids done tableid=448 cuid=8941-8960 completed_cuids=8992/10240
+[gdct] 449/512 tableids done tableid=449 cuid=8961-8980 completed_cuids=9003/10240
+[gdct] 450/512 tableids done tableid=450 cuid=8981-9000 completed_cuids=9008/10240
+[gdct] 451/512 tableids done tableid=451 cuid=9001-9020 completed_cuids=9054/10240
+[gdct] 452/512 tableids done tableid=452 cuid=9021-9040 completed_cuids=9074/10240
+[gdct] 453/512 tableids done tableid=453 cuid=9041-9060 completed_cuids=9080/10240
+[gdct] 454/512 tableids done tableid=454 cuid=9061-9080 completed_cuids=9088/10240
+[gdct] 455/512 tableids done tableid=455 cuid=9081-9100 completed_cuids=9140/10240
+[gdct] 456/512 tableids done tableid=456 cuid=9101-9120 completed_cuids=9152/10240
+[gdct] 457/512 tableids done tableid=457 cuid=9121-9140 completed_cuids=9160/10240
+[gdct] 458/512 tableids done tableid=458 cuid=9141-9160 completed_cuids=9168/10240
+[gdct] 459/512 tableids done tableid=460 cuid=9181-9200 completed_cuids=9212/10240
+[gdct] 460/512 tableids done tableid=459 cuid=9161-9180 completed_cuids=9222/10240
+[gdct] 461/512 tableids done tableid=461 cuid=9201-9220 completed_cuids=9251/10240
+[gdct] 462/512 tableids done tableid=462 cuid=9221-9240 completed_cuids=9255/10240
+[gdct] 463/512 tableids done tableid=463 cuid=9241-9260 completed_cuids=9292/10240
+[gdct] 464/512 tableids done tableid=464 cuid=9261-9280 completed_cuids=9296/10240
+[gdct] 465/512 tableids done tableid=466 cuid=9301-9320 completed_cuids=9332/10240
+[gdct] 466/512 tableids done tableid=465 cuid=9281-9300 completed_cuids=9334/10240
+[gdct] 467/512 tableids done tableid=467 cuid=9321-9340 completed_cuids=9372/10240
+[gdct] 468/512 tableids done tableid=468 cuid=9341-9360 completed_cuids=9376/10240
+[gdct] 469/512 tableids done tableid=470 cuid=9381-9400 completed_cuids=9415/10240
+[gdct] 470/512 tableids done tableid=469 cuid=9361-9380 completed_cuids=9416/10240
+[gdct] 471/512 tableids done tableid=471 cuid=9401-9420 completed_cuids=9452/10240
+[gdct] 472/512 tableids done tableid=472 cuid=9421-9440 completed_cuids=9456/10240
+[gdct] 473/512 tableids done tableid=473 cuid=9441-9460 completed_cuids=9493/10240
+[gdct] 474/512 tableids done tableid=474 cuid=9461-9480 completed_cuids=9496/10240
+[gdct] 475/512 tableids done tableid=475 cuid=9481-9500 completed_cuids=9532/10240
+[gdct] 476/512 tableids done tableid=476 cuid=9501-9520 completed_cuids=9536/10240
+[gdct] 477/512 tableids done tableid=478 cuid=9541-9560 completed_cuids=9576/10240
+[gdct] 478/512 tableids done tableid=477 cuid=9521-9540 completed_cuids=9577/10240
+[gdct] 479/512 tableids done tableid=479 cuid=9561-9580 completed_cuids=9610/10240
+[gdct] 480/512 tableids done tableid=480 cuid=9581-9600 completed_cuids=9616/10240
+[gdct] 481/512 tableids done tableid=481 cuid=9601-9620 completed_cuids=9652/10240
+[gdct] 482/512 tableids done tableid=482 cuid=9621-9640 completed_cuids=9656/10240
+[gdct] 483/512 tableids done tableid=483 cuid=9641-9660 completed_cuids=9695/10240
+[gdct] 484/512 tableids done tableid=484 cuid=9661-9680 completed_cuids=9699/10240
+[gdct] 485/512 tableids done tableid=485 cuid=9681-9700 completed_cuids=9732/10240
+[gdct] 486/512 tableids done tableid=486 cuid=9701-9720 completed_cuids=9736/10240
+[gdct] 487/512 tableids done tableid=487 cuid=9721-9740 completed_cuids=9773/10240
+[gdct] 488/512 tableids done tableid=488 cuid=9741-9760 completed_cuids=9780/10240
+[gdct] 489/512 tableids done tableid=489 cuid=9761-9780 completed_cuids=9806/10240
+[gdct] 490/512 tableids done tableid=490 cuid=9781-9800 completed_cuids=9816/10240
+[gdct] 491/512 tableids done tableid=491 cuid=9801-9820 completed_cuids=9852/10240
+[gdct] 492/512 tableids done tableid=492 cuid=9821-9840 completed_cuids=9866/10240
+[gdct] 493/512 tableids done tableid=493 cuid=9841-9860 completed_cuids=9884/10240
+[gdct] 494/512 tableids done tableid=494 cuid=9861-9880 completed_cuids=9892/10240
+[gdct] 495/512 tableids done tableid=495 cuid=9881-9900 completed_cuids=9933/10240
+[gdct] 496/512 tableids done tableid=496 cuid=9901-9920 completed_cuids=9945/10240
+[gdct] 497/512 tableids done tableid=497 cuid=9921-9940 completed_cuids=9961/10240
+[gdct] 498/512 tableids done tableid=498 cuid=9941-9960 completed_cuids=9976/10240
+[gdct] 499/512 tableids done tableid=499 cuid=9961-9980 completed_cuids=10024/10240
+[gdct] 500/512 tableids done tableid=500 cuid=9981-10000 completed_cuids=10032/10240
+[gdct] 501/512 tableids done tableid=502 cuid=10021-10040 completed_cuids=10043/10240
+[gdct] 502/512 tableids done tableid=501 cuid=10001-10020 completed_cuids=10044/10240
+[gdct] 503/512 tableids done tableid=503 cuid=10041-10060 completed_cuids=10103/10240
+[gdct] 504/512 tableids done tableid=504 cuid=10061-10080 completed_cuids=10112/10240
+[gdct] 505/512 tableids done tableid=505 cuid=10081-10100 completed_cuids=10116/10240
+[gdct] 506/512 tableids done tableid=506 cuid=10101-10120 completed_cuids=10128/10240
+[gdct] 507/512 tableids done tableid=507 cuid=10121-10140 completed_cuids=10186/10240
+[gdct] 508/512 tableids done tableid=508 cuid=10141-10160 completed_cuids=10195/10240
+[gdct] 509/512 tableids done tableid=509 cuid=10161-10180 completed_cuids=10196/10240
+[gdct] 510/512 tableids done tableid=510 cuid=10181-10200 completed_cuids=10207/10240
+[gdct] 511/512 tableids done tableid=511 cuid=10201-10220 completed_cuids=10238/10240
+[gdct] 512/512 tableids done tableid=512 cuid=10221-10240 completed_cuids=10240/10240
+[gdct] db closed
+{
+  "mode": "gdct",
+  "workload_cf": "delta",
+  "enable_partition": true,
+  "enable_gdct": true,
+  "enable_gdct_delete_fast_path": true,
+  "enable_gdct_delete_fast_path_skip_duplicate_locks": true,
+  "workload_model": "table_active",
+  "table_assignment": "contiguous",
+  "table_count": 512,
+  "non_empty_table_count": 512,
+  "cuid_count": 10240,
+  "rows_per_cuid": 60000,
+  "active_table_count": 4,
+  "writer_threads_per_table": 8,
+  "update_rows_per_merge": 5000,
+  "late_writer_rows_per_merge": 0,
+  "update_percent": 80,
+  "update_merge_rounds": 5,
+  "lifecycle_active_cuid_percent": 50,
+  "lifecycle_concurrent_writer_percent": 5,
+  "writer_threads": 32,
+  "scan_threads": 32,
+  "scan_interval_ms": 100,
+  "scans_per_cuid": 200,
+  "scan_range_rows": 1000,
+  "max_background_jobs": 8,
+  "max_subcompactions": 1,
+  "l0_target_tables_per_partition": 32,
+  "l0_split_factor": 1,
+  "l0_min_tables_to_split": 16,
+  "l0_max_partition_count": 256,
+  "total_seconds": 3940.6,
+  "writer_seconds": 3940.6,
+  "mode_wall_seconds": 3941.0,
+  "manual_compact_seconds": 0.0,
+  "completed_cuids": 10240,
+  "completed_tables": 512,
+  "merge_txns": 61440,
+  "inserted_rows": 614400000,
+  "merge_delete_rows": 4454400000,
+  "update_rows": 256000000,
+  "logical_write_ops": 5324800000,
+  "cuid_per_sec": 2.6,
+  "merge_txns_per_sec": 15.6,
+  "insert_rows_per_sec": 155913.5,
+  "update_rows_per_sec": 64964.0,
+  "merge_delete_rows_per_sec": 1130372.9,
+  "logical_write_ops_per_sec": 1351250.4,
+  "scan_ops": 2048000,
+  "scan_rows": 147731070,
+  "get_samples": 1024000,
+  "data_errors": 0,
+  "insert_put_p50_us": 3.2,
+  "insert_put_p95_us": 7.3,
+  "insert_put_p99_us": 20.4,
+  "update_put_p50_us": 2.9,
+  "update_put_p95_us": 13.2,
+  "update_put_p99_us": 21.0,
+  "merge_txn_p50_us": 1112541.5,
+  "merge_txn_p95_us": 1723187.0,
+  "merge_txn_p99_us": 2071900.7,
+  "merge_prescan_p50_us": 999220.9,
+  "merge_prescan_p95_us": 1559299.9,
+  "merge_prescan_p99_us": 1787361.7,
+  "scan_seconds": 27259.2,
+  "scan_p50_us": 10756.3,
+  "scan_p95_us": 34443.7,
+  "scan_p99_us": 45374.2,
+  "get_p50_us": 31.0,
+  "get_p95_us": 79.9,
+  "get_p99_us": 135.1,
+  "estimate_live_data_size": 67924642399,
+  "live_sst_bytes": 73446872134,
+  "wal_bytes": 83564550443,
+  "flush_write_bytes": 74901814566,
+  "compact_read_bytes": 143377908365,
+  "compact_write_bytes": 141985052341,
+  "flush_time_micros": 3518503451,
+  "flush_count": 1456,
+  "compaction_time_micros": 4395754496,
+  "compaction_count": 405,
+  "subcompaction_setup_micros": 0,
+  "subcompaction_setup_count": 0,
+  "num_subcompactions_scheduled": 0,
+  "gdct_read_visibility_checks": 1201225069,
+  "gdct_read_slow_path_checks": 1053350639,
+  "gdct_compaction_visibility_checks": 0,
+  "gdct_compaction_slow_path_checks": 0,
+  "gdct_lookup_row_csn_calls": 1053350639,
+  "gdct_lookup_row_csn_failures": 0,
+  "gdct_journal_append_batches": 0,
+  "gdct_journal_appended_records": 0,
+  "gdct_journal_sync_calls": 0,
+  "gdct_snapshot_schedule_calls": 0,
+  "gdct_snapshot_rotate_calls": 0,
+  "gdct_delete_fast_path_rows": 4453687788,
+  "gdct_delete_fast_path_markers": 61440,
+  "gdct_delete_fast_path_cuids": 61440,
+  "gdct_delete_fast_path_skipped_locks": 4453626348,
+  "gdct_intercepted_delete_records": 61440,
+  "gdct_committed_barriers": 61440,
+  "gdct_memory_bytes": 3871632,
+  "delta_l0_precompact": {
+    "available": true,
+    "partition_count": 31,
+    "split_count": 30,
+    "directory_snapshot_bytes": 1111,
+    "get_l0_candidate_files_before_prune": 14733729,
+    "get_l0_candidate_files_after_prune": 6906441,
+    "get_l0_candidate_files_pruned": 7827288,
+    "get_l0_candidate_file_prune_pct": 53.1,
+    "scan_l0_candidate_files_before_prune": 20470729,
+    "scan_l0_candidate_files_after_prune": 9042782,
+    "scan_l0_candidate_files_pruned": 11427947,
+    "scan_l0_candidate_file_prune_pct": 55.8,
+    "legacy_l0_file_count_without_meta": 0,
+    "old_parent_l0_file_count": 0,
+    "total_partition_observed_table_count": 512,
+    "non_empty_partition_count": 1,
+    "total_partition_l0_file_count": 7,
+    "total_partition_l0_bytes": 359394301,
+    "max_partition_observed_table_count": 32,
+    "max_partition_l0_file_count": 7,
+    "max_partition_l0_bytes": 359394301
+  },
+  "delta_l0_postcompact": {
+    "available": true,
+    "partition_count": 31,
+    "split_count": 30,
+    "directory_snapshot_bytes": 1111,
+    "get_l0_candidate_files_before_prune": 14733729,
+    "get_l0_candidate_files_after_prune": 6906441,
+    "get_l0_candidate_files_pruned": 7827288,
+    "get_l0_candidate_file_prune_pct": 53.1,
+    "scan_l0_candidate_files_before_prune": 20470729,
+    "scan_l0_candidate_files_after_prune": 9042782,
+    "scan_l0_candidate_files_pruned": 11427947,
+    "scan_l0_candidate_file_prune_pct": 55.8,
+    "legacy_l0_file_count_without_meta": 0,
+    "old_parent_l0_file_count": 0,
+    "total_partition_observed_table_count": 512,
+    "non_empty_partition_count": 1,
+    "total_partition_l0_file_count": 7,
+    "total_partition_l0_bytes": 359394301,
+    "max_partition_observed_table_count": 32,
+    "max_partition_l0_file_count": 7,
+    "max_partition_l0_bytes": 359394301
+  }
+}
