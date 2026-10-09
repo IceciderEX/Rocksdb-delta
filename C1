@@ -1,0 +1,715 @@
+def do_backup(g_opts, command_dict, cnHost, table_list=None):
+    """
+    Do backup operation
+    """
+    if table_list is None:
+        table_list = []
+    global g_backup_is_stopped
+
+    if table_list is None:
+        table_list = []
+
+    if not g_opts.single:
+        cnPort = instanceInfo.get_single_cn_port_by_hostname(g_clusterInfo, cnHost)
+
+    g_logger.debug("start backup operation...")
+    if g_opts.logical:
+        check_tables_for_skip(g_opts, cnHost, command_dict, table_list)
+        backup_on_nodes(g_opts, command_dict, cnHost, cnPort)
+        if g_backup_is_stopped or is_roach_op_failed():
+            g_logger.debug("Backup failed...")
+            return
+        else:
+            final_ip_param_dict.clear()
+            make_roach_options(g_opts, master_ip, master_host, command_dict)
+        clear_cmd = get_cmd_path('clear')
+        if clear_cmd is not None:
+            g_logger.debug(f"Execute {clear_cmd}")
+            os.system(clear_cmd)
+        bkp_key = get_multtable_backupkey(g_opts)
+        g_logger.log("Logical Multiple table backup COMPLETED")
+        g_logger.log("Backup operation SUCCESSFUL. Backup key: %s\n" % bkp_key)
+    else:
+        g_kernel_adapter = KernelAdapter(g_logger, g_clusterInfo)
+        start_mode = g_kernel_adapter.get_upgrade_mode_from_guc()
+        # for normal cluster
+        if not g_opts.single:
+            #
+            backup_on_nodes(g_opts, command_dict, cnHost, cnPort)
+            #
+        # for single mode
+        else:
+            single_dn_port = instanceInfo.get_single_dn_port_by_hostname(g_clusterInfo, cnHost)
+            backup_on_nodes(g_opts, command_dict, cnHost, single_dn_port)
+        end_mode = g_kernel_adapter.get_upgrade_mode_from_guc()
+
+        if g_backup_is_stopped or is_roach_op_failed():
+            g_logger.debug("Backup failed...")
+            if not g_opts.resumeBkp:
+                if g_opts.remoteMasterIp != "":
+                    clean_remote_backup(g_opts, backup_key)
+                drop_roach_schema_table_when_backup_failed(g_opts, g_logger, backup_key, g_clusterInfo)
+            return
+
+        write_backup_upgrade_version(g_opts, backup_key, start_mode, end_mode)
+        if is_cluster_backup(g_opts):
+            if g_opts.pitr and g_opts.resumeBkp:
+                g_logger.debug("When pitr in resume-backup phase, no need to backup!")
+                return
+
+            backup_cluster_config_file(g_opts, backup_key)
+            backup_pitr_mark_file(g_opts)
+            amend_table_list(g_opts, backup_key)
+            backup_obs_backup_path_list(g_opts, backup_key)
+            backup_obs_store_path_list(g_opts, backup_key)
+            backup_upgrade_mode(g_opts, backup_key)
+            backup_version_file(g_opts, backup_key)
+        else:
+            backup_cluster_config_file(g_opts, backup_key)
+            amend_table_list(g_opts, backup_key)
+            backup_obs_backup_path_list(g_opts, backup_key)
+            backup_obs_store_path_list(g_opts, backup_key)
+            backup_version_file(g_opts, backup_key)
+
+    g_logger.debug("end backup operation...")
+
+
+def start_restore(g_opts, command_dict, g_sshTool, table_list=None):
+    """
+    call for restore functionality
+    """
+    global g_logger
+    g_logger = gsinit_logger(g_opts)
+
+    g_logger.debug("Checking flock of python before start_resotre.")
+    check_gs_roach_running(g_opts, g_logger)
+    if table_list is None:
+        table_list = []
+
+    global master_ip
+    final_ip_param_dict.clear()
+    master_ip = get_master_ip()
+    g_opts.masterIP = master_ip
+
+    if g_opts.roachConf:
+        parse_roach_conf(g_opts)
+    make_roach_options(g_opts, master_ip, master_host, command_dict)
+    validate_logparams()
+
+    # get cluster version used for miniaturized deployment
+    global g_dbClusterInfo
+    global cluster_version
+    g_dbClusterInfo, cluster_version = dbClusterInfo.init_cluster_info(g_opts.user, g_logger)
+
+    validate_roach_params(g_opts)
+    if not g_opts.disaster_fine_grained and '--prior-backup-key' in command_dict.keys():
+        g_logger.logExit("Error: Invalid Parameter, '--prior-backup-key'")
+
+    # dictionary to store the key(i.e. time stamp as integer) and value(i.e. backup key)
+    # so that we can restore according to the time stamp i.e. in reverse chronological order
+    global bkpkeylist
+    global g_isClusterBkp
+    global isFineRestoreLastKey
+    global isIncremental
+    isIncremental = False
+    bkpkeylist = list()
+
+    org_backupkey = check_restore_backup_key_internal(command_dict)
+    metaDest = get_meta_dest(final_ip_param_dict)
+
+    if not metaDest:
+        g_logger.logExit("Error: '--metadata-destination' not provided")
+
+    if not has_table_name_backup(command_dict, table_list):
+        g_logger.logExit("Error: Table restore Failed, "
+            "please check if db/schema/table name is the same as that backed up in the backup-key.")
+
+    # restore operation if backups.ini does not exist
+    global noBackupIni
+    noBackupIni = False
+
+    org_backupkey = make_bkpkey_list_for_timebased_restore(command_dict, g_opts, metaDest, org_backupkey)
+
+    # for cluster level restore, check version are the same,
+    # if version is different from that when backup, then restore is not allowed.
+    # use org_backupkey because maybe cmd has no backup key, but has --restore-target-time
+    if g_isClusterBkp and not g_opts.phyFineGrained:
+        g_logger.debug("start_restore: this is a cluster level restore, "
+                       "need check version is matched, backup key is: %s" % org_backupkey)
+        compare_version_file(g_opts, org_backupkey)
+
+    # added to check if the current cluster is compatible with Topology of the Full backup key
+    if not g_opts.disaster_fine_grained and not g_opts.logical and not g_opts.is_asymmetric_restore:
+        if not check_cluster_node_count(g_opts, bkpkeylist[-1], metaDest):
+            g_logger.logExit("Node count not matched when restore!")
+
+    check_netmedia_whether_backupini_exists(command_dict, g_opts, g_sshTool, metaDest)
+
+    bkpkeylist.reverse()
+
+    # get the backup type of the full backup key
+    bkpDetail = get_backup_details_for_restore(g_opts, command_dict, metaDest, bkpkeylist)
+
+    # This restore-new-cluster parameter has different meanings in different scenarios
+    # The restore-new-cluster parameter supports the following:
+    # 1. restore new cluster for cluster backup.
+    # 2. inplace restore with net media.
+    # 3. physical fine-grained restore with net media.
+    if not g_opts.logical and "--restore-new-cluster" in command_dict.keys() \
+            and bkpDetail["BackupType"].upper() not in ["FULL", "INCREMENTAL", "PITR",
+                                                        "FINE_SCHEMA", "FINE_INCREMENTAL_SCHEMA", "FINE_TABLE", "FINE_DATABASE"]:
+        g_logger.logExit("Error: restore-new-cluster parameter does not support %s backup tpye"
+                         % bkpDetail["BackupType"])
+
+    check_backup_type_for_fine_rebuild(g_opts, bkpDetail)
+
+    if g_opts.phyFineGrained and g_opts.mediaType.upper() == "DISK":
+        state, output = get_cluster_balance_state(g_opts, g_logger)
+        if state != "Yes":
+            g_logger.error("Error : Cluster state is not balance. Output:\n%s" % output)
+            g_logger.exitWithError("physical fine grained online restore cannot continue when the cluster is not balance and the media type is DISK")
+
+    if "--restore-new-cluster" in command_dict.keys():
+        check_expected_conf_files(g_opts, g_logger, g_sshTool)
+
+    # clean before cluster restore
+    # Notice: g_isClusterBkp cannot be replaced by is_cluster_backup()
+    if (not g_opts.disaster_fine_grained and 
+        ((g_opts.clean and g_isClusterBkp and not g_opts.phyFineGrained)
+        or g_opts.doubleCluster)):
+        g_logger.debug("Clean cluster before restore because of --clean")
+
+        if check_stop_progress(g_logger, g_opts, g_dbClusterInfo, cluster_version, "stop-restore"):
+            g_logger.log("Stop restore due to stop restore command.")
+            return True
+        do_clean(g_opts, g_logger)
+
+    # copy the user provided backup key as target backup key
+    g_opts.targetBackupKey = check_target_key(g_opts.backupKey, bkpkeylist)
+    command_dict["--target-backup-key"] = g_opts.targetBackupKey
+    # get unfinishedBkp
+    unfinishedBkp = ''
+    if g_opts.clusterMigration:
+        unfinishedBkp = get_unfinished_bkp(g_opts, bkpkeylist)
+        g_logger.debug("unfinishedBkp is %s" % unfinishedBkp)
+    status = copy_backup_files_from_primary_instance(bkpkeylist, cluster_version, g_opts, g_sshTool, unfinishedBkp)
+    if status is True:
+        return status
+
+    if g_opts.disaster_fine_grained:
+        try:
+            if not dfg_copy_backup_files_from_old_primary_instance(g_opts, g_dbClusterInfo):
+                g_logger.log('Error: Failed to copy backup files from old primary instance.')
+                return True
+        except Exception as ex:
+            g_logger.log(f'Error: Failed to copy backup files from old primary instance, msg: {ex}')
+            g_logger.debug(traceback.format_exc())
+            return True
+
+    get_asymmetric_restore_info(g_opts, g_logger)
+
+    for i in range(g_opts.total_restore_round):
+        if g_opts.is_asymmetric_restore:
+            pre_process_for_asymmetric_restore(g_opts, g_logger, command_dict, i)
+            if g_opts.end_of_restore:
+                break
+        else:
+            g_opts.restore_round = 0
+
+        for item in range(len(bkpkeylist)):
+            # calling function to modify values for various types of backup keys
+            final_ip_param_dict.clear()
+            make_roach_options(g_opts, master_ip, master_host, command_dict)
+            if "--restore-new-cluster" not in command_dict.keys():
+                form_command_dict(bkpkeylist[item], final_ip_param_dict, org_backupkey)
+
+            print_restore_operation_in_progress_info(bkpkeylist, command_dict, g_opts, item, master_ip)
+            update_final_ip_param_dict(bkpDetail, bkpkeylist, command_dict, g_opts, item, unfinishedBkp)
+
+            if unfinishedBkp == bkpkeylist[item]:
+                command_dict["--skip-restore-gtmcm"] = None
+            do_restore(g_opts, command_dict, g_sshTool)
+            rm_file_list_dirs(g_opts, bkpkeylist[item])
+            if is_roach_op_failed():
+                g_logger.log(f"Error: Restore operation failed for backup key: {bkpkeylist[item]}")
+                if item != 0 and g_isClusterBkp and not g_opts.phyFineGrained and not g_opts.disaster_fine_grained:
+                    g_logger.debug("Clean cluster when cluster restore failed...")
+                    do_clean(g_opts, g_logger)
+                post_exec_cleanup(g_opts, g_logger)
+                return is_roach_op_failed()
+            if not isIncremental and g_isClusterBkp:
+                update_backupini_for_restore_success(g_logger, g_opts, command_dict)
+
+        merge_update_conf_files_on_all_nodes(cluster_version, command_dict, g_opts, g_sshTool)
+        do_logical_restore(command_dict, g_opts, g_sshTool, table_list)
+        rm_file_list_dirs(g_opts, g_opts.backupKey)
+
+    post_exec_cleanup(g_opts, g_logger)
+
+    return is_roach_op_failed()
+
+
+ERROR_CODE performBackup(int childSlotId)
+{
+    ERROR_CODE ulRet;
+    NODE_METADATA *meta = nullptr;
+
+    INIT_STATISTIC_TIME();
+
+    LOGINFO("performBackup enter");
+
+    ulRet = InitPerformBackup(childSlotId);
+    if (ulRet != EC_SUCCESS) {
+        return ulRet;
+    }
+
+    agentGlobals->writeSenderLastBigFileInfo = nullptr;
+    agentGlobals->writeSenderLastSmallFileInfo = nullptr;
+
+    if (clioptions.isDrFineGrained) {
+        return EC_SUCCESS;
+    }
+    meta = agentGlobals->nodeMetadata;
+
+    InitDropFileList(meta);
+
+    ulRet = ExecPreOpsDatafilesWithTiming(childSlotId);
+    if (ulRet != EC_SUCCESS) {
+        return ulRet;
+    }
+
+    START_TIME();
+
+    /* Backup datanode files */
+    ulRet = backupDNFiles(meta, childSlotId);
+    if (ulRet != EC_SUCCESS) {
+        return ulRet;
+    }
+    LOGINFO("performBackup after backupDNFiles");
+
+    END_TIME();
+    PRINT_TOTAL_TIME("BACKUP ROW TABLES TIMES");
+
+    /* Copy coordinator files if present in same agent */
+    ulRet = backupCoordFiles(meta, childSlotId);
+    if (ulRet != EC_SUCCESS) {
+        return ulRet;
+    }
+    LOGINFO("performBackup after backupCoordFiles");
+
+    /* Backup DummyStandby files */
+    ulRet = backupDSNFiles(meta, childSlotId);
+    if (ulRet != EC_SUCCESS) {
+        return ulRet;
+    }
+    LOGINFO("performBackup after backupDSNFiles");
+
+    /* Issue stop backup on all data nodes and Coordinators */
+    if (!agentGlobals->skipFileList) {
+        ulRet = LeadProcRowFilePostOps(meta, childSlotId);
+        if (ulRet != EC_SUCCESS) {
+            return ulRet;
+        }
+    }
+
+    if (CheckInvalidFileAfterIncBackup(meta)) {
+        ulRet = EC_FILE_OPEN_FAILED;
+    }
+
+    LOGINFO("performBackup leave");
+    return ulRet;
+}
+
+ERROR_CODE PrepareDnBackupFileList(DATANODE_METADATA *datanode)
+{
+    ERROR_CODE ulRet = EC_SUCCESS;
+    PREP_FILE_LIST_CTX *preFileListCtx = NULL;
+    time_t beginTime = time(NULL);
+    time_t currTime;
+    char duration[TIMESTAMP_ARR_SIZE] = "----";
+    errno_t rc = 0;
+
+    if (BACKUP_MODE_TABLE == clioptions.eBackupType) {
+        return EC_SUCCESS;
+    }
+
+    preFileListCtx = (PREP_FILE_LIST_CTX *)MALLOC(sizeof(PREP_FILE_LIST_CTX));
+    if (NULL == preFileListCtx) {
+        LOGERROR("Memory allocation failed for prepare filelist context.");
+        return EC_MEMALLOC_FAILURE;
+    }
+
+    rc = memset_s(preFileListCtx, sizeof(PREP_FILE_LIST_CTX), 0, sizeof(PREP_FILE_LIST_CTX));
+    securec_check_c(rc, "\0", "\0");
+    preFileListCtx->localDataPath = datanode->localDataPath;
+    preFileListCtx->instanceName = datanode->instanceName;
+    preFileListCtx->dataNodeSize = &datanode->diskUsageDatanode;
+    preFileListCtx->port = datanode->port;
+    preFileListCtx->dataPrimiary = DATANODE_PRIMARY;
+    preFileListCtx->conn = (GSCONN **)&(datanode->conn);
+    preFileListCtx->startLsn = &datanode->startLsn;
+    preFileListCtx->tli = &datanode->tli;
+    preFileListCtx->bBackupStarted = &datanode->bStartGsBackup;
+    preFileListCtx->instanceType = INSTANCE_DN;
+    preFileListCtx->arcLogPath = datanode->arcLogPath;
+
+    if (isResumeBkp()) {
+        preFileListCtx->bkpState = &datanode->resumeBkpInfo.bkpState;
+    }
+
+    if (IS_INCREMENTAL_BACKUP_TYPE() || IS_INC_AT_TWO_PAHSE()) {
+        int prior_inst_pos = -1;
+        IdentifyMatchedPriorInstPos(datanode, &prior_inst_pos);
+
+        if (-1 == prior_inst_pos) {
+            /* This is required when standby did a switch over after the full backup */
+            IdentifyMatchedPriorStandbyPos(datanode, &prior_inst_pos);
+            if (-1 == prior_inst_pos) {
+                LOGERROR("Datanode %s cannot be found in  %s.", datanode->instanceName, ROACHMASTERPRIORMETAFILE);
+                FREE(preFileListCtx);
+                return EC_AGENT_METADATA_FAILED;
+            } else {
+                preFileListCtx->priorStartLsn = agentGlobals->priorNodeMetadata->standbys[prior_inst_pos].startLsn;
+                preFileListCtx->priorTli = &(agentGlobals->priorNodeMetadata->standbys[prior_inst_pos].tli);
+            }
+        } else {
+            preFileListCtx->priorStartLsn = agentGlobals->priorNodeMetadata->datanodes[prior_inst_pos].startLsn;
+            preFileListCtx->priorTli = &(agentGlobals->priorNodeMetadata->datanodes[prior_inst_pos].tli);
+        }
+    } else {
+        preFileListCtx->priorStartLsn = InvalidXLogRecPtr;
+        preFileListCtx->priorTli = NULL;
+    }
+
+    ulRet = PrepareDNCNInstanceFileList(preFileListCtx, (void *)datanode);
+    if (ulRet != EC_SUCCESS) {
+        LOGERROR("Failed to prepare backup filelist for instance:%s", datanode->localDataPath);
+        FREE(preFileListCtx);
+        return ulRet;
+    }
+
+    currTime = time(NULL);
+    if (currTime >= beginTime) {
+        /* Avoid user adjust system time during backup, if so, use default value of duration */
+        getOperationDuration(currTime - beginTime, duration);
+    }
+
+    LOGINFO("Prepare metadata data for datanode %s finished, time:%s", datanode->instanceName, duration);
+    FREE(preFileListCtx);
+    return ulRet;
+}
+
+/**
+ * Coordinator metadata
+ */
+typedef struct metadata_coordinator {
+    uint32_t coordinatorId;
+    char *localDataPath;
+    char *arcLogPath;
+    char *srvLogPath;
+
+    char *cnDataNBHostName;
+    char *localDataNBPath;
+    char *arcLogNBPath;
+    char *srvLogNBPath;
+
+    GSCONN *conn;
+    uint32_t arcLogPathDiskUsage;
+
+    /* pitr backup info */
+    char *archiveMediaDestination;
+    char *archiveXlogBufferPath;
+    uint32_t archiveXlogBufferSize;
+
+    uint32_t port;  //Only for agent use in backup. No need to send to master
+
+    /* these 3 task id is used during restore, for Verbose purpose */
+    uint32_t dataTaskID;
+    uint32_t arcTaskID;
+    uint32_t serTaskID;
+
+    TimeLineID tli;
+    XLogRecPtr startLsn;
+    XLogRecPtr barrierLsn;
+    XLogRecPtr stopLsn;
+    time_t bkpStartTime;
+    bool bRecoveryConf;
+    bool bStartGsBackup;
+    bool isPrimaryCn;
+    int restoreFd;
+    char *instanceName;
+    uint64_t diskUsageCoord;
+    /* resume bkp*/
+    RESUMEBKP_METADATA resumeBkpInfo;
+    uint32_t memArraryIndex;
+    BACKUP_MODE_TYPE backupType;
+
+    CommitSeqNo barrierCSN;
+    parray *droppedFileList;
+
+    uint64 oldestXmin;
+
+    /* Control the scope of gs_stat_operation_trace table records */
+    uint32_t gsStatOpTraceStartXid;
+    uint32_t gsStatOpTraceBarrierXid;
+    uint32_t gsStatOpTraceEndXid;
+
+    /* File list path for parallel backup (PreOps_DATAFILES) */
+    char *fileListPath;
+    /* Dir record file path for parallel backup */
+    char *dirRecordFilePath;
+    /* Soft link record file path for parallel backup */
+    char *softLinkRecordFilePath;
+} COORD_METADATA;
+
+/**
+ * Datanode metadata
+ * NOTE: When add new members, you should check DeepCopyDatanodeMetadataForDR.
+ */
+typedef struct metadata_datanode {
+    uint32_t datanodeId;
+    uint32_t dnIndex;
+
+    /* Datanode master */
+    char *instanceName;
+    char *localDataPath;
+    char *arcLogPath;
+    char *srvLogPath;
+
+    char *dataNBHostName;
+    char *localDataNBPath;
+    char *arcLogNBPath;
+    char *srvLogNBPath;
+
+    uint32_t arcLogPathDiskUsage;
+
+    /* pitr backup info */
+    char *archiveMediaDestination;
+    char *archiveXlogBufferPath;
+    uint32_t archiveXlogBufferSize;
+
+    int restoreFd;
+    uint32_t port;  //Only for agent use in backup. No need to send to master
+
+    /* These 3 task id is used during restore, for Verbose purpose */
+    uint32_t dataTaskID;
+    uint32_t arcTaskID;
+    uint32_t serTaskID;
+
+    TimeLineID tli;
+    XLogRecPtr startLsn;
+    XLogRecPtr barrierLsn;
+    XLogRecPtr stopLsn;
+    time_t bkpStartTime;
+    bool bStartGsBackup;  //Should be sent to master?
+    GSCONN *conn;
+    uint64_t diskUsageDatanode;
+
+    /* Standby Node */
+    char *standbyIP;
+    char *standbyHostname;
+    char *dbScpDNHostname;
+    char *standbyDatapath;
+    char *standbyArcLogPath;
+    char *standbySrvLogPath;
+    char *standbyConfNBPath;
+
+    /* Dummy Standby Node */
+    char *dummyStandbyIP;
+    char *dummyStandbyHostname;
+    char *dummyStandbyDatapath;
+    char *dummyStandbyArcLogPath;
+    char *dummyStandbySrvLogPath;
+    char *dummyStandbyConfNBPath;
+
+    /* Remote IP*/
+    char *remoteIp;
+    /* resume bkp*/
+    RESUMEBKP_METADATA resumeBkpInfo;
+    uint32_t memArraryIndex;
+    /* Remote path*/
+    char *remotePath;
+
+    /* pitr collect xlog info */
+    bool ShouldBeCollect;
+    uint32_t currentPrimaryInstId;
+
+    CommitSeqNo barrierCSN;
+    parray *droppedFileList;
+
+    /* fine grained dr */
+    int *buckets; /* the IDs of buckets belong to current DN */
+    char **localDataNBPathBuckets; /* just as localDataNBPath */
+    int currBucketIdx; /* the current handled bucket, a subscript for "buckets" and "localDataNBPathBuckets" above. */
+
+    uint64 oldestXmin;
+
+    /* In the multi-round restore scenario, record the original datanodeid. */
+    uint32_t localInstanceId;
+
+    /* Control the scope of gs_stat_operation_trace table records */
+    uint32_t gsStatOpTraceStartXid;
+    uint32_t gsStatOpTraceBarrierXid;
+    uint32_t gsStatOpTraceEndXid;
+
+    /* File list path for parallel backup (PreOps_DATAFILES) */
+    char *fileListPath;
+    /* Dir record file path for parallel backup */
+    char *dirRecordFilePath;
+    /* Soft link record file path for parallel backup */
+    char *softLinkRecordFilePath;
+} DATANODE_METADATA;
+
+/**
+ * Standby and dummy standby metadata.
+ */
+typedef struct metadata_standby {
+    uint32_t standbyId;
+    char *instanceName;
+    char *localDataPath;
+    char *arcLogPath;
+
+    char *standbyDataNBHostName;
+    char *standbyConfNBPath;
+    char *arcLogNBPath;
+
+    /* These 3 task id is used during restore, for Verbose purpose */
+    uint32_t dataTaskID;
+    uint32_t arcTaskID;
+    uint32_t serTaskID;
+
+    int restoreFd;
+    uint32_t arcLogPathStandby;
+    uint32_t arcLogPathDummy;
+
+
+    /* pitr backup info */
+    char *archiveMediaDestination;
+    char *archiveXlogBufferPath;
+    uint32_t archiveXlogBufferSize;
+
+    char *srvLogPath;
+    char *srvLogNBPath;
+    uint64_t diskUsageStandBy;
+    uint64_t diskUsageDummy;
+
+
+    /* master cluster primary datanode information */
+    char *PrimaryIP;
+    uint32_t primaryInstId;
+    char *PrimaryDataPath;
+    char *PrimaryArcLogPath;
+    char *PrimarySrvLogPath;
+    char *PrimaryDataNBPath;
+
+    char *dbScpSNHostname;
+
+    time_t bkpStartTime;
+    XLogRecPtr startLsn;
+    XLogRecPtr barrierLsn;
+    XLogRecPtr stopLsn;
+    TimeLineID tli;
+    char *remoteIp;
+    uint32_t remoteInstId;
+
+    /* resume bkp*/
+    RESUMEBKP_METADATA resumeBkpInfo;
+    uint32_t memArraryIndex;
+
+    char *remotePath;
+
+    /* pitr collect xlog info */
+    bool ShouldBeCollect;
+    uint32_t currentPrimaryInstId;
+
+    CommitSeqNo  barrierCSN;
+
+    uint64 barrierOldestxmin;
+    int port;
+
+    /* File list path for parallel backup (PreOps_DATAFILES) */
+    char *fileListPath;
+    /* Dir record file path for parallel backup */
+    char *dirRecordFilePath;
+    /* Soft link record file path for parallel backup */
+    char *softLinkRecordFilePath;
+} STANDBY_METADATA;
+
+/**
+ * cluster metadata.
+ */
+typedef struct cluster_metadata {
+    char *clusterStaticPath;
+    char *clusterStaticNBPath;
+    char *clusterDynamicPath;
+    char *clusterDynamicNBPath;
+} CLUSTER_METADATA;
+
+/**
+ * Note: CM Server not backed up.
+ */
+typedef struct rmaster_metadata_node {
+    char *nodeHostName;
+    char *ip; //backupIp
+    char *sshIp; //sshIp
+    uint32_t nodeId;
+    bool isConnected;
+    char acReserved[3];
+    size_t lastDataCopyTaskId;
+    uint32_t gtmCount;
+    GTM_METADATA *gtm;
+    uint32_t etcdCount;
+    ETCD_METADATA *etcd;
+    uint32_t coordCount;
+    COORD_METADATA *coord;
+    uint32_t datanodeCount;
+    DATANODE_METADATA *datanodes;
+    uint32_t standbyCount;
+    STANDBY_METADATA *standbys;
+    uint32_t dummyStandbyCount;
+    STANDBY_METADATA *dummyStandbys;
+    CLUSTER_METADATA clusterMeta;
+    uint32_t cmServerId;
+    bool isPrimaryCms;
+    char *cmPath;
+    char *cmNBHostName;
+    char *cmNBPath;
+    char *libPath;
+    char *libNBHostName;
+    char *libNBPath;
+    uint32_t cmprsType;  // Compression type
+    uint32_t cmprsLevel; // Compression level
+    uint32_t bufblksize;
+    char *backupLocation;
+    char *metaLocation;
+    char *priorBkpKey;
+    time_t startResumeBkpTime; //for resumeBkp and normalBkp
+    char *bufferLocation;    // archive xlog buffer local path
+    char *archiveLocation;   // archive media destinations
+} NODE_METADATA;
+
+ERROR_CODE DoCNTasksBeforeRestore(COORD_METADATA *coord, TaskOrder TaskOrder)
+{
+    ERROR_CODE ec = EC_SUCCESS;
+    LOGINFO("clean CN directory %s before %s restore.", coord->localDataPath,
+            coord->backupType == BACKUP_MODE_FULL ? "Full" : "Inc");
+
+    if (coord->backupType == BACKUP_MODE_FULL) {
+        ec = removeDirectory(coord->localDataPath, false, g_cnExcludeFileList, NULL);
+        if (ec != EC_SUCCESS) {
+            LOGINFO("Warning: Failed to remove cn stale directory %s before incremental restore", coord->localDataPath);
+        }
+    } else {
+        if (TaskOrder == BEFORE_BEGIN_RESTORE) {
+            /* off line mode. */
+            ec = IncRestoreRemoveDirectory(coord->localDataPath, g_nonDataDirs, g_excludeSuffixPatternList);
+        } else {
+            /* read only mode. */
+            ec = IncRestoreRemoveDirectory(coord->localDataPath, g_NonDataDirsForReadOnly, g_excludeSuffixPatternList);
+        }
+        if (ec != EC_SUCCESS) {
+            LOGERROR("Failed to remove cn stale directory before incremental restore.");
+        }
+    }
+    return ec;
+}
