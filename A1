@@ -1,0 +1,88 @@
+### 1. 结论：LSN 字段是 GaussDB XLOG 位置
+
+**`barrierLsn`、`startLsn`、`stopLsn` 等字段绝对是 GaussDB 的 XLOG 位置（`XLogRecPtr`），而不是 RocksDB 的 SequenceNumber。**
+
+### 2. 关键证据分析
+
+#### 证据一：类型定义明确为 `XLogRecPtr`
+在 **`agent_metadata.h`** 中，`COORD_METADATA`、`DATANODE_METADATA` 和 `STANDBY_METADATA` 结构体中，LSN 字段的类型被明确定义为 `XLogRecPtr`：
+
+```cpp
+// agent_metadata.h
+typedef struct metadata_coordinator {
+    // ...
+    TimeLineID tli;
+    XLogRecPtr startLsn;   // <--- 明确类型为 XLogRecPtr
+    XLogRecPtr barrierLsn; // <--- 明确类型为 XLogRecPtr
+    XLogRecPtr stopLsn;    // <--- 明确类型为 XLogRecPtr
+    // ...
+} COORD_METADATA;
+
+typedef struct metadata_datanode {
+    // ...
+    TimeLineID tli;
+    XLogRecPtr startLsn;   // <--- 明确类型为 XLogRecPtr
+    XLogRecPtr barrierLsn; // <--- 明确类型为 XLogRecPtr
+    XLogRecPtr stopLsn;    // <--- 明确类型为 XLogRecPtr
+    // ...
+} DATANODE_METADATA;
+```
+*   **解释**：`XLogRecPtr` 是 PostgreSQL/GaussDB 内核中用于表示 WAL（Write-Ahead Log）记录指针的标准类型。它底层虽然是 `uint64_t`，但其语义完全对应 XLOG 的段号（High 32 bits）和段内偏移（Low 32 bits）。RocksDB 的 SequenceNumber 通常定义为 `uint64_t` 或 `SequenceNumber` 类型，绝不会使用 `XLogRecPtr` 这种数据库内核特有的类型。
+
+#### 证据二：LSN 的赋值来源是数据库内核 SQL 执行结果
+在 **`roach_agent_barrier.cpp`** 中，`barrierLsn` 的获取过程清晰地展示了它与数据库内核的交互：
+
+1.  **执行 SQL 创建 Barrier**：
+    ```cpp
+    // roach_agent_barrier.cpp
+    nRet = snprintf_s(barrierQuery, sizeof(barrierQuery), sizeof(barrierQuery) - 1,
+        "create barrier '%s_%s'", GetRoachTaskSlotName(clioptions.taskType), actualBkpKey);
+    // ...
+    ulRet = GsExecuteWithRetry(conn, createBarrierStmt); // 执行 SQL
+    ```
+    这里通过 `GsExecuteWithRetry` 向数据库发送了 `create barrier` 命令。这是 GaussDB 内核提供的用于物理备份一致性点的 SQL 命令。
+
+2.  **解析 Barrier 信息字符串**：
+    ```cpp
+    // roach_agent_barrier.cpp
+    ERROR_CODE DeformBarrierInfo(const char *barrierInfoStr, BarrierInfo *curBarrierInfo)
+    {
+        uint32      hi = 0;
+        uint32      lo = 0;
+        // ...
+        if (sscanf_s((char *)barrierInfoStr, "%8X/%8X", &hi, &lo) != SCANF_NUM_IN_LOCK_MODE) {
+            goto ERROR;
+        }
+        // ...
+        curBarrierInfo->barrierLSN = ((uint64)hi) << 32 | lo; // <--- 组合成 64 位 LSN
+        return ec;
+    }
+    ```
+    *   **关键点**：`barrierInfoStr` 是从数据库内核返回的字符串（格式如 `0/12345678`）。
+    *   **解析逻辑**：代码将字符串解析为高 32 位 (`hi`) 和低 32 位 (`lo`)，然后组合成一个 `uint64`。这正是 PostgreSQL/GaussDB XLOG LSN 的标准格式（`%X/%X`）。
+    *   **来源**：这个字符串是由数据库内核在执行 `create barrier` 或 `pg_start_backup` 等命令时生成的，代表的是**当前 WAL 流的位置**。
+
+3.  **从共享内存同步到元数据**：
+    ```cpp
+    // roach_agent_barrier.cpp
+    void updateDNChildProcAgentGlobals(int dnIdx, int shmemIdx)
+    {
+        // ...
+        agentGlobals->nodeMetadata->datanodes[dnIdx].barrierLsn = agentGlobals->destShMeta->instDnInfo[shmemIdx].barrierLsn;
+        // ...
+    }
+    ```
+    这里将内核通过共享内存（`destShMeta`）传递过来的 LSN 值赋给了 `nodeMetadata` 中的 `barrierLsn`。`destShMeta` 中的数据直接来源于数据库内核的共享内存结构。
+
+#### 证据三：与 RocksDB 无关
+*   在整个 `roach_agent_barrier.cpp` 和 `agent_metadata.h` 中，**没有任何**关于 RocksDB、`SequenceNumber`、`rocksdb::` 命名空间或相关 API 的引用。
+*   `roach` 作为物理备份工具，其职责是拷贝数据文件和 WAL 日志。它不关心数据文件内部（如 RocksDB SST 文件）的存储引擎版本号（SequenceNumber），只关心数据文件在 WAL 流中的逻辑一致性点（LSN）。
+
+### 3. 总结
+
+*   **`barrierLsn`**：是 GaussDB XLOG 位置。它由数据库内核在执行 `create barrier` 时生成，格式为 `High32/Low32`，通过 SQL 结果或共享内存传递给 Roach Agent。
+*   **`startLsn` / `stopLsn`**：同样是 GaussDB XLOG 位置，分别代表备份开始和结束时的 WAL 位置。
+*   **`targetLsn`**：在恢复场景中，也是 XLOG 位置，用于指定恢复到哪个 WAL 点。
+*   **`outAppliedLsn`**：同样是 XLOG 位置，表示已应用到数据库的 WAL 位置。
+
+**因此，在接入接口时，请务必将这些 LSN 字段视为 GaussDB 的 XLOG 位置（`XLogRecPtr`），并按照 `%X/%X` 格式进行解析和比较，切勿将其误认为是 RocksDB 的 SequenceNumber。**
