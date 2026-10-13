@@ -582,3 +582,78 @@ GaussDB 使用 **Replication Slot (复制槽位)** 机制来管理 Xlog 的保�
 1.  **Barrier LSN**：搜索 `PostOpsIssueStopBackupQuery` 的实现，或 `pg_stop_backup` 的调用处。
 2.  **RocksDB**：如果确实涉及 RocksDB，搜索 `RocksDB`、`SequenceNumber`、`GetLatestSequenceNumber` 等关键词，可能在 `src/gausskernel/storage/rocksdb/` 或类似目录。
 3.  **CSNLog 保留**：搜索 `csnlog`、`CSNLog`、`pg_csnlog` 相关的清理或归档函数，可能在 `src/gausskernel/utils/csn/` 或 `src/gausskernel/replication/` 中。
+
+基于你提供的 `backup_utils.cpp`（包含 `PostOpsIssueStopBackupQuery` 等函数）以及之前的文件，现在可以**部分回答**关于 `barrierLsn` 生成和 CSNLog 备份时点的问题，但**仍然无法回答**关于 RocksDB Sequence Number 的对应关系。
+
+以下是详细分析：
+
+### 1. Barrier LSN (`stopLsn`) 的生成代码
+
+**现有文件能回答的部分：**
+
+*   **生成入口**：`PostOpsIssueStopBackupQuery` 是触发 Barrier 点生成的顶层函数。
+*   **核心 SQL**：在 `GetParam4StopBackup` 中，定义了生成 Barrier LSN 的关键 SQL：
+    ```cpp
+    nRet = snprintf_s(query, MAX_QUERY_LEN, MAX_QUERY_LEN - 1,
+        "SELECT * FROM pg_catalog.pg_xlogfile_name_offset(pg_catalog.gs_roach_stop_backup('%s'))",
+        GetRoachTaskSlotName(clioptions.taskType));
+    ```
+    *   **`gs_roach_stop_backup`**：这是 GaussDB 内核提供的函数，类似于 PostgreSQL 的 `pg_stop_backup`。它会在内核中执行 Checkpoint，刷脏页，并标记备份结束。
+    *   **`pg_xlogfile_name_offset`**：获取当前事务日志文件名称和偏移量。
+*   **LSN 获取逻辑**：在 `StopPGBackup` 函数中：
+    ```cpp
+    ulRet = GsExecuteWithRetry(conn, query); // 执行上述 SQL
+    if (ulRet != EC_SUCCESS) { ... }
+
+    ulRet = getLsn(conn, tli, stopLsn, "result of issueStopBackup"); // 解析结果获取 LSN
+    ```
+    *   `getLsn` 函数（未提供源码，但逻辑清晰）会从 SQL 执行结果中解析出 `TimeLineID` 和 `XLogRecPtr` (LSN)，并将其赋值给 `*stopLsn`。
+*   **存储位置**：`stopLsn` 被存储在 `DATANODE_METADATA` 或 `COORD_METADATA` 结构体的 `stopLsn` 字段中，并通过 `updateInstanceInfoForMyProc` 更新到共享内存中，供后续 Xlog 备份使用。
+
+**结论**：`barrierLsn` (即 `stopLsn`) 是通过执行 `gs_roach_stop_backup` 并在内核中触发 Checkpoint 后，通过查询当前 WAL 位置获得的。
+
+### 2. 与 RocksDB Sequence Number 的对应
+
+**现有文件完全无法回答：**
+
+*   **无 RocksDB 代码**：提供的代码完全是基于 PostgreSQL/GaussDB 内核的。
+*   **架构差异**：如前所述，GaussDB 的标准物理备份流程不直接管理 RocksDB 的 Sequence Number。如果 GaussDB 有集成 RocksDB，这种映射逻辑会在专门的 RocksDB 适配层代码中，而不在通用的备份管理器中。
+*   **推测**：如果存在对应关系，通常是在内核层面，当 `gs_roach_stop_backup` 执行 Checkpoint 时，内核可能会同步 RocksDB 的 MemTable 到 SST 文件，并记录当前的 Sequence Number。但这个逻辑不在备份工具代码中。
+
+### 3. CSNLog 如何备份？对应哪个时点？
+
+**现有文件能回答的部分：**
+
+*   **备份时点**：
+    *   在 `fine_backup_manager.cpp` 中，`BackupGlobalFilesParallelly` 调用了 `PostOpsIssueStopBackupQuery`。
+    *   `PostOpsIssueStopBackupQuery` 执行 `gs_roach_stop_backup`，生成 `stopLsn` (Barrier LSN)。
+    *   **之后**，流程进入 `BackupXactFilesParallelly`。
+    *   在 `BackupXactFilesParallelly` 中，`g_xactWhiteList` 包含 `PG_CSNLOG_DIR`。
+    *   因此，CSNLog 是在 **Barrier 点 (`stopLsn`) 生成之后**，作为普通文件被扫描和复制的。
+*   **一致性保证**：
+    *   由于 `gs_roach_stop_backup` 会触发 Checkpoint 并冻结数据文件状态，此时 CSNLog 的状态也是稳定的。
+    *   备份 CSNLog 时，备份的是截至 `stopLsn` 时刻的 CSNLog 文件。
+    *   后续的 Xlog 备份会覆盖从 `startLsn` 到 `stopLsn` 以及之后直到 `SwitchXLogToNextSegment` 产生的新 LSN 的所有日志，确保事务提交的完整性。
+
+**现有文件不能回答的部分：**
+
+*   **CSNLog 内部结构**：代码没有展示 CSNLog 文件的格式或如何解析它。
+*   **CSNLog 与 Xlog 的协同**：代码没有展示内核如何确保 CSNLog 中的提交顺序与 Xlog 中的事务记录一致。这通常由内核在 `gs_roach_stop_backup` 时保证。
+
+### 4. CSNLog 历史如何保留？
+
+**现有文件完全无法回答：**
+
+*   **无保留逻辑**：提供的代码中没有任何关于 CSNLog 清理、归档或保留策略的逻辑。
+*   **推测**：CSNLog 的保留策略可能与 Xlog 类似，由内核根据 Checkpoint 和复制槽位管理，或者由专门的 CSN 管理器处理。但这部分代码不在提供的文件中。
+
+### 总结
+
+*   **Barrier LSN 生成**：通过执行 `gs_roach_stop_backup` SQL，触发内核 Checkpoint，并查询当前 WAL 位置获得 `stopLsn`。
+*   **RocksDB 对应**：代码中无 RocksDB 逻辑，无法回答。
+*   **CSNLog 备份时点**：在 Barrier 点 (`stopLsn`) 生成之后，作为普通文件在 Xact Phase 备份。
+*   **CSNLog 保留**：代码中无相关逻辑。
+
+**建议搜索线索：**
+1.  **RocksDB 对应**：如果确实涉及 RocksDB，搜索 `RocksDB`、`SequenceNumber`、`GetLatestSequenceNumber` 等关键词，可能在 `src/gausskernel/storage/rocksdb/` 或类似目录。
+2.  **CSNLog 保留**：搜索 `csnlog`、`CSNLog`、`pg_csnlog` 相关的清理或归档函数，可能在 `src/gausskernel/utils/csn/` 或 `src/gausskernel/replication/` 中。
